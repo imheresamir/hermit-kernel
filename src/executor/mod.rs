@@ -163,7 +163,7 @@ where
 
 		if backoff.is_completed() {
 			let wakeup_time =
-				timeout.map(|duration| start + u64::try_from(duration.as_micros()).unwrap());
+				timeout.map(|duration| u64::try_from(duration.as_micros()).unwrap());
 
 			// switch to another task
 			task_notify.wait(wakeup_time);
