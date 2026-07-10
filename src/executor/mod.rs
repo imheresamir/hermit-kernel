@@ -143,6 +143,9 @@ where
 	let mut cx = Context::from_waker(&waker);
 	let mut future = pin!(future);
 
+	let timeout_ms: i64 = timeout.map(|d| d.as_millis() as i64).unwrap_or(-1);
+	let mut iter: u64 = 0;
+
 	loop {
 		// check future
 		let result = future.as_mut().poll(&mut cx);
@@ -151,6 +154,15 @@ where
 		run();
 
 		let now = crate::arch::kernel::systemtime::now_micros();
+		let elapsed_ms = (now as i128 - start as i128) as i64;
+		let backoff_done = backoff.is_completed();
+		warn!(
+			"BLOCK_ON iter={} start={} now={} elapsed_ms={} timeout_ms={} backoff_done={} ready={}",
+			iter, start, now, elapsed_ms, timeout_ms, backoff_done,
+			matches!(result, Poll::Ready(_))
+		);
+		iter += 1;
+
 		if let Poll::Ready(t) = result {
 			return t;
 		}
@@ -158,6 +170,7 @@ where
 		if let Some(duration) = timeout
 			&& Duration::from_micros(now - start) >= duration
 		{
+			warn!("BLOCK_ON timeout-elapsed -> returning Err(Time)");
 			return Err(Errno::Time);
 		}
 
@@ -166,7 +179,9 @@ where
 				timeout.map(|duration| u64::try_from(duration.as_micros()).unwrap());
 
 			// switch to another task
+			warn!("BLOCK_ON parking via task_notify.wait(wakeup_time={:?})", wakeup_time);
 			task_notify.wait(wakeup_time);
+			warn!("BLOCK_ON woke from task_notify.wait");
 
 			// restore default values
 			backoff.reset();
