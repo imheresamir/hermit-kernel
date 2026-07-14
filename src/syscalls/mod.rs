@@ -860,7 +860,6 @@ pub extern "C" fn sys_isatty(fd: RawFd) -> i32 {
 #[hermit_macro::system(errno)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sys_poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32 {
-	let slice = unsafe { slice::from_raw_parts_mut(fds, nfds) };
 	let timeout = if timeout >= 0 {
 		Some(core::time::Duration::from_millis(
 			timeout.try_into().unwrap(),
@@ -868,6 +867,18 @@ pub unsafe extern "C" fn sys_poll(fds: *mut PollFd, nfds: usize, timeout: i32) -
 	} else {
 		None
 	};
+
+	// POSIX: poll(NULL, 0, timeout) is a valid sleep. QuickJS calls this
+	// when only timers are registered (no file descriptors to poll).
+	// Guard against the null pointer — slice::from_raw_parts_mut requires
+	// non-null even for zero-length slices.
+	let mut dummy: PollFd = Default::default();
+	let ptr = if nfds == 0 {
+		&mut dummy as *mut PollFd
+	} else {
+		fds
+	};
+	let slice = unsafe { slice::from_raw_parts_mut(ptr, nfds) };
 
 	fd::poll(slice, timeout).map_or_else(
 		|e| {
