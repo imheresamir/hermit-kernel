@@ -134,31 +134,32 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	#[cfg(target_arch = "aarch64")]
 	fn reschedule(self) {
 		use aarch64_cpu::asm::barrier::{NSH, SY, dsb, isb};
-		use arm_gic::IntId;
-		use arm_gic::gicv3::{GicCpuInterface, SgiTarget, SgiTargetGroup};
 
 		use crate::arch::kernel::interrupts::SGI_RESCHED;
 
 		dsb(NSH);
 		isb(SY);
 
-		let reschedid = IntId::sgi(SGI_RESCHED.into());
+		let intid: u64 = u64::from(SGI_RESCHED);
 		#[cfg(feature = "smp")]
 		let core_id = self.core_id;
 		#[cfg(not(feature = "smp"))]
 		let core_id = 0;
 
-		GicCpuInterface::send_sgi(
-			reschedid,
-			SgiTarget::List {
-				affinity3: 0,
-				affinity2: 0,
-				affinity1: 0,
-				target_list: 1 << core_id,
-			},
-			SgiTargetGroup::CurrentGroup1,
-		)
-		.unwrap();
+		let target_list: u64 = 1u64 << u64::from(core_id);
+		let sgi_value: u64 = (intid << 24) | target_list;
+
+		// SAFETY: ICC_SGI1R_EL1 triggers an SGI to specified cores.
+		// We bypass GicCpuInterface::send_sgi() due to an ABI bug where
+		// Result<(), GicError> uses a hidden return pointer (x8) that callers
+		// pass as NULL, crashing on the post-MSR store.
+		unsafe {
+			core::arch::asm!(
+				"msr ICC_SGI1R_EL1, {value:x}",
+				value = in(reg) sgi_value,
+				options(nostack),
+			);
+		}
 
 		interrupts::enable();
 	}
@@ -801,6 +802,12 @@ impl PerCoreScheduler {
 		}
 
 		// Tell the scheduler about the new task.
+		if new_stack_pointer.as_usize() == 0 {
+			error!(
+				"SCHEDULER: switching to task {} with ZERO last_stack_pointer! (from task {})",
+				new_id, id
+			);
+		}
 		debug!(
 			"Switching task from {} to {} (stack {:#X} => {:p})",
 			id,
