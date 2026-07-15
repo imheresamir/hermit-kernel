@@ -42,8 +42,10 @@ const TCR_FLAGS: u64 = TCR_IRGN_WBWA | TCR_ORGN_WBWA | TCR_SHARED;
 const VA_BITS: u64 = 48;
 
 unsafe extern "C" {
-	static vector_table: u8;
-}
+		// NOTE: The build prefixes exported kernel symbols with `hermit_`.
+		// We reference the final symbol name here so debuggers can set breakpoints by name.
+		static hermit_vector_table: u8;
+	}
 
 /// Entrypoint - Initialize Stack pointer and Exception Table
 #[unsafe(no_mangle)]
@@ -63,25 +65,37 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 	}
 
 	naked_asm!(
-		// use core::sync::atomic::{AtomicU32, Ordering};
-		//
-		// pub static CPU_ONLINE: AtomicU32 = AtomicU32::new(0);
-		//
-		// while CPU_ONLINE.load(Ordering::Acquire) != this {
-		//     core::hint::spin_loop();
-		// }
+		// Determine core id from MPIDR.
 		"mrs x4, mpidr_el1",
 		"and x4, x4, #0xff",
-		"1:",
-		"adrp x8, {cpu_online}",
-		"ldr x5, [x8, #:lo12:{cpu_online}]",
-		"cmp x4, x5",
-		"b.eq 2f",
-		"b 1b",
-		"2:",
 
-		// we want to use sp_el1
+		// Only core 0 is allowed to run early boot. Park all other cores in a
+		// low-power loop with interrupts masked until the boot core is ready to
+		// bring them up.
+		"cbz x4, 1f",
 		"msr spsel, #1",
+		"msr daifset, #0xf",
+		"2:",
+		"adrp x8, {early_smp_release}",
+		"ldr w5, [x8, #:lo12:{early_smp_release}]",
+		"cbnz w5, 3f",
+		"wfe",
+		"b 2b",
+		"3:",
+		// released: jump into the regular init path
+		"b {pre_init}",
+		"1:",
+
+		// We want to use sp_el1 as early as possible.
+		"msr spsel, #1",
+
+		// Set exception vector base early so any fault before full init goes to
+		// the kernel vector table (start.s) instead of the low 0x000.. vectors.
+		// Requires a valid stack (we're on sp_el1 now).
+		"adrp x9, {vt}",
+		"add  x9, x9, #:lo12:{vt}",
+		"msr  vbar_el1, x9",
+		"isb",
 
 		// Overwrite RSP if `CURRENT_STACK_ADDRESS != 0`
 		"adrp x8, {current_stack_address}",
@@ -102,9 +116,10 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		// Jump to Rust code
 		"b {pre_init}",
 
-		cpu_online = sym super::CPU_ONLINE,
+		early_smp_release = sym super::EARLY_SMP_RELEASE,
 		stack_top_offset = const KERNEL_STACK_SIZE - TaskStacks::MARKER_SIZE,
 		current_stack_address = sym super::CURRENT_STACK_ADDRESS,
+		vt = sym hermit_vector_table,
 		pre_init = sym pre_init,
 	)
 }
@@ -257,7 +272,7 @@ unsafe extern "C" fn pre_init(boot_info: Option<&'static RawBootInfo>, cpu_id: u
 			"adrp x4, {vector_table}",
 			"add x4, x4, #:lo12:{vector_table}",
 			"msr vbar_el1, x4",
-			vector_table = sym vector_table,
+			vector_table = sym hermit_vector_table,
 			out("x4") _,
 			options(nostack),
 		);
