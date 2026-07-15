@@ -4,7 +4,8 @@
 .extern do_fiq
 .extern do_sync
 .extern do_error
-.extern get_last_stack_pointer
+	.extern get_last_stack_pointer
+	.extern HERMIT_EARLY_EXCEPTION_STACK_POOL
 
 .macro trap_entry spsel
      stp x29, x30, [sp, #-16]!
@@ -82,7 +83,22 @@ b       do_bad_mode
  */
 .align 6
 el1_sync:
-      trap_entry 1
+
+		// Switch to an early emergency exception stack from a bounded pool.
+		//
+		// slot = (MPIDR_EL1 & 0xff) & (POOL_SIZE-1)
+		// sp = &HERMIT_EARLY_EXCEPTION_STACK_POOL + slot*64KiB + 64KiB
+		mrs     x24, mpidr_el1
+		and     x24, x24, #0xff
+		and     x24, x24, #0x3f
+		adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+		add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+		mov     x26, #65536
+		mul     x24, x24, x26
+		add     x24, x25, x24
+		add     x24, x24, x26
+		mov     sp, x24
+		trap_entry 1
       mov     x0, sp
       bl      do_sync
       trap_exit
@@ -96,10 +112,18 @@ el1_sync:
 
 /*
  * IRQ handler.
+ *
+ * IMPORTANT: We do NOT switch to the emergency stack here. The trap_entry
+ * frame must live on the task's own kernel stack so that it survives across
+ * context switches. If we used the emergency stack, a subsequent exception
+ * on the same core would reset SP to the top of the emergency stack and the
+ * new trap_entry would overwrite the previously saved State, corrupting the
+ * task's registers (x30/LR, elr_el1, etc.). This was the root cause of
+ * crashes with PC=0x0 / x30=0x0 after the executor parks.
  */
 .align 6
 el1_irq:
-      trap_entry 1
+	trap_entry 1
       mov     x0, sp
       bl      do_irq
       cmp x0, 0
@@ -121,10 +145,13 @@ el1_irq:
 
 /*
  * FIQ handler.
+ *
+ * Same rationale as el1_irq: use the task's kernel stack directly to
+ * avoid emergency stack corruption across context switches.
  */
 .align 6
 el1_fiq:
-      trap_entry 1
+	trap_entry 1
       mov     x0, sp
       bl      do_fiq
       cmp x0, 0
@@ -146,7 +173,17 @@ el1_fiq:
 
 .align 6
 el1_error:
-      trap_entry 1
+	mrs     x24, mpidr_el1
+	and     x24, x24, #0xff
+	and     x24, x24, #0x3f
+	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+	mov     x26, #65536
+	mul     x24, x24, x26
+	add     x24, x25, x24
+	add     x24, x24, x26
+	mov     sp, x24
+	trap_entry 1
       mov     x0, sp
       bl      do_error
       trap_exit
@@ -164,6 +201,16 @@ el1_error:
 .align 6
 el1_sp0_sync:
       msr spsel, #1
+	mrs     x24, mpidr_el1
+	and     x24, x24, #0xff
+	and     x24, x24, #0x3f
+	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+	mov     x26, #65536
+	mul     x24, x24, x26
+	add     x24, x25, x24
+	add     x24, x24, x26
+	mov     sp, x24
       trap_entry 0
       mov     x0, sp
       bl      do_sync
@@ -182,6 +229,16 @@ el1_sp0_sync:
 .align 6
 el1_sp0_irq:
       msr spsel, #1
+	mrs     x24, mpidr_el1
+	and     x24, x24, #0xff
+	and     x24, x24, #0x3f
+	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+	mov     x26, #65536
+	mul     x24, x24, x26
+	add     x24, x25, x24
+	add     x24, x24, x26
+	mov     sp, x24
       trap_entry 0
       mov     x0, sp
       bl      do_irq
@@ -208,6 +265,16 @@ el1_sp0_irq:
 .align 6
 el1_sp0_fiq:
       msr spsel, #1
+	mrs     x24, mpidr_el1
+	and     x24, x24, #0xff
+	and     x24, x24, #0x3f
+	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+	mov     x26, #65536
+	mul     x24, x24, x26
+	add     x24, x25, x24
+	add     x24, x24, x26
+	mov     sp, x24
       trap_entry 0
       mov     x0, sp
       bl      do_fiq
@@ -231,6 +298,16 @@ el1_sp0_fiq:
 .align 6
 el1_sp0_error:
       msr spsel, #1
+	mrs     x24, mpidr_el1
+	and     x24, x24, #0xff
+	and     x24, x24, #0x3f
+	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
+	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
+	mov     x26, #65536
+	mul     x24, x24, x26
+	add     x24, x25, x24
+	add     x24, x24, x26
+	mov     sp, x24
       trap_entry 0
       mov     x0, sp
       bl      do_error
@@ -275,11 +352,16 @@ el1_error_invalid:
    invalid 3
 .type el1_error_invalid, @function
 
-/* start of the data section */
-.section .rodata
-.align  11
-.global vector_table
-vector_table:
+	/* Exception vectors.
+	 *
+	 * Must reside in executable, mapped memory very early in boot, since `_start`
+	 * programs `VBAR_EL1` before the full kernel paging setup.
+	 */
+	.section .vectors, "ax"
+		.align  11
+		.global vector_table
+	.type vector_table, @function
+	vector_table:
 /* Current EL with SP0 */
 ventry el1_sp0_sync             // Synchronous EL1t
 ventry el1_sp0_irq              // IRQ EL1t
@@ -303,4 +385,18 @@ ventry el0_sync_invalid         // Synchronous 32-bit EL0
 ventry el0_irq_invalid          // IRQ 32-bit EL0
 ventry el0_fiq_invalid          // FIQ 32-bit EL0
 ventry el0_error_invalid        // Error 32-bit EL0
-.size vector_table, .-vector_table
+	.size vector_table, .-vector_table
+	.section .rodata
+	// Keep a second global alias that is easy to find in debuggers/symbolizers.
+	.global __hermit_vector_table
+	.type __hermit_vector_table, @function
+__hermit_vector_table = vector_table
+	// NOTE: `__hermit_vector_table` is an absolute symbol alias, so we must not
+	// emit a `.size` directive for it (LLVM requires size expressions be absolute).
+
+	// Export a stable, prefixed symbol name. The build may also apply a global
+	// prefix automatically, but this guarantees `hermit_vector_table` exists.
+	.global hermit_vector_table
+	.type hermit_vector_table, @function
+hermit_vector_table = vector_table
+	// NOTE: `hermit_vector_table` is an absolute symbol alias; no `.size`.

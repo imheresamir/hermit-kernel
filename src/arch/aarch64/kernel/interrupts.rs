@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use aarch64_cpu::asm::barrier::{ISH, SY, dmb, isb};
 use aarch64_cpu::registers::*;
 use ahash::RandomState;
-use arm_gic::gicv3::{GicCpuInterface, GicV3, SgiTarget, SgiTargetGroup};
+use arm_gic::gicv3::{GicCpuInterface, GicV3};
 use arm_gic::{IntId, InterruptGroup, Trigger, UniqueMmioPointer};
 use fdt::standard_nodes::Compatible;
 use free_list::PageLayout;
@@ -212,6 +212,20 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		loop {
 			core::hint::spin_loop();
 		}
+	} else if ec_raw == 0x20 || ec_raw == 0x21 {
+		// Instruction Abort from lower (0x20) or current (0x21) EL
+		let far = FAR_EL1.get();
+		let sp_val: u64;
+		unsafe { core::arch::asm!("mrs {val}, sp_el1", val = out(reg) sp_val) };
+		error!("Instruction abort at {far:#x}, PC={pc:#x}, EC={ec_raw:#x}");
+		error!("Current stack pointer {state:p}, SP_EL1={sp_val:#x}");
+		error!("Exception Syndrome Register {esr:#x}");
+		error!("Thread ID register {:#x}", TPIDR_EL0.get());
+		let (sx29, sx30) = (state.x29, state.x30);
+		error!("State x29(fp)={sx29:#x} x30(lr)={sx30:#x}");
+		let task_id = core_scheduler().get_current_task_id();
+		error!("Crashed in task {task_id:?}");
+		scheduler::abort()
 	} else if ec == ESR_EL1::EC::Value::TrappedFP {
 		trace!("Floating point trap");
 
@@ -224,7 +238,16 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		// Let the scheduler set up the FPU for the current task
 		core_scheduler().fpu_switch();
 	} else {
-		error!("Unsupported exception class: {ec_raw:#x}, PC={pc:#x}");
+		let far = FAR_EL1.get();
+		let sp_val: u64;
+		unsafe { core::arch::asm!("mrs {val}, sp_el1", val = out(reg) sp_val) };
+		error!("Unsupported exception class: {ec_raw:#x}, PC={pc:#x}, FAR={far:#x}");
+		error!("SP_EL1={sp_val:#x}");
+		// State is #[repr(C, packed)] -- copy fields to locals to avoid misaligned references.
+		let (sx0, sx1, sx2, sx29, sx30) = (state.x0, state.x1, state.x2, state.x29, state.x30);
+		error!("State x0={sx0:#x} x1={sx1:#x} x2={sx2:#x} x30(lr)={sx30:#x} x29(fp)={sx29:#x}");
+		let task_id = core_scheduler().get_current_task_id();
+		error!("Crashed in task {task_id:?}");
 
 		loop {
 			core::hint::spin_loop();
@@ -246,21 +269,39 @@ pub(crate) extern "C" fn do_error(_state: &State) -> ! {
 	scheduler::abort()
 }
 
+/// Send a Software Generated Interrupt to a specific core.
+///
+/// Bypasses the arm-gic crate's `GicCpuInterface::send_sgi()` which has an ABI bug:
+/// `Result<(), GicError>` is returned via a hidden pointer in x8, but the caller
+/// passes NULL, so the callee always crashes writing `Ok(())` through null.
+///
+/// Instead, we build the ICC_SGI1R_EL1 register value manually and issue the MSR
+/// directly. This is safe, efficient, and avoids the broken ABI entirely.
+///
+/// ICC_SGI1R_EL1 encoding:
+///   bits [63:48] = Aff3
+///   bits [43:40] = IRM (1 = exclude self)
+///   bits [39:32] = Aff2
+///   bits [31:24] = INTID
+///   bits [23:16] = Aff1
+///   bits [15:0]  = TargetList
 pub fn wakeup_core(core_id: CoreId) {
 	debug!("Wakeup core {core_id}");
-	let reschedid = IntId::sgi(SGI_RESCHED.into());
 
-	GicCpuInterface::send_sgi(
-		reschedid,
-		SgiTarget::List {
-			affinity3: 0,
-			affinity2: 0,
-			affinity1: 0,
-			target_list: 1 << core_id,
-		},
-		SgiTargetGroup::CurrentGroup1,
-	)
-	.unwrap();
+	let intid: u64 = u64::from(SGI_RESCHED);
+	let target_list: u64 = 1u64 << u64::from(core_id);
+	let sgi_value: u64 = (intid << 24) | target_list;
+
+	// SAFETY: ICC_SGI1R_EL1 is a system register that triggers an SGI to the
+	// specified cores. Writing to it is safe as long as the GIC CPU interface is
+	// initialized (which it is — we only get here after interrupts::init_cpu).
+	unsafe {
+		core::arch::asm!(
+			"msr ICC_SGI1R_EL1, {value:x}",
+			value = in(reg) sgi_value,
+			options(nostack),
+		);
+	}
 }
 
 pub(crate) fn init() {

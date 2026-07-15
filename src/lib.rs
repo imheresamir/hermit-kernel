@@ -232,6 +232,10 @@ fn boot_processor_main() -> ! {
 	mm::claim_initial_heap();
 	hermit_sync::Lazy::force(&console::CONSOLE);
 	env::init();
+	// Early bootarg visibility: print before logging::init() so we can see
+	// whether QEMU/loader bootargs made it into the FDT chosen.bootargs.
+	// This helps debug hangs that occur before the logger is initialized.
+	println!("[KERNEL][EARLY] bootargs = {:?}", env::fdt().and_then(|f| f.chosen().bootargs()));
 	unsafe {
 		logging::init();
 	}

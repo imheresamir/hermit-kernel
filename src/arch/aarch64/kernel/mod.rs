@@ -32,9 +32,42 @@ pub(crate) struct AlignedAtomicU32(AtomicU32);
 /// `CPU_ONLINE` is the count of CPUs that finished initialization.
 ///
 /// It also synchronizes initialization of CPU cores.
+///
+/// NOTE: This is read extremely early in the aarch64 entry stub (before paging
+/// is fully initialized). Keep it in a dedicated section so it stays within the
+/// early-mapped kernel image prefix even as the binary grows.
+#[unsafe(link_section = ".early_data")]
 pub(crate) static CPU_ONLINE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU32::new(0));
 
+/// Like `CPU_ONLINE`, this is accessed by the aarch64 entry stub before full
+/// paging init. Keep it close to other early-boot state.
+#[unsafe(link_section = ".early_data")]
 pub(crate) static CURRENT_STACK_ADDRESS: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+/// Early SMP release flag.
+///
+/// Secondary cores spin in `_start` until the boot core sets this to 1.
+/// Placed in `.early_data` so it is mapped before paging is fully initialized.
+#[unsafe(link_section = ".early_data")]
+pub(crate) static EARLY_SMP_RELEASE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU32::new(0));
+
+	/// Emergency exception stack pool used very early on aarch64.
+	///
+	/// Design:
+	/// - **Early boot** uses a small fixed pool of stacks in `.early_data` that is
+	///   guaranteed mapped. This avoids recursive exception storms if `sp` is invalid.
+	/// - **Later boot** should switch to real per-core exception stacks stored in
+	///   core-local state once the allocator/paging are fully initialized.
+	///
+	/// For now we keep only the early pool (64 stacks). This keeps `.early_data`
+	/// bounded and avoids scaling the image size linearly with core count.
+	pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_SIZE: usize = 64 * 1024;
+	pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE: usize = 64;
+
+	#[unsafe(link_section = ".early_data")]
+	#[unsafe(no_mangle)]
+	pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE] =
+		[0; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE];
 
 #[cfg(target_os = "none")]
 global_asm!(include_str!("start.s"));
@@ -73,6 +106,13 @@ pub fn boot_processor_init() {
 	pci::init();
 
 	finish_processor_init();
+
+	// Safe-3 release point: core 0 has completed global init (paging, interrupts, etc)
+	// and has installed its own per-core state. Now allow secondary cores to enter
+	// the normal init path.
+	EARLY_SMP_RELEASE.0.store(1, Ordering::Release);
+	// Wake cores parked in `wfe`.
+	unsafe { core::arch::asm!("sev", options(nostack, nomem)) };
 }
 
 /// Application Processor initialization
