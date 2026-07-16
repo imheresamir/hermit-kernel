@@ -156,7 +156,7 @@ where
 		let now = crate::arch::kernel::systemtime::now_micros();
 		let elapsed_ms = (now as i128 - start as i128) as i64;
 		let backoff_done = backoff.is_completed();
-		warn!(
+		debug!(
 			"BLOCK_ON iter={} start={} now={} elapsed_ms={} timeout_ms={} backoff_done={} ready={}",
 			iter, start, now, elapsed_ms, timeout_ms, backoff_done,
 			matches!(result, Poll::Ready(_))
