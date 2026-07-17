@@ -165,6 +165,38 @@ fn trivial_test() {
 	panic!("Test called");
 }
 
+// C runtime globals from newlib (libc.a). These must be initialized before
+// LIEF's C++ constructors run via `__libc_init_array` inside `runtime_entry`.
+// See docs/atexit-bss-mystery.md for full analysis.
+#[cfg(all(target_os = "none", not(test)))]
+unsafe extern "C" {
+	/// Pointer to the current `struct _atexit`. Must be NULL so
+	/// `__register_exitproc` falls back to the static `__atexit0`.
+	static mut __atexit: *mut core::ffi::c_void;
+	/// newlib's global `struct _reent`. Must be non-zero for reentrant newlib
+	/// functions (printf, malloc, atexit, etc.) to work.
+	static mut __sf: core::ffi::c_void;
+}
+
+/// Initialize newlib C runtime globals so LIEF's C++ static constructors
+/// (which call `std::atexit`, `malloc`, etc.) work correctly.
+///
+/// Must be called once on core 0, before `runtime_entry` invokes
+/// `__libc_init_array` which runs `.init_array` constructors.
+#[cfg(all(target_os = "none", not(test)))]
+unsafe fn init_c_runtime() {
+	// Ensure `__atexit` is NULL. `__register_exitproc` checks this: if NULL,
+	// it uses the static `__atexit0` fallback. If non-NULL (e.g. `1` due to
+	// uninitialized / clobbered BSS), it dereferences the invalid pointer → fault.
+	unsafe {
+		__atexit = core::ptr::null_mut();
+	}
+	info!(
+		"C runtime initialized: __atexit = NULL, __sf at {:p}",
+		&raw const __sf
+	);
+}
+
 /// Entry point of a kernel thread, which initialize the libos
 #[cfg(target_os = "none")]
 extern "C" fn initd(_arg: usize) {
@@ -195,6 +227,14 @@ extern "C" fn initd(_arg: usize) {
 	if cfg!(feature = "warn-prebuilt") {
 		warn!("This is a prebuilt Hermit kernel.");
 		warn!("For non-default device drivers and features, consider building a custom kernel.");
+	}
+
+	// Initialize the newlib C runtime globals before the application starts.
+	// runtime_entry → __libc_init_array → LIEF constructors → std::atexit()
+	// requires a valid C runtime. Without this, __register_exitproc faults.
+	#[cfg(not(test))]
+	unsafe {
+		init_c_runtime();
 	}
 
 	info!("Jumping into application");
@@ -235,7 +275,10 @@ fn boot_processor_main() -> ! {
 	// Early bootarg visibility: print before logging::init() so we can see
 	// whether QEMU/loader bootargs made it into the FDT chosen.bootargs.
 	// This helps debug hangs that occur before the logger is initialized.
-	println!("[KERNEL][EARLY] bootargs = {:?}", env::fdt().and_then(|f| f.chosen().bootargs()));
+	println!(
+		"[KERNEL][EARLY] bootargs = {:?}",
+		env::fdt().and_then(|f| f.chosen().bootargs())
+	);
 	unsafe {
 		logging::init();
 	}
