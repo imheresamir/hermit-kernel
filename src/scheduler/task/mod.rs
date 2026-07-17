@@ -6,9 +6,10 @@ pub(crate) mod tls;
 use alloc::collections::{LinkedList, VecDeque};
 use alloc::rc::Rc;
 use alloc::sync::Arc;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::num::NonZeroU64;
 use core::{cmp, fmt};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
@@ -24,6 +25,52 @@ use crate::arch::kernel::processor::{self, FPUState};
 use crate::arch::kernel::scheduler::TaskStacks;
 use crate::fd::{Fd, RawFd, stdio};
 use crate::scheduler::CoreId;
+
+// ---------------------------------------------------------------------------
+// Bitmap pool: static bump allocator for cache-padded priority bitmaps.
+//
+// Each TaskHandlePriorityQueue needs a CachePadded<u64> for its priority
+// bitmap (to prevent false sharing with the adjacent queues array). But
+// CachePadded<u64> is #[repr(align(128))], and propagating that alignment
+// through the struct chain (TaskHandlePriorityQueue → RecursiveMutexState →
+// TicketMutex → RecursiveMutex) breaks the FFI contract with newlib:
+// newlib's pthread_once_t is only 8-byte aligned.
+//
+// Solution: store CachePadded<u64> instances in a static pool and reference
+// them by index. The struct holds just a usize (8-byte aligned).
+// ---------------------------------------------------------------------------
+
+/// Maximum concurrent mutex/semaphore instances that use pooled bitmaps.
+const MAX_BITMAP_POOL: usize = 256;
+
+#[derive(Copy, Clone)]
+#[repr(C, align(128))]
+struct BitmapSlot {
+	bitmap: CachePadded<u64>,
+}
+
+static mut BITMAP_POOL: [BitmapSlot; MAX_BITMAP_POOL] =
+	[BitmapSlot { bitmap: CachePadded::new(0) }; MAX_BITMAP_POOL];
+static NEXT_BITMAP_ID: AtomicUsize = AtomicUsize::new(0);
+
+fn alloc_bitmap_id() -> usize {
+	let id = NEXT_BITMAP_ID.fetch_add(1, Ordering::Relaxed);
+	assert!(
+		id < MAX_BITMAP_POOL,
+		"exceeded MAX_BITMAP_POOL ({MAX_BITMAP_POOL})"
+	);
+	id
+}
+
+/// Returns a raw pointer to the cache-padded bitmap at the given pool index.
+///
+/// # Safety
+///
+/// `id` must be a value previously returned by `alloc_bitmap_id()`.
+#[inline]
+unsafe fn bitmap_ptr(id: usize) -> *mut CachePadded<u64> {
+	unsafe { core::ptr::addr_of_mut!(BITMAP_POOL[id].bitmap) }
+}
 
 /// Returns the most significant bit.
 ///
@@ -152,25 +199,64 @@ impl PartialEq for TaskHandle {
 
 impl Eq for TaskHandle {}
 
-/// Realize a priority queue for task handles
+/// Realize a priority queue for task handles.
+///
+/// The priority bitmap is stored in a static pool of `CachePadded<u64>`
+/// instances (see `BITMAP_POOL` above) rather than inline.  This keeps the
+/// struct at 8-byte alignment so that `RecursiveMutex` (which contains this
+/// type) is FFI-compatible with newlib's `pthread_once_t` (also 8-byte
+/// aligned).  The pool entries are `#[repr(align(128))]` so cache-line
+/// isolation is preserved.
 #[derive(Default)]
 pub(crate) struct TaskHandlePriorityQueue {
 	queues: [Option<VecDeque<TaskHandle>>; NO_PRIORITIES],
-	prio_bitmap: CachePadded<u64>,
+	prio_bitmap_id: Cell<usize>,
 }
 
 impl TaskHandlePriorityQueue {
-	/// Creates an empty priority queue for tasks
+	/// Creates an empty priority queue for tasks.
+	///
+	/// The bitmap pool slot is allocated lazily on first access.
 	pub const fn new() -> Self {
 		Self {
 			queues: [const { None }; NO_PRIORITIES],
-			prio_bitmap: CachePadded::new(0),
+			prio_bitmap_id: Cell::new(0),
 		}
+	}
+
+	/// Ensure a bitmap pool slot has been allocated for this queue.
+	fn ensure_bitmap(&self) -> usize {
+		let id = self.prio_bitmap_id.get();
+		if id == 0 {
+			let new_id = alloc_bitmap_id();
+			self.prio_bitmap_id.set(new_id);
+			new_id
+		} else {
+			id
+		}
+	}
+
+	/// Shared reference to the cache-padded bitmap.
+	#[inline]
+	fn bitmap(&self) -> &CachePadded<u64> {
+		let id = self.ensure_bitmap();
+		unsafe { &*bitmap_ptr(id) }
+	}
+
+	/// Exclusive reference to the cache-padded bitmap.
+	///
+	/// # Safety
+	///
+	/// Caller must hold `&mut self` (exclusive access to this queue).
+	#[inline]
+	fn bitmap_mut(&mut self) -> &mut CachePadded<u64> {
+		let id = self.ensure_bitmap();
+		unsafe { &mut *bitmap_ptr(id) }
 	}
 
 	/// Checks if the queue is empty.
 	pub fn is_empty(&self) -> bool {
-		self.prio_bitmap.into_inner() == 0
+		self.bitmap().into_inner() == 0
 	}
 
 	/// Checks if the given task is in the queue. Returns `true` if the task
@@ -185,7 +271,7 @@ impl TaskHandlePriorityQueue {
 		let i = task.priority.into() as usize;
 		//assert!(i < NO_PRIORITIES, "Priority {} is too high", i);
 
-		*self.prio_bitmap |= (1 << i) as u64;
+		**self.bitmap_mut() |= (1 << i) as u64;
 		if let Some(queue) = &mut self.queues[i] {
 			queue.push_back(task);
 		} else {
@@ -201,7 +287,7 @@ impl TaskHandlePriorityQueue {
 		let task = queue.pop_front();
 
 		if queue.is_empty() {
-			*self.prio_bitmap &= !(1 << queue_index as u64);
+			**self.bitmap_mut() &= !(1 << queue_index as u64);
 		}
 
 		task
@@ -209,7 +295,7 @@ impl TaskHandlePriorityQueue {
 
 	/// Pop the task handle with the highest priority from the queue
 	pub fn pop(&mut self) -> Option<TaskHandle> {
-		let i = msb(self.prio_bitmap.into_inner())?;
+		let i = msb(self.bitmap().into_inner())?;
 
 		self.pop_from_queue(i as usize)
 	}
@@ -233,7 +319,7 @@ impl TaskHandlePriorityQueue {
 			}
 
 			if queue.is_empty() {
-				*self.prio_bitmap &= !(1 << queue_index as u64);
+				**self.bitmap_mut() &= !(1 << queue_index as u64);
 			}
 		}
 
