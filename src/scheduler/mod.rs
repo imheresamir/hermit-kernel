@@ -795,7 +795,23 @@ impl PerCoreScheduler {
 			}
 
 			(borrowed.id, borrowed.last_stack_pointer)
-		};
+	};
+
+		// DEBUG (Option D ctx-switch corruption hunt): decode the resumed
+		// task's saved State and print sp_el0 / elr_el1. A corrupt frame
+		// shows sp_el0 in the kernel static range (e.g. 0x41850000, the
+		// exception-stack top) and elr in kernel .text (e.g. reschedule) —
+		// i.e. the frame was saved from the IRQ/exc stack instead of a real
+		// task frame. Remove once the corruption source is fixed.
+		if cfg!(target_arch = "aarch64") {
+			let st = new_stack_pointer.as_ptr::<crate::kernel::scheduler::State>();
+			let sp_el0 = unsafe { (*st).sp_el0 };
+			let elr = unsafe { (*st).elr_el1 };
+			let spsel = unsafe { (*st).spsel };
+			error!(
+				"CTXSWITCH -> task {new_id}: State@{new_stack_pointer:p} sp_el0={sp_el0:#x} elr_el1={elr:p} spsel={spsel:#x}"
+			);
+		}
 
 		if id == new_id {
 			return None;

@@ -135,7 +135,8 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	crate::executor::run();
+	// handle_waiting_tasks() calls executor::run() internally, so a separate
+	// executor::run() here is redundant.
 	core_scheduler().handle_waiting_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
@@ -161,7 +162,8 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	crate::executor::run();
+	// handle_waiting_tasks() calls executor::run() internally, so a separate
+	// executor::run() here is redundant.
 	core_scheduler().handle_waiting_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
@@ -203,7 +205,18 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 				error!("Unable to acknowledge interrupt!");
 			}
 
-			scheduler::abort()
+				error!("Fatal: halting in data-abort handler to surface the real fault.");
+				// DEBUG SURFACE: previously this called `scheduler::abort()`
+				// (`core_scheduler().exit(-1)`), whose panic/shutdown path walks the
+				// (very deep) application call stack and overflows the exception
+				// stack, triple-faulting and masking the original fault. Spin
+				// instead so the FAR/ELR/ESR printed above survive. The real bug
+				// is the application fault (observed PC = `sparse_chunk::insert`
+				// in Gleam/HAMT code at client connect) - fix that, then restore
+				// `scheduler::abort()`.
+				loop {
+					core::hint::spin_loop();
+				}
 		} else {
 			error!("Unknown exception");
 		}
@@ -216,7 +229,11 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		// Instruction Abort from lower (0x20) or current (0x21) EL
 		let far = FAR_EL1.get();
 		let sp_val: u64;
-		unsafe { core::arch::asm!("mrs {val}, sp_el1", val = out(reg) sp_val) };
+		// At EL1h the running stack pointer IS `sp` (SP_EL1). Reading the
+		// `SP_EL1` *system register* via `mrs` is UNDEFINED at EL1 (only
+		// accessible from EL2/EL3) and traps as an Undefined Instruction —
+		// which re-enters el1_sync and causes an infinite exception storm.
+		unsafe { core::arch::asm!("mov {val}, sp", val = out(reg) sp_val) };
 		error!("Instruction abort at {far:#x}, PC={pc:#x}, EC={ec_raw:#x}");
 		error!("Current stack pointer {state:p}, SP_EL1={sp_val:#x}");
 		error!("Exception Syndrome Register {esr:#x}");
@@ -240,7 +257,8 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 	} else {
 		let far = FAR_EL1.get();
 		let sp_val: u64;
-		unsafe { core::arch::asm!("mrs {val}, sp_el1", val = out(reg) sp_val) };
+		// See note above: `mrs ..., sp_el1` is UNDEFINED at EL1. Use `sp`.
+		unsafe { core::arch::asm!("mov {val}, sp", val = out(reg) sp_val) };
 		error!("Unsupported exception class: {ec_raw:#x}, PC={pc:#x}, FAR={far:#x}");
 		error!("SP_EL1={sp_val:#x}");
 		// State is #[repr(C, packed)] -- copy fields to locals to avoid misaligned references.

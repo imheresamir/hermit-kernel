@@ -113,11 +113,40 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		"mov x8, {stack_top_offset}",
 		"add sp, sp, x8",
 
+		// Option D (EL1t/EL1h split): run the boot path at EL1t with SP_EL0 =
+		// boot/task stack, and reserve SP_EL1 for this core's per-core exception
+		// stack. On exception entry the hardware flips to EL1h (SP_EL1)
+		// automatically -> the handler always lands on the known-good exception
+		// stack.
+		//
+		// CRITICAL: the named `SP_EL1` system register is NOT accessible at EL1
+		// (`msr sp_el1, xN` is UNDEFINED there). At EL1h the *current* SP IS
+		// SP_EL1, so we set it with `mov sp, xN`. SP_EL0 is the non-current bank
+		// at EL1h and is written with `msr sp_el0, xN`. So while still at EL1h:
+		//   1. stash the boot stack into SP_EL0 (msr sp_el0),
+		//   2. set SP_EL1 = exception stack via `mov sp` (current SP is SP_EL1),
+		//   3. flip to EL1t (msr spsel,#0) -> current SP becomes SP_EL0 = boot
+		//      stack; SP_EL1 retains the exception stack.
+		"mov x24, sp",                    // x24 = boot stack (current SP == SP_EL1 at EL1h)
+		"msr sp_el0, x24",                // SP_EL0 = boot stack (non-current bank, writable)
+		"mrs x25, mpidr_el1",             // core_id
+		"and x25, x25, #0xff",
+		"adrp x26, {exc_stacks}",
+		"add  x26, x26, #:lo12:{exc_stacks}",
+		"mov  x28, {exc_stack_size}",
+		"mul  x28, x25, x28",
+		"add  x26, x26, x28",
+		"add  x26, x26, {exc_stack_size}",   // top of this core's exception stack
+		"mov sp, x26",                    // SP_EL1 = per-core exception stack (current SP at EL1h)
+		"msr spsel, #0",                 // now EL1t; current SP becomes SP_EL0 = boot stack
+
 		// Jump to Rust code
 		"b {pre_init}",
 
 		early_smp_release = sym super::EARLY_SMP_RELEASE,
 		stack_top_offset = const KERNEL_STACK_SIZE - TaskStacks::MARKER_SIZE,
+		exc_stacks = sym crate::arch::aarch64::kernel::EXCEPTION_STACKS,
+		exc_stack_size = const crate::arch::aarch64::kernel::EXCEPTION_STACK_SIZE,
 		current_stack_address = sym super::CURRENT_STACK_ADDRESS,
 		vt = sym hermit_vector_table,
 		pre_init = sym pre_init,
@@ -245,6 +274,22 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		"ldr x0, ={sctlr_el1}",
 		"msr sctlr_el1, x0",
 
+		// Option D (EL1t/EL1h split) — symmetric with _start. The named SP_EL1
+		// register is UNDEFINED at EL1, so set SP_EL1 via `mov sp` while at EL1h
+		// (current SP == SP_EL1), then flip to EL1t. (See _start for details.)
+		"mov x24, sp",                    // x24 = boot stack (current SP == SP_EL1 at EL1h)
+		"msr sp_el0, x24",                // SP_EL0 = boot stack (non-current bank)
+		"mrs x25, mpidr_el1",
+		"and x25, x25, #0xff",
+		"adrp x26, {exc_stacks}",
+		"add  x26, x26, #:lo12:{exc_stacks}",
+		"mov  x28, {exc_stack_size}",
+		"mul  x28, x25, x28",
+		"add  x26, x26, x28",
+		"add  x26, x26, {exc_stack_size}",
+		"mov sp, x26",                    // SP_EL1 = per-core exception stack (current SP at EL1h)
+		"msr spsel, #0",                 // now EL1t; current SP becomes SP_EL0 = boot stack
+
 		// initialize argument for pre_init
 		"mov x0, xzr",
 		"mrs x1, mpidr_el1",
@@ -256,6 +301,8 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		mair_el1 = const mair(0x00, MT_DEVICE_nGnRnE) | mair(0x04, MT_DEVICE_nGnRE) | mair(0x0c, MT_DEVICE_GRE) | mair(0x44, MT_NORMAL_NC) | mair(0xff, MT_NORMAL),
 		tcr_bits = const tcr_size(VA_BITS) | TCR_TG1_4K | TCR_FLAGS,
 		stack_top_offset = const KERNEL_STACK_SIZE - TaskStacks::MARKER_SIZE,
+		exc_stacks = sym crate::arch::aarch64::kernel::EXCEPTION_STACKS,
+		exc_stack_size = const crate::arch::aarch64::kernel::EXCEPTION_STACK_SIZE,
 		current_stack_address = sym super::CURRENT_STACK_ADDRESS,
 		sctlr_el1 = const SCTLR_EL1,
 		ttbr0 = sym TTBR0,

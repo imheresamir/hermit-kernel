@@ -1,15 +1,13 @@
 //! Architecture dependent interface to initialize a task
 
 use core::arch::naked_asm;
-use core::sync::atomic::Ordering;
-
 use aarch64_cpu::asm::barrier::{SY, isb};
 use aarch64_cpu::registers::*;
 use align_address::Align;
 use free_list::{PageLayout, PageRange};
 use memory_addresses::{PhysAddr, VirtAddr};
 
-use crate::arch::aarch64::kernel::CURRENT_STACK_ADDRESS;
+use crate::arch::aarch64::kernel::{IDLE_STACKS, IDLE_STACK_SIZE};
 use crate::arch::aarch64::kernel::core_local::core_scheduler;
 use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize, PageTableEntryFlags};
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
@@ -174,7 +172,16 @@ impl TaskStacks {
 	}
 
 	pub fn from_boot_stacks() -> TaskStacks {
-		let stack = VirtAddr::from_ptr(CURRENT_STACK_ADDRESS.load(Ordering::Relaxed));
+		// The idle / first task runs on this core's STATIC idle stack
+		// (IDLE_STACKS[core_id]) — a per-core slot in the loaded image, mapped
+		// in full by the loader. No dynamic allocation (Path C).
+		let base = crate::arch::aarch64::kernel::core_local::core_id() as usize
+			* IDLE_STACK_SIZE;
+		// SAFETY: IDLE_STACKS is a static [u8; IDLE_STACK_SIZE] in .idle_stacks;
+		// take a raw pointer (no reference to the mutable static) and index it.
+		let stack = VirtAddr::from_ptr(unsafe {
+			(&raw const IDLE_STACKS.0).cast::<u8>().add(base)
+		});
 		debug!("Using boot stack {stack:p}");
 
 		TaskStacks::Boot(BootStack { stack })
@@ -307,10 +314,19 @@ impl TaskFrame for Task {
 			(*state).elr_el1 = task_start;
 			(*state).x0 = func as usize as u64; // use second argument to transfer the entry point
 			(*state).x1 = arg as u64;
-			(*state).spsel = 1;
-
-			/* Zero the condition flags. */
-			(*state).spsr_el1 = 0x3e5;
+			// Option D: tasks MUST resume at EL1t (SPSEL=0). SP_EL0 holds
+			// the task/kernel stack; SP_EL1 stays reserved for the per-core
+			// exception stack (set at boot). `trap_exit` restores spsr_el1
+			// (NOT the `spsel` field below) and that is what selects
+			// EL1h/EL1t on eret — so the SPSEL bit in spsr_el1 is the real
+			// control. 0x3e5 has SPSEL=1 (EL1h) -> the task would run on
+			// SP_EL1 = exc-stack top and fault the instant it touches its
+			// stack. 0x3e4 has SPSEL=0 (EL1t): eret lands the task at EL1t
+			// with SP = SP_EL0 = its own stack, SP_EL1 untouched. I/F stay
+			// masked (same as the old EL1h value) — the kernel enables IRQs
+			// via interrupts::enable() as before.
+			(*state).spsel = 0;
+			(*state).spsr_el1 = 0x3e4;
 
 			// Set the task's stack pointer entry to the stack we have just crafted.
 			self.last_stack_pointer = stack;
