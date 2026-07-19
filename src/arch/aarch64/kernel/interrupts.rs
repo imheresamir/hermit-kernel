@@ -205,7 +205,18 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 				error!("Unable to acknowledge interrupt!");
 			}
 
-			scheduler::abort()
+			error!("Fatal: halting in data-abort handler to surface the real fault.");
+			// DEBUG SURFACE: previously this called `scheduler::abort()`
+			// (`core_scheduler().exit(-1)`), whose panic/shutdown path walks the
+			// (very deep) application call stack and overflows the exception
+			// stack, triple-faulting and masking the original fault. Spin
+			// instead so the FAR/ELR/ESR printed above survive. The real bug
+			// is the application fault (observed PC = `sparse_chunk::insert`
+			// in Gleam/HAMT code at client connect) - fix that, then restore
+			// `scheduler::abort()`.
+			loop {
+				core::hint::spin_loop();
+			}
 		} else {
 			error!("Unknown exception");
 		}
