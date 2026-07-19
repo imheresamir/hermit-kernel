@@ -135,7 +135,8 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	crate::executor::run();
+	// handle_waiting_tasks() calls executor::run() internally, so a separate
+	// executor::run() here is redundant.
 	core_scheduler().handle_waiting_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
@@ -161,7 +162,8 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	crate::executor::run();
+	// handle_waiting_tasks() calls executor::run() internally, so a separate
+	// executor::run() here is redundant.
 	core_scheduler().handle_waiting_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
