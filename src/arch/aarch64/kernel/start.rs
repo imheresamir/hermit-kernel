@@ -11,8 +11,15 @@ use hermit_entry::Entry;
 use hermit_entry::boot_info::RawBootInfo;
 
 use crate::arch::aarch64::kernel::scheduler::TaskStacks;
-use crate::config::KERNEL_STACK_SIZE;
+use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 use crate::env;
+
+// Per-core exception-stack base symbol (defined in link.x as `.exception_stacks`)
+// — PIE-rebased by the loader, so `sym` yields the correct runtime address.
+// Used by Phase 2a.1 to set SP_EL1 to this core's exception stack top (Option D).
+unsafe extern "C" {
+    static __start_exception_stacks: u8;
+}
 
 /*
  * Memory types available.
@@ -113,6 +120,26 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		"mov x8, {stack_top_offset}",
 		"add sp, sp, x8",
 
+		// === Phase 2a.1: per-core exception-stack SP_EL1 (Option D) ===
+		// spsel=1 (line above), so `sp` aliases SP_EL1; setting SP_EL1 == `mov sp`.
+		// Tasks still run EL1h for now, so this only conditions the early/boot
+		// exception path; the vector rewrite (2a.2) later relies on SP_EL1=E.
+		"mrs x24, mpidr_el1",
+		"and x24, x24, #0xff",       // core index (aff0; >64 cores via §7.2 port)
+		"and x24, x24, #0x3f",
+		"adrp x25, {exc_start}",
+		"add  x25, x25, #:lo12:{exc_start}",
+		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
+		"mul  x24, x24, x26",
+		"add  x25, x25, x24",        // base of this core's exception slot
+		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000)
+		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable stack
+		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
+		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
+		// legal way to set it. Do NOT use `msr sp_el1`.
+		"mov  sp, x25",
+
 		// Jump to Rust code
 		"b {pre_init}",
 
@@ -121,6 +148,8 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		current_stack_address = sym super::CURRENT_STACK_ADDRESS,
 		vt = sym hermit_vector_table,
 		pre_init = sym pre_init,
+		exc_start = sym __start_exception_stacks,
+		default_stack_size = const DEFAULT_STACK_SIZE,
 	)
 }
 
@@ -237,6 +266,25 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		"mov x8, {stack_top_offset}",
 		"add sp, sp, x8",
 
+		// === Phase 2a.1: per-core exception-stack SP_EL1 (Option D) ===
+		// spsel=1, so `sp` aliases SP_EL1; setting SP_EL1 == `mov sp`. Mirrors
+		// the BSP _start block above (inserted after `add sp,sp,x8`).
+		"mrs x24, mpidr_el1",
+		"and x24, x24, #0xff",       // core index (aff0; >64 cores via §7.2 port)
+		"and x24, x24, #0x3f",
+		"adrp x25, {exc_start}",
+		"add  x25, x25, #:lo12:{exc_start}",
+		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
+		"mul  x24, x24, x26",
+		"add  x25, x25, x24",        // base of this core's exception slot
+		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000)
+		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable stack
+		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
+		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
+		// legal way to set it. Do NOT use `msr sp_el1`.
+		"mov  sp, x25",
+
 		"msr ttbr1_el1, xzr",
 		"adrp x8, {ttbr0}",
 		"ldr x5, [x8, #:lo12:{ttbr0}]",
@@ -260,6 +308,8 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		sctlr_el1 = const SCTLR_EL1,
 		ttbr0 = sym TTBR0,
 		pre_init = sym pre_init,
+		exc_start = sym __start_exception_stacks,
+		default_stack_size = const DEFAULT_STACK_SIZE,
 	)
 }
 
