@@ -312,16 +312,18 @@ impl TaskFrame for Task {
 			/* Zero the condition flags. */
 			(*state).spsr_el1 = 0x3e5;
 
-			// Set the task's stack pointer entry to the stack we have just crafted.
-			self.last_stack_pointer = stack;
+						// Set the task's stack pointer entry to the stack we have just crafted.
+						self.last_stack_pointer = stack;
 
-			// initialize user-level stack
-			self.user_stack_pointer = self.stacks.get_user_stack()
-				+ self.stacks.get_user_stack_size()
-				- TaskStacks::MARKER_SIZE;
-			*self.user_stack_pointer.as_mut_ptr::<u64>() = 0xdead_beefu64;
-			(*state).sp_el0 = self.user_stack_pointer.as_u64();
-		}
+						// initialize user-level stack
+						self.user_stack_pointer = self.stacks.get_user_stack()
+						+ self.stacks.get_user_stack_size()
+						- TaskStacks::MARKER_SIZE;
+						*self.user_stack_pointer.as_mut_ptr::<u64>() = 0xdead_beefu64;
+						(*state).sp_el0 = self.user_stack_pointer.as_u64();
+						info!("[D3-TRACE] create_stack_frame: sp_el0={:#x} last_stack_pointer={:p} user_stack={:#x}",
+						self.user_stack_pointer.as_u64(), stack, self.stacks.get_user_stack().as_u64());
+						}
 	}
 }
 
@@ -332,9 +334,12 @@ pub(crate) extern "C" fn get_last_stack_pointer() -> u64 {
 	isb(SY);
 
 	let sp = core_scheduler().get_last_stack_pointer().as_u64();
+	// NOTE: do NOT fatal on 0 here. The early-boot/idle task (TaskStacks::Boot)
+	// legitimately has last_stack_pointer == 0; callers that copy the frame
+	// (D3) guard with cbz. A 0 here only matters on the real switch path
+	// (mov sp, x0), which will fault visibly if truly bogus.
 	if sp == 0 {
-		error!("FATAL: get_last_stack_pointer() returned 0 for task {}!",
-			core_scheduler().get_current_task_id());
+		debug!("get_last_stack_pointer() == 0 (early-boot/idle; expected)");
 	}
 	sp
 }

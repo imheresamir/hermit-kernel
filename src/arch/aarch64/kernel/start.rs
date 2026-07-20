@@ -129,12 +129,12 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		"and x24, x24, #0x3f",
 		"adrp x25, {exc_start}",
 		"add  x25, x25, #:lo12:{exc_start}",
-		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
 		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
 		"mul  x24, x24, x26",
 		"add  x25, x25, x24",        // base of this core's exception slot
-		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000)
-		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable stack
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (64KiB exception scratch stack)
+		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable exception stack
 		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
 		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
 		// legal way to set it. Do NOT use `msr sp_el1`.
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		vt = sym hermit_vector_table,
 		pre_init = sym pre_init,
 		exc_start = sym __start_exception_stacks,
-		default_stack_size = const DEFAULT_STACK_SIZE,
+		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (64KiB + GUARD per design §1.1)
 	)
 }
 
@@ -274,12 +274,12 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		"and x24, x24, #0x3f",
 		"adrp x25, {exc_start}",
 		"add  x25, x25, #:lo12:{exc_start}",
-		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
 		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
 		"mul  x24, x24, x26",
 		"add  x25, x25, x24",        // base of this core's exception slot
-		"mov  x26, {default_stack_size}", // DEFAULT_STACK_SIZE (0x10000)
-		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable stack
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (64KiB exception scratch stack)
+		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable exception stack
 		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
 		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
 		// legal way to set it. Do NOT use `msr sp_el1`.
@@ -309,7 +309,7 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		ttbr0 = sym TTBR0,
 		pre_init = sym pre_init,
 		exc_start = sym __start_exception_stacks,
-		default_stack_size = const DEFAULT_STACK_SIZE,
+		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (64KiB + GUARD per design §1.1)
 	)
 }
 

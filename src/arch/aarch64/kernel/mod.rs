@@ -121,6 +121,9 @@ pub(crate) fn protect_stack_guards() {
         ]
     };
     // Per-slot stack size from config.rs, parallel to `section_bases` above.
+    // The exception stack is DEFAULT_STACK_SIZE (64KiB) -- a scratch stack for
+    // trap_entry + dispatch (§1.1); deep handler work runs on the task's kernel
+    // stack. All four sources (link.x, start.rs, core_local.rs, here) are 64KiB.
     let stacks: [usize; 6] = [
         DEFAULT_STACK_SIZE,
         KERNEL_STACK_SIZE,

@@ -13,19 +13,27 @@ pub unsafe extern "C" fn call_with_kernel_stack(
 	f: unsafe extern "C" fn(x0: Reg, x1: Reg, x2: Reg, x3: Reg, x4: Reg, x5: Reg) -> Reg,
 ) -> Reg {
 	core::arch::naked_asm!(
-		// Disable IRQs and FIQs while changing stack pointer
-		"msr daifset, #0b11",
-		// Preserve return address on the stack
+		// Save return address on the CURRENT stack (SP_EL0 = task body stack) before switching.
 		"str x30, [sp, #-16]!",
-		// Switch to kernel stack
+		// Select SP_EL1 so we can write it. Under INV-D SP_EL1 == E (exception
+		// stack), NOT the task kernel stack, so we must load the kernel stack
+		// explicitly from CoreLocal.kernel_sp (offset 16) instead of relying on
+		// SP_EL1 already holding it (that assumption is what the old code made).
 		"msr spsel, #1",
+		// x9 = &CoreLocal (per-core, via TPIDR_EL1)
+		"mrs x9, tpidr_el1",
+		// SP_EL1 = current task's kernel-stack top (kernel_sp field, offset 16).
+		// `ldr sp, [...]` is illegal; load to a GPR then `mov sp, x9` (legal EL1 write).
+		"ldr x9, [x9, #16]",
+		"mov sp, x9",
 		// Re-enable IRQs and FIQs
 		"msr daifclr, #0b11",
 		// Call the function pointer (stored in x6)
 		"blr x6",
 		// Disable IRQs and FIQs before restoring stack
 		"msr daifset, #0b11",
-		// Switch back to user stack
+		// Switch back to user/body stack (SP_EL0), restoring SP_EL1 = E for the
+		// next exception (INV-D).
 		"msr spsel, #0",
 		// Restore return address from the stack
 		"ldr x30, [sp], 16",

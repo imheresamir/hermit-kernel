@@ -173,6 +173,8 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 		without_interrupts(|| {
 			// Get the current task.
 			let mut current_task_borrowed = self.current_task.borrow_mut();
+			info!("[D5-TRACE] Task::exit: id={} status={:?} (exit_code={})",
+				current_task_borrowed.id, current_task_borrowed.status, exit_code);
 			assert_ne!(
 				current_task_borrowed.status,
 				TaskStatus::Idle,
