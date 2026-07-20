@@ -14,8 +14,25 @@ use super::interrupts::{IRQ_COUNTERS, IrqStatistics};
 #[cfg(feature = "smp")]
 use crate::scheduler::SchedulerInput;
 use crate::scheduler::{CoreId, PerCoreScheduler};
+use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize};
+use crate::config::DEFAULT_STACK_SIZE;
+use crate::mm::{kernel_end_address, kernel_start_address};
+
+// Linker-defined per-core exception-stack base (one slot per core, each
+// `DEFAULT_STACK_SIZE +0x1000` (guard) wide; the top of slot N is E(N)).
+// Same symbol §2.2 (start.rs boot block) and mod.rs::protect_stack_guards use.
+unsafe extern "C" {
+	static __start_exception_stacks: u8;
+}
 
 pub(crate) struct CoreLocal {
+	/// Per-core exception-stack top E (recomputed once install(), NOT read
+	/// from live SP_EL1 — which has already descended by install time, §2.3.1 / §8.9).
+	/// The §2.3.1 `trap_exit` tail reloads SP_EL1 =E from this field via
+	/// `ldr x21,[x21,#0]` (offset 0 — first field, no repr-dependent offset).
+	pub exception_sp: u64,
+	/// Self-pointer (set in install()). Kept as 2nd field so `exception_sp`
+	/// remains at offset 0 for the §2.3.1 trap_exit tail (`ldr x21,[x21,#0]`).
 	this: *const Self,
 	/// ID of the current Core.
 	core_id: CoreId,
@@ -32,16 +49,48 @@ pub(crate) struct CoreLocal {
 
 impl CoreLocal {
 	pub fn install() {
-		let core_id = CPU_ONLINE.0.load(Ordering::Relaxed);
+		let core_id =CPU_ONLINE.0.load(Ordering::Relaxed);
 
-		let irq_statistics = if core_id == 0 {
-			static FIRST_IRQ_STATISTICS: IrqStatistics = IrqStatistics::new();
+		// Recompute E (per-core exception-stack top), §2.3.1 — same formula as
+		// §2.2 boot (start.rs) and mod.rs::protect_stack_guards.2a1t6
+		// E(core) = &__start_exception_stacks +core*(DEFAULT_STACK_SIZE+0x1000)+DEFAULT_STACK_SIZE
+		// (0x1000 =BasePageSize::SIZE guard per slot). NOT read from live SP_EL1
+		// (descended by install time).
+		let e_top = {
+			// &__start_exception_stacks: for a REAL (non-INSERT) section the
+			// loader rebases this symbol to the runtime PIE base, so it already
+			// yields the runtime address (same as the boot block's `sym` form).
+			// The debug_assert below verifies it lands inside the image; if a
+			// future loader/section change stops rebasing it, the lower-bound
+			// assert fires instead of silently faulting on the first IRQ.
+			let base = &raw const __start_exception_stacks as usize;
+			let stride =DEFAULT_STACK_SIZE +BasePageSize::SIZE as usize;
+			(base + (core_id as usize) *stride +DEFAULT_STACK_SIZE) as u64
+		};
+		// Belt-and-suspenders against the janky-loader rebase bug (see §8.13):
+		// `exception_sp` must lie inside the loaded kernel image
+		// (kernel_start_address()..kernel_end_address()). A zero or link-only
+		// (un-rebased) value would be unmapped and fault on the first IRQ taken
+		// while a task ran -- exactly the 2a.2 boot hang. This assert fires at
+		// install() instead of failing opaquely later.
+		debug_assert!(
+			e_top > kernel_start_address().as_u64(),
+			"exception_sp below image base -- loader did not rebase __start_exception_stacks (add kernel_start_address() bias)"
+		);
+		debug_assert!(
+			e_top < kernel_end_address().as_u64(),
+			"exception_sp above image end -- __start_exception_stacks stride/offset wrong"
+		);
+
+		let irq_statistics = if core_id ==0 {
+			static FIRST_IRQ_STATISTICS: IrqStatistics =IrqStatistics::new();
 			&FIRST_IRQ_STATISTICS
 		} else {
 			&*Box::leak(Box::new(IrqStatistics::new()))
 		};
 
-		let this = Self {
+		let this =Self {
+			exception_sp: e_top,
 			this: ptr::null_mut(),
 			core_id,
 			scheduler: Cell::new(ptr::null_mut()),
@@ -50,18 +99,18 @@ impl CoreLocal {
 			#[cfg(feature = "smp")]
 			scheduler_input: InterruptTicketMutex::new(SchedulerInput::new()),
 		};
-		let this = if core_id == 0 {
+		let this = if core_id ==0 {
 			take_static::take_static! {
-				static FIRST_CORE_LOCAL: Option<CoreLocal> = None;
+				static FIRST_CORE_LOCAL: Option<CoreLocal> =None;
 			}
 			FIRST_CORE_LOCAL.take().unwrap().insert(this)
 		} else {
 			this.add_irq_counter();
 			Box::leak(Box::new(this))
 		};
-		this.this = ptr::from_ref(this);
+		this.this =ptr::from_ref(this);
 
-		let addr = (&raw mut *this).expose_provenance();
+		let addr =(&raw mut *this).expose_provenance();
 		TPIDR_EL1.set(addr.try_into().unwrap());
 	}
 

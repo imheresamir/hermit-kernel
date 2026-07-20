@@ -200,17 +200,7 @@ el1_error:
  */
 .align 6
 el1_sp0_sync:
-      msr spsel, #1
-	mrs     x24, mpidr_el1
-	and     x24, x24, #0xff
-	and     x24, x24, #0x3f
-	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-	mov     x26, #65536
-	mul     x24, x24, x26
-	add     x24, x25, x24
-	add     x24, x24, x26
-	mov     sp, x24
+      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
       trap_entry 0
       mov     x0, sp
       bl      do_sync
@@ -228,17 +218,7 @@ el1_sp0_sync:
  */
 .align 6
 el1_sp0_irq:
-      msr spsel, #1
-	mrs     x24, mpidr_el1
-	and     x24, x24, #0xff
-	and     x24, x24, #0x3f
-	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-	mov     x26, #65536
-	mul     x24, x24, x26
-	add     x24, x25, x24
-	add     x24, x24, x26
-	mov     sp, x24
+      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
       trap_entry 0
       mov     x0, sp
       bl      do_irq
@@ -264,17 +244,7 @@ el1_sp0_irq:
  */
 .align 6
 el1_sp0_fiq:
-      msr spsel, #1
-	mrs     x24, mpidr_el1
-	and     x24, x24, #0xff
-	and     x24, x24, #0x3f
-	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-	mov     x26, #65536
-	mul     x24, x24, x26
-	add     x24, x25, x24
-	add     x24, x24, x26
-	mov     sp, x24
+      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
       trap_entry 0
       mov     x0, sp
       bl      do_fiq
@@ -297,17 +267,7 @@ el1_sp0_fiq:
 
 .align 6
 el1_sp0_error:
-      msr spsel, #1
-	mrs     x24, mpidr_el1
-	and     x24, x24, #0xff
-	and     x24, x24, #0x3f
-	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-	mov     x26, #65536
-	mul     x24, x24, x26
-	add     x24, x25, x24
-	add     x24, x24, x26
-	mov     sp, x24
+      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
       trap_entry 0
       mov     x0, sp
       bl      do_error
