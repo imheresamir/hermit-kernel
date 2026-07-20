@@ -69,39 +69,27 @@ pub(crate) static EARLY_SMP_RELEASE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU
 	pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE] =
 		[0; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE];
 
-/// Unmap the per-stack guard pages so a stack overflow faults (translation
+/// Unmap the per-core stack guard pages so a stack overflow faults (translation
 /// fault → el1_sync prints ESR/FAR/ELR) instead of silently corrupting the
 /// adjacent stack section.
 ///
-/// Each `.stack_guard_*` region in `link.x` is exactly one 4 KiB page
-/// (BasePageSize::SIZE) of reserved-but-mapped space. After paging is up we
-/// clear its PTEs. The linker exposes start/end symbols for every section; the
-/// guard regions sit between the stack sections and are the ones to unmap.
+/// Each `.X_stacks` section in `link.x` holds one slot per core, sized to the
+/// matching `config.rs` constant, followed by a 4 KiB guard tail. The LIEF
+/// patcher grows each section at deploy time to `N × (STACK_SIZE + GUARD_SIZE)`
+/// for `N` cores detected at boot. `protect_stack_guards` walks `i in 0..N` for
+/// each section and unmaps the guard page at `base + i*(STACK+GUARD) + STACK`.
 ///
-/// Must run after the page tables are live but before any task uses a stack.
-/// Unmap the per-core guard page after every core's stack slot in each of the
-/// six stack sections.
+/// `N` comes from `get_possible_cpus()` (the device tree), so this covers all
+/// cores regardless of bring-up order. The kernel page tables must be live
+/// (called from `boot_processor_init` after `mm::init()`) and it must run
+/// before any task uses a stack.
 ///
-/// link.x is a single-core template: each `.X_stacks` section holds one slot of
-/// `X_STACK_SIZE` (the matching `config.rs` constant), and the LIEF patcher grows
-/// every section at deploy time to `N × (X_STACK_SIZE + GUARD_SIZE)`, appending
-/// core 1..N slots each with a `GUARD_SIZE` tail. This walks `i in 0..N` for each
-/// section and unmaps the guard page at `base + i*(STACK+GUARD) + STACK`.
-///
-/// `N` is the number of cores the kernel detects from the device tree
-/// (`get_possible_cpus`), so this covers all cores regardless of bring-up order.
-/// Called once on the boot core, after `env::set_boot_info` makes the FDT
-/// readable, and before any task uses a stack; the kernel page tables are
-/// Unmaps the per-core stack guard pages so an overflow faults (translation
-/// fault) instead of corrupting the adjacent section.
-///
-/// The kernel is linked as PIE, so every absolute reference is a relocation
-/// that the loader must rebase by the load bias. hermit-loader fails to rebase
-/// symbols defined in the `INSERT AFTER .tbss` section, so `&__start_X`
-/// resolves to 0 at runtime. Instead we read each section's *link* address
-/// (its `st_value` in `.symtab`, which is the single source of truth from
-/// link.x) and add the correctly-rebased load bias from `kernel_start_address`.
-/// That is exactly what a correct PIE relocation would have produced.
+/// The section base addresses come from the linker-provided `__start_X` symbols,
+/// defined with `= .` inside each section. These carry a real (non-zero) link
+/// address and are rebased by the loader's `R_AARCH64_RELATIVE` relocation — the
+/// same path as `executable_start`. (An earlier `PROVIDE(__start_X = ADDR(.X))`
+/// form evaluated `ADDR()` to 0 inside the `INSERT AFTER .tbss` script, so
+/// `&__start_X` resolved to 0 at runtime and the unmap hit garbage addresses.)
 pub(crate) fn protect_stack_guards() {
     use crate::arch::aarch64::mm::paging::unmap;
     use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
@@ -241,11 +229,19 @@ pub fn application_processor_init() {
 fn finish_processor_init() {
 	debug!("Initialized processor {}", core_id());
 
-	// Allocate stack for the CPU and pass the addresses.
-	let layout = Layout::from_size_align(KERNEL_STACK_SIZE, BasePageSize::SIZE as usize).unwrap();
-	let stack = unsafe { alloc(layout) };
-	assert!(!stack.is_null());
-	CURRENT_STACK_ADDRESS.store(stack, Ordering::Relaxed);
+	// Use a static per-core slot in `.idle_stacks` instead of a heap allocation.
+	// Slot N for core N: base + N * (KERNEL_STACK_SIZE + GUARD_SIZE). The guard
+	// tail is unmapped by protect_stack_guards(), so an overflow faults instead of
+	// corrupting the adjacent slot. CURRENT_STACK_ADDRESS points at the slot base;
+	// start.s sets SP = base + KERNEL_STACK_SIZE (just below the guard).
+	unsafe extern "C" {
+		static __start_idle_stacks: u8;
+	}
+	let guard = BasePageSize::SIZE as usize;
+	let slot = KERNEL_STACK_SIZE + guard;
+	let core = core_id() as usize;
+	let stack = unsafe { &__start_idle_stacks as *const u8 as usize + core * slot };
+	CURRENT_STACK_ADDRESS.store(stack as *mut u8, Ordering::Relaxed);
 }
 
 pub fn boot_next_processor() {
