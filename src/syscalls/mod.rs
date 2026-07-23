@@ -66,6 +66,145 @@ pub(crate) fn init() {
 	init_entropy();
 }
 
+/// [ALLOC-TRACE] Aggressive instrumentation for the C-runtime static-init crash.
+///
+/// Logs every large allocation (>= threshold) along with the CURRENT kernel
+/// stack pointer and the running task's kernel-stack bounds, and screams if the
+/// returned region overlaps the live kernel stack (the working hypothesis for
+/// the EC=0x21 branch-into-heap fault at libstdc++ eh-pool ctor #277).
+#[cfg(all(target_os = "none", not(feature = "common-os")))]
+/// Stash the deterministic clobber value `V = returned_ptr + size + 0x20` from
+/// the last large allocation (the eh-pool ctor's 0x12000 malloc). `V` is exactly
+/// the value that later appears in the corrupted `saved-x30` slot (proved against
+/// the live capture: 0x800000018880 + 0x12000 + 0x20 = 0x80000002a8a0). The B2
+/// ctor loop reads this to bisect WHICH ctor first deposits `V` onto the kernel
+/// stack. 0 means "not yet set".
+#[cfg(all(target_os = "none", not(feature = "common-os")))]
+pub(crate) static LAST_ALLOC_V: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Scan the current task's kernel stack for a specific 64-bit value `v` and
+/// report the lowest slot that holds it. Used to pinpoint the clobber writer.
+/// `scan_hi` bounds the search (default: 8 KiB above the stack base = the ctor
+/// frame region) to keep the trace lightweight and avoid perturbing the
+/// layout-sensitive fault.
+#[cfg(all(target_os = "none", not(feature = "common-os")))]
+#[inline(never)]
+pub(crate) fn scan_kstack_for_v(tag: &str, v: u64) {
+	if v == 0 {
+		return;
+	}
+	let (kstack_lo, kstack_hi, tid) =
+		crate::arch::kernel::core_local::core_scheduler().get_current_task_kstack_bounds();
+	// Search only the lower 8 KiB (the ctor frame region) to stay lightweight.
+	let lo = kstack_lo;
+	let hi = core::cmp::min(kstack_hi, kstack_lo + 0x2000).saturating_sub(8);
+	let mut found: u64 = 0;
+	let mut found_off: u64 = 0;
+	let mut hits = 0usize;
+	let mut cur = lo;
+	while cur + 8 <= hi {
+		// SAFETY: cur is within the validated kernel-stack window.
+		let w = unsafe { core::ptr::read_volatile(cur as *const u64) };
+		if w == v {
+			if hits == 0 {
+				found = cur;
+				found_off = cur - kstack_lo;
+			}
+			hits += 1;
+		}
+		cur += 8;
+	}
+	if hits > 0 {
+		warn!(
+			"[V-SCAN {tag}] task={tid} V={v:#x} found={hits} lowest_off={found_off:#x} (within 8KiB frame region)"
+		);
+	} else {
+		warn!("[V-SCAN {tag}] task={tid} V={v:#x} NOT PRESENT in 8KiB frame region");
+	}
+}
+
+#[inline(never)]
+fn alloc_trace(tag: &str, size: usize, align: usize, ptr: *mut u8) {
+	// Only trace sizeable allocations to keep the log readable; the eh-pool
+	// ctor requests 0x12000 bytes. Everything >= 0x1000 is interesting here.
+	if size < 0x1000 {
+		return;
+	}
+
+	let sp: u64;
+	// SAFETY: reading the stack pointer has no side effects.
+	unsafe {
+		core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+	}
+
+	let end = (ptr as u64).wrapping_add(size as u64);
+
+	// Deterministic clobber value: the next-chunk header talc records at
+	// ptr + size + 0x20 (wrapper stores size+0x10 at ptr+0x10; the following
+	// chunk header sits a further size+0x10 bytes up). For the eh-pool ctor
+	// this equals the corrupted `saved-x30` value exactly. Stash it for the
+	// B2 ctor-loop bisect.
+	let v = (ptr as u64).wrapping_add(size as u64).wrapping_add(0x20);
+	LAST_ALLOC_V.store(v, core::sync::atomic::Ordering::Relaxed);
+
+	// Fetch running task's kernel-stack bounds without allocating.
+	let (kstack_lo, kstack_hi, tid) =
+		crate::arch::kernel::core_local::core_scheduler().get_current_task_kstack_bounds();
+
+	warn!(
+		"[ALLOC-TRACE] {tag}: size={size:#x} align={align:#x} ptr={ptr:p} end={end:#x} sp={sp:#x} task={tid} kstack=[{kstack_lo:#x}..{kstack_hi:#x}] V={v:#x}"
+	);
+
+	// NOTE: no post-alloc stack scan here — a full 128 KiB read (and the
+	// `format!` it needs) perturbs this layout-sensitive fault. The V bisect
+	// happens in the B2 ctor loop (lib.rs) over a bounded 8 KiB window.
+
+	// Overlap of the returned buffer with the live kernel stack window.
+	let buf_lo = ptr as u64;
+	let buf_hi = end;
+	if buf_lo < kstack_hi && buf_hi > kstack_lo {
+		warn!(
+			"[ALLOC-TRACE] *** OVERLAP: allocation [{buf_lo:#x}..{buf_hi:#x}] intersects kstack [{kstack_lo:#x}..{kstack_hi:#x}] ***"
+		);
+	}
+	// SP inside the returned buffer would be catastrophic.
+	if sp >= buf_lo && sp < buf_hi {
+		warn!("[ALLOC-TRACE] *** SP {sp:#x} IS INSIDE returned allocation ***");
+	}
+	// SP outside the declared kernel stack (stack overflow / wrong stack).
+	if sp < kstack_lo || sp >= kstack_hi {
+		warn!(
+			"[ALLOC-TRACE] *** SP {sp:#x} OUTSIDE kstack [{kstack_lo:#x}..{kstack_hi:#x}] ***"
+		);
+	}
+
+	// FP-chain walk: dump each frame's saved {FP, LR} so we can see which
+	// frame's saved-LR slot later gets smashed. AArch64 frame record layout is
+	// [x29(prev FP), x30(LR)] at the FP address.
+	let mut fp: u64;
+	unsafe {
+		core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
+	}
+	let mut depth = 0;
+	while depth < 12 && fp >= kstack_lo && fp + 16 <= kstack_hi && (fp & 0xf) == 0 {
+		// SAFETY: fp is within the validated kernel-stack window and aligned.
+		let saved_fp = unsafe { core::ptr::read_volatile(fp as *const u64) };
+		let saved_lr = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+		// Flag any saved-LR that points into the stack (a return address should
+		// point into .text ~0x406xxxxx..0x413xxxxx, never into the stack).
+		let lr_in_stack = saved_lr >= kstack_lo && saved_lr < kstack_hi;
+		warn!(
+			"[ALLOC-TRACE]   frame[{depth}] fp={fp:#x} saved_fp={saved_fp:#x} saved_lr={saved_lr:#x}{}",
+			if lr_in_stack { "  <== LR POINTS INTO STACK" } else { "" }
+		);
+		if saved_fp <= fp {
+			break; // FP must increase up the stack; stop on corruption/end.
+		}
+		fp = saved_fp;
+		depth += 1;
+	}
+}
+
 /// Interface to allocate memory from system heap
 ///
 /// # Errors
@@ -84,6 +223,7 @@ pub extern "C" fn sys_alloc(size: usize, align: usize) -> *mut u8 {
 	let layout = layout_res.unwrap();
 	let ptr = unsafe { ALLOCATOR.alloc(layout) };
 
+	alloc_trace("sys_alloc", size, align, ptr);
 	trace!("__sys_alloc: allocate memory at {ptr:p} (size {size:#x}, align {align:#x})");
 
 	ptr
@@ -103,6 +243,7 @@ pub extern "C" fn sys_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
 	let layout = layout_res.unwrap();
 	let ptr = unsafe { ALLOCATOR.alloc_zeroed(layout) };
 
+	alloc_trace("sys_alloc_zeroed", size, align, ptr);
 	trace!("__sys_alloc_zeroed: allocate memory at {ptr:p} (size {size:#x}, align {align:#x})");
 
 	ptr
@@ -120,6 +261,7 @@ pub extern "C" fn sys_malloc(size: usize, align: usize) -> *mut u8 {
 	let layout = layout_res.unwrap();
 	let ptr = unsafe { ALLOCATOR.alloc(layout) };
 
+	alloc_trace("sys_malloc", size, align, ptr);
 	trace!("__sys_malloc: allocate memory at {ptr:p} (size {size:#x}, align {align:#x})");
 
 	ptr

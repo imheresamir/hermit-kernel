@@ -135,13 +135,15 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	// handle_waiting_tasks() calls executor::run() internally, so a separate
-	// executor::run() here is redundant.
-	core_scheduler().handle_waiting_tasks();
+	// Part B: on the exception stack E, only do the bounded wake-move
+	// (ready_queue update); the async executor is drained off E by the reactor
+	// idle loop (PerCoreScheduler::run). Do NOT call handle_waiting_tasks()
+	// here -- it runs executor::run() on the current stack (= E post-flip).
+	core_scheduler().wake_pending_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 
-	core_scheduler().scheduler().unwrap_or_default()
+	core_scheduler().scheduler(false).unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]
@@ -178,13 +180,32 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 			handler();
 		}
 	}
-	// handle_waiting_tasks() calls executor::run() internally, so a separate
-	// executor::run() here is redundant.
-	core_scheduler().handle_waiting_tasks();
+	// Part B: on the exception stack E, only do the bounded wake-move
+	// (ready_queue update); the async executor is drained off E by the reactor
+	// idle loop (PerCoreScheduler::run). Do NOT call handle_waiting_tasks()
+	// here -- it runs executor::run() on the current stack (= E post-flip).
+	core_scheduler().wake_pending_tasks();
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 
-	core_scheduler().scheduler().unwrap_or_default()
+	let result = core_scheduler().scheduler(false).unwrap_or_default();
+
+	// === INSTRUMENTATION: log context switch result ===
+	if !result.is_null() {
+		// result = ptr to old task's last_stack_pointer field
+		// *result = old task's SP_EL1 (the trap_entry frame on E)
+		let old_sp = unsafe { *result };
+		let new_task_id = core_scheduler().get_current_task_id();
+		let new_lsp = core_scheduler().get_last_stack_pointer();
+		warn!("[TRACE-IRQ] ctx switch: old_sp={old_sp:#x} new_task={new_task_id:?} new_lsp={:#x}", new_lsp.as_u64());
+		// Dump the new task's State at new_lsp
+		let state_ptr = new_lsp.as_usize() as *const u64;
+		let raw = unsafe { core::slice::from_raw_parts(state_ptr, 36) };
+		warn!("[TRACE-IRQ] new State[0]={:#x} [1]={:#x} [8]={:#x} [35]={:#x}",
+			raw[0], raw[1], raw[8], raw[35]);
+	}
+
+	result
 }
 
 #[unsafe(no_mangle)]
@@ -212,6 +233,35 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 			error!("Thread ID register {:#x}", TPIDR_EL0.get());
 			error!("Table Base Register {:#x}", TTBR0_EL1.get());
 			error!("Exception Syndrome Register {esr:#x}");
+
+			// === EL1t diagnostic: what writes to kernel_stack_top? ===
+			// state.sp_el0 is SP_EL0 captured at fault time (frame slot @24).
+			// far is the faulting VA. Compare both against the current
+			// task's computed kernel_stack_top = base + size.
+			let sp_el0_fault = state.sp_el0;
+			let cur_id = core_scheduler().get_current_task_id();
+			let ktop = core_scheduler().get_current_task_kernel_stack_top();
+			error!(
+				"DIAG sp_el0_fault={sp_el0_fault:#x} far={far:#x} cur_task={cur_id:?}"
+			);
+			error!(
+				"DIAG kernel_stack_top={ktop:#x} (base+KERNEL_STACK_SIZE)"
+			);
+			// Runtime image base (rebased). link_pc = fault_pc - base lets us
+			// map the fault to a function in the (link-addressed) binary via
+			// host objdump. kernel_start_address() == executable_start() rebased.
+			let base = crate::mm::kernel_start_address().as_u64();
+			let link_pc = ELR_EL1.get().wrapping_sub(base);
+			error!(
+				"DIAG kernel_start_address={base:#x} fault_pc(runtime)={:#x} link_pc={link_pc:#x}",
+				ELR_EL1.get()
+			);
+			error!(
+				"DIAG sp_el0==ktop? {} far==ktop? {} sp_el0==far? {}",
+				sp_el0_fault == ktop,
+				far == ktop,
+				sp_el0_fault == far
+			);
 
 			if let Some(irqid) =
 				GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1)
@@ -256,8 +306,100 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		error!("Thread ID register {:#x}", TPIDR_EL0.get());
 		let (sx29, sx30) = (state.x29, state.x30);
 		error!("State x29(fp)={sx29:#x} x30(lr)={sx30:#x}");
+
+		// === INSTRUMENTATION: dump full trap_entry State from emergency stack ===
+		// state is the #[repr(C, packed)] trap_entry frame. Copy fields to
+		// locals to avoid unaligned-reference errors.
+		let state_addr = state as *const State as u64;
+		let (sx0, sx1, sx25, sx30_val, sspsel, sspsr, stpidr, ssp_el0) = (
+			state.x0, state.x1, state.x25, state.x30, state.spsel, state.spsr_el1, state.tpidr_el0, state.sp_el0
+		);
+		let s_elr = state.elr_el1 as *const () as u64;
+		error!("[TRACE-SYNC] State @ {state_addr:#x}: elr_el1={s_elr:#x} x0={sx0:#x} x1={sx1:#x} x25={sx25:#x} x30={sx30_val:#x} spsel={sspsel:#x} spsr={sspsr:#x} tpidr={stpidr:#x} sp_el0={ssp_el0:#x}");
+
 		let task_id = core_scheduler().get_current_task_id();
 		error!("Crashed in task {task_id:?}");
+
+		// === INSTRUMENTATION: read raw State words for cross-check ===
+		let raw = unsafe { core::slice::from_raw_parts(state as *const State as *const u64, 36) };
+		error!("[TRACE-SYNC] raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
+			raw[0], raw[1], raw[8], raw[35]);
+
+		// === INSTRUMENTATION: check task_start trace buffer ===
+		unsafe {
+			let trace = crate::arch::aarch64::kernel::scheduler::TASK_START_TRACE;
+			error!("[TRACE-SYNC] TASK_START_TRACE[8]={:#x} (0x42=reached) [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x}",
+				trace[8], trace[0], trace[1], trace[2], trace[3]);
+			error!("[TRACE-SYNC] TASK_START_TRACE SP_after_spsel={:#x} SP_after_func={:#x}",
+				trace[4], trace[5]);
+		}
+
+		// === INSTRUMENTATION: dump stack memory around SP_EL0 and FP ===
+		// SP_EL0 at fault time tells us where the function's stack was.
+		// Dump from (SP_EL0 - 16) through (initial_SP + 16) to see the full frame.
+		let sp_el0_fault = state.sp_el0;
+		let fp_fault = sx29;
+		if sp_el0_fault != 0 {
+			// Use TASK_START_TRACE[4] as the initial SP_EL0 (set in task_start after spsel)
+			let initial_sp_el0: u64 = unsafe { crate::arch::aarch64::kernel::scheduler::TASK_START_TRACE[4] };
+			// Sentinel-encoding helper (mirror of create_stack_frame):
+			// sentinel(w) = 0x5EED_0000_0000_0000 | (w & 0x0000_FFFF_FFFF_FFF8).
+			let is_sentinel = |w: u64, addr: u64| -> bool {
+				(w & 0xFFFF_0000_0000_0000) == 0x5EED_0000_0000_0000
+					&& (w & 0x0000_FFFF_FFFF_FFFF) == (addr & 0x0000_FFFF_FFFF_FFF8)
+			};
+			// Classify: a window around SP_EL0. Report *how many* slots
+			// broke and list the first/last broken VA so the footprint
+			// and clobbered-slot is derivable from one line.
+			let guard_page = if initial_sp_el0 > 0 { initial_sp_el0 + 16 } else { sp_el0_fault + 0x200 };
+			let lo = sp_el0_fault.saturating_sub(16);
+			let hi = guard_page.max(sp_el0_fault + 8);
+			let nwords = ((hi - lo) / 8) as usize;
+			if nwords > 0 && nwords <= 128 {
+				let words = unsafe { core::slice::from_raw_parts(lo as *const u64, nwords) };
+				error!("[TRACE-SYNC] STACK DUMP lo={lo:#x} hi={hi:#x} ({} words):", nwords);
+				let mut i = 0;
+				let mut first_broke: Option<u64> = None;
+				let mut last_broke: Option<u64> = None;
+				let mut broke_count = 0usize;
+				while i < nwords {
+					let addr = lo + (i as u64) * 8;
+					let mut line = [0u64; 4];
+					let count = nwords - i.min(nwords);
+					let show = count.min(4);
+					for j in 0..show {
+						let v = words[i + j];
+						let a = addr + (j as u64) * 8;
+						line[j] = v;
+						// A slot is "broken" if it was a sentinel and now
+						// isn't. Value 0 == zeroed; text addr == displaced
+						// real LR; else foreign.
+						if is_sentinel(v, a) {
+							// intact
+						} else {
+							broke_count += 1;
+							if first_broke.is_none() { first_broke = Some(a); }
+							last_broke = Some(a);
+						}
+					}
+					error!("  {:#x}: {:#x} {:#x} {:#x} {:#x}",
+						addr, line[0], line[1], line[2], line[3]);
+					i += show;
+				}
+				if let (Some(f), Some(l)) = (first_broke, last_broke) {
+					error!("[TRACE-SYNC] SENTINEL broken: count={} first_broke_va={:#x} last_broke_va={:#x} span={} bytes",
+						broke_count, f, l, l - f + 8);
+				} else {
+					error!("[TRACE-SYNC] SENTINEL intact: no clobber in dumped window");
+				}
+			}
+		}
+		if fp_fault != 0 && fp_fault >= sp_el0_fault && fp_fault < 0x800015d92000 {
+			let fp_words = unsafe { core::slice::from_raw_parts(fp_fault as *const u64, 4) };
+			error!("[TRACE-SYNC] Frame @ FP={fp_fault:#x}: [FP_chain={:#x} LR={:#x} {:#x} {:#x}]",
+				fp_words[0], fp_words[1], fp_words[2], fp_words[3]);
+		}
+
 		scheduler::abort()
 	} else if ec == ESR_EL1::EC::Value::TrappedFP {
 		trace!("Floating point trap");
