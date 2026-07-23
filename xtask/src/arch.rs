@@ -107,22 +107,16 @@ impl Arch {
 			Self::X86_64 => &["--target=x86_64-unknown-none"],
 			Self::Aarch64 => &[
 				"--target=aarch64-unknown-none-softfloat",
-				// We can't use prebuilt std here because it is built with
-				// relocation-model=static and we need relocation-model=pic
 				"-Zbuild-std=core,alloc",
 				"-Zbuild-std-features=compiler-builtins-mem",
 			],
 			Self::Aarch64Be => &[
 				"--target=aarch64_be-unknown-none-softfloat",
-				// We can't use prebuilt std here because it is built with
-				// relocation-model=static and we need relocation-model=pic
 				"-Zbuild-std=core,alloc",
 				"-Zbuild-std-features=compiler-builtins-mem",
 			],
 			Self::Riscv64 => &[
 				"--target=riscv64gc-unknown-none-elf",
-				// We can't use prebuilt std here because it is built with
-				// relocation-model=static and we need relocation-model=pic
 				"-Zbuild-std=core,alloc",
 				"-Zbuild-std-features=compiler-builtins-mem",
 			],
@@ -154,8 +148,10 @@ impl Arch {
 	pub fn rustflags(&self) -> &'static [&'static str] {
 		match self {
 			Self::X86_64 => &[],
-			Self::Aarch64 | Self::Aarch64Be => &["-Crelocation-model=pic"],
-			Self::Riscv64 => &["-Cno-redzone", "-Crelocation-model=pic"],
+			// NOTE: PIC disabled for non-PIE static kernel (no relocation, no slide).
+			// --image-base places kernel at fixed address after the loader (0x40400000).
+			Self::Aarch64 | Self::Aarch64Be => &["-Clink-arg=-Wl,--image-base=0x40600000"],
+			Self::Riscv64 => &["-Cno-redzone"],
 		}
 	}
 

@@ -50,7 +50,10 @@ impl Build {
 			.args(careful)
 			.arg("rustc")
 			.arg("--crate-type=staticlib")
+			.arg("--config")
+			.arg("profile.dev.codegen-units=1")
 			.env("CARGO_ENCODED_RUSTFLAGS", self.cargo_encoded_rustflags()?)
+			.env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1")
 			.args(self.cargo_build.artifact.arch.cargo_args())
 			.args(self.cargo_build.cargo_build_args());
 
@@ -128,6 +131,17 @@ impl Build {
 		}
 
 		rustflags.extend(self.cargo_build.artifact.arch.rustflags());
+
+		// Debug: remap container paths to host so LLDB source-map can resolve them,
+		// and use single CGU so DWARF paths are breakpoint-friendly.
+		if let Ok(val) = env::var("HERMIT_DEBUG_RUSTFLAGS") {
+			let val: &'static str = Box::leak(val.into_boxed_str());
+			for flag in val.split('\x1f') {
+				rustflags.push(flag);
+			}
+			// Force single CGU via RUSTFLAGS when cargo profile is ignored by -Zbuild-std
+			rustflags.push("-Ccodegen-units=1");
+		}
 
 		Ok(rustflags.join("\x1f"))
 	}

@@ -330,7 +330,7 @@ pub fn timer_handler() {
 	debug!("Handle timer interrupt");
 	timer_interrupts::clear_active_and_set_next();
 	core_scheduler().handle_waiting_tasks();
-	core_scheduler().scheduler();
+	core_scheduler().scheduler(true);
 }
 
 #[cfg(feature = "smp")]
@@ -343,7 +343,7 @@ pub fn wakeup_handler() {
 		riscv::register::sie::clear_ssoft();
 	}
 	if core_scheduler.is_scheduling() {
-		core_scheduler.scheduler();
+		core_scheduler.scheduler(true);
 	}
 }
 

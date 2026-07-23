@@ -234,7 +234,14 @@ mod tls_info {
 			let tls_phdr = phdrs.iter().find(|phdr| phdr.p_type == abi::PT_TLS)?;
 			let executable_start = elf_symbols::executable_start().expose_provenance() as u64;
 
-			let start = usize::try_from(executable_start + tls_phdr.p_vaddr).unwrap();
+			// Compute load bias from the first PT_LOAD segment so this works for
+			// both PIE (p_vaddr is relative) and non-PIE/EXEC (p_vaddr is absolute).
+			let load_bias = phdrs
+				.iter()
+				.find(|phdr| phdr.p_type == abi::PT_LOAD)
+				.map(|phdr| executable_start.wrapping_sub(phdr.p_vaddr))
+				.unwrap_or(0);
+			let start = usize::try_from(load_bias.wrapping_add(tls_phdr.p_vaddr)).unwrap();
 			let filesz = usize::try_from(tls_phdr.p_filesz).unwrap();
 			let memsz = usize::try_from(tls_phdr.p_memsz).unwrap();
 			let align = usize::try_from(tls_phdr.p_align).unwrap();

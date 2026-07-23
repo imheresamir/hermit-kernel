@@ -176,6 +176,9 @@ unsafe extern "C" {
 	/// newlib's global `struct _reent`. Must be non-zero for reentrant newlib
 	/// functions (printf, malloc, atexit, etc.) to work.
 	static mut __sf: core::ffi::c_void;
+	/// newlib's `_impure_ptr`, read by `__getreent()` to find the current
+	/// `struct _reent`. Must point at `__sf`.
+	static mut _impure_ptr: *mut core::ffi::c_void;
 }
 
 /// Initialize newlib C runtime globals so LIEF's C++ static constructors
@@ -190,6 +193,17 @@ unsafe fn init_c_runtime() {
 	// uninitialized / clobbered BSS), it dereferences the invalid pointer → fault.
 	unsafe {
 		__atexit = core::ptr::null_mut();
+		// Point newlib's reent at the static `__sf` so reentrant functions
+		// (printf, malloc, atexit, pthread_once from LIEF ctors) work.
+		_impure_ptr = &raw mut __sf as *mut _;
+	}
+	// newlib's `__getreent()` reads the reent pointer from a TLS slot at
+	// `tpidr_el0 + 0x130`. Initialize it to `&__sf` so ctor-time reent access
+	// is valid before any thread-local reent is set up.
+	let tpidr_el0: usize;
+	core::arch::asm!("mrs {0}, tpidr_el0", out(reg) tpidr_el0);
+	unsafe {
+		*(tpidr_el0 as *mut u64).add(0x130 / 8) = &raw mut __sf as *mut _ as u64;
 	}
 	info!(
 		"C runtime initialized: __atexit = NULL, __sf at {:p}",
@@ -239,6 +253,57 @@ extern "C" fn initd(_arg: usize) {
 
 	info!("Jumping into application");
 
+	// === B2 DIAGNOSTIC: instrumented .init_array pre-walk ===
+	// Bug #3 is a branch-to-0 (PC=0, x30=0, EC=0x21) inside the C-runtime
+	// static-initializer run. The `.init_array` table is statically clean (no
+	// null entries) and the stack sentinel showed NO stray-write corruption,
+	// so the null branch is a runtime indirect call (vtable/ifunc/callback)
+	// executed from *within* one constructor. To name it without QEMU/GDB we
+	// walk __init_array_start..__init_array_end ourselves, logging each ctor's
+	// address immediately BEFORE calling it. The fault occurs during this walk
+	// (before runtime_entry), so the LAST "[B2-CTOR]" line printed identifies
+	// the offending constructor — feed that address to `objdump -d` to find the
+	// null indirect call. No double-init: we crash before reaching runtime_entry.
+	#[cfg(all(not(test), not(any(feature = "nostd", feature = "common-os"))))]
+	unsafe {
+		unsafe extern "C" {
+			static __init_array_start: u8;
+			static __init_array_end: u8;
+		}
+		let start = &raw const __init_array_start as usize;
+		let end = &raw const __init_array_end as usize;
+		let n = (end - start) / core::mem::size_of::<usize>();
+		warn!("[B2-CTOR] init_array start={start:#x} end={end:#x} count={n}");
+		let table = start as *const Option<extern "C" fn()>;
+		for i in 0..n {
+			let slot = table.add(i);
+			let fnptr = core::ptr::read(slot);
+			let raw = fnptr.map_or(0usize, |f| f as usize);
+			warn!("[B2-CTOR] #{i} @ {:#x} -> fn={raw:#x}", slot as usize);
+			if let Some(f) = fnptr {
+				// Bisect the clobber writer: scan the kernel stack for
+				// the deterministic value `V` (stashed by alloc_trace on
+				// the eh-pool ctor's malloc) BEFORE the ctor runs; if it
+				// is absent before and present immediately after, THIS
+				// ctor (or a callee) is the writer. Fixed tags (no
+				// format!) to avoid perturbing the layout-sensitive fault.
+				let v_before = crate::syscalls::LAST_ALLOC_V.load(core::sync::atomic::Ordering::Relaxed);
+				if v_before != 0 {
+					crate::syscalls::scan_kstack_for_v("pre", v_before);
+					warn!("[B2-VCHECK] ctor #{i} pre-scan done", i = i);
+					f();
+					crate::syscalls::scan_kstack_for_v("post", v_before);
+					warn!("[B2-VCHECK] ctor #{i} post-scan done", i = i);
+				} else {
+					f();
+				}
+			} else {
+				warn!("[B2-CTOR] #{i} is NULL, skipping");
+			}
+		}
+		warn!("[B2-CTOR] all {n} constructors completed without fault");
+	}
+
 	#[cfg(not(test))]
 	unsafe {
 		// And finally start the application.
@@ -266,6 +331,11 @@ fn synch_all_cores() {
 /// Entry Point of Hermit for the Boot Processor
 #[cfg(target_os = "none")]
 fn boot_processor_main() -> ! {
+	let sp: u64;
+	unsafe {
+		core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack));
+	}
+	warn!("[TRACE-BOOT] boot_processor_main entered, sp={:#x}", sp);
 	use crate::config::USER_STACK_SIZE;
 
 	// Initialize the kernel and hardware.

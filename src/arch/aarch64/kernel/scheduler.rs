@@ -3,19 +3,19 @@
 use core::arch::naked_asm;
 use core::sync::atomic::Ordering;
 
-use aarch64_cpu::asm::barrier::{SY, isb};
+use aarch64_cpu::asm::barrier::{isb, SY};
 use aarch64_cpu::registers::*;
 use align_address::Align;
 use free_list::{PageLayout, PageRange};
 use memory_addresses::{PhysAddr, VirtAddr};
 
-use crate::arch::aarch64::kernel::CURRENT_STACK_ADDRESS;
 use crate::arch::aarch64::kernel::core_local::core_scheduler;
+use crate::arch::aarch64::kernel::CURRENT_STACK_ADDRESS;
 use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize, PageTableEntryFlags};
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 use crate::mm::{FrameAlloc, PageAlloc, PageRangeAllocator};
-use crate::scheduler::PerCoreSchedulerExt;
 use crate::scheduler::task::{Task, TaskFrame};
+use crate::scheduler::PerCoreSchedulerExt;
 
 #[derive(Debug)]
 #[repr(C, packed)]
@@ -134,12 +134,6 @@ impl TaskStacks {
 			.expect("Failed to allocate Physical Memory for TaskStacks");
 		let phys_addr = PhysAddr::from(frame_range.start());
 
-		debug!(
-			"Create stacks at {:p} with a size of {} KB",
-			virt_addr,
-			total_size >> 10
-		);
-
 		let mut flags = PageTableEntryFlags::empty();
 		flags.normal().writable().execute_disable();
 
@@ -159,12 +153,23 @@ impl TaskStacks {
 			flags,
 		);
 
-		// clear user stack
+		// clear user stack — word-by-word to avoid compiler_builtins memset overflow
+		let user_stack_va = virt_addr + DEFAULT_STACK_SIZE + 2 * BasePageSize::SIZE;
+		warn!(
+			"[TRACE-STACKS] clear user stack: va={:#x} size={:#x} ({} bytes)",
+			user_stack_va.as_u64(),
+			user_stack_size,
+			user_stack_size
+		);
 		unsafe {
-			(virt_addr + DEFAULT_STACK_SIZE + 2 * BasePageSize::SIZE)
-				.as_mut_ptr::<u8>()
-				.write_bytes(0, user_stack_size);
+			let ptr = user_stack_va.as_mut_ptr::<u64>();
+			let nwords = user_stack_size / size_of::<u64>();
+			let words = core::slice::from_raw_parts_mut(ptr, nwords);
+			for word in words.iter_mut() {
+				*word = 0;
+			}
 		}
+		warn!("[TRACE-STACKS] user stack clear done");
 
 		TaskStacks::Common(CommonStack {
 			virt_addr,
@@ -258,22 +263,44 @@ extern "C" fn thread_exit(status: i32) -> ! {
 	core_scheduler().exit(status)
 }
 
+/// Static trace buffer for GDB inspection: task_start dumps registers here.
+/// Layout: [0]=x0(func), [1]=x1(arg), [2]=x25, [3]=x30, [4]=SP after spsel,
+///         [5]=SP after blr (i.e. SP at func entry), [8]=magic
+#[unsafe(no_mangle)]
+pub(crate) static mut TASK_START_TRACE: [u64; 16] = [0u64; 16];
+
 #[unsafe(naked)]
 extern "C" fn task_start(_f: extern "C" fn(usize), _arg: usize) -> ! {
 	// `f` is in the `x0` register
 	// `arg` is in the `x1` register
 
 	naked_asm!(
+		// === TRACE: dump register state to static buffer ===
+		"adrp x8, {trace}",
+		"add  x8, x8, #:lo12:{trace}",
+		"str  x0, [x8, #0]",       // trace[0] = x0 (func)
+		"str  x1, [x8, #8]",       // trace[1] = x1 (arg)
+		"str  x25, [x8, #16]",     // trace[2] = x25
+		"str  x30, [x8, #24]",     // trace[3] = x30 (LR from trap_exit)
+		"mov  x9, #0x42",
+		"str  x9, [x8, #64]",      // trace[8] = 0x42 (magic: task_start reached)
+		// === end trace ===
 		"msr spsel, {l0}",
+		"mov x9, sp",
+		"str  x9, [x8, #32]",      // trace[4] = SP after spsel (should be SP_EL0 = kernel_stack_top-16)
 		"mov x25, x0",
 		"mov x0, x1",
 		"blr x25",
+		// If func returns, we land here. Dump SP to verify stack integrity.
+		"mov x9, sp",
+		"str  x9, [x8, #40]",      // trace[5] = SP after func returns (should be back near kernel_stack_top-16)
 		"mov x0, xzr",
 		"adrp x4, {exit}",
 		"add x4, x4, #:lo12:{exit}",
 		"br x4",
 		l0 = const 0,
 		exit = sym thread_exit,
+		trace = sym TASK_START_TRACE,
 	)
 }
 
@@ -283,20 +310,58 @@ impl TaskFrame for Task {
 		#[cfg(not(feature = "common-os"))]
 		if self.tls.is_none() {
 			use crate::scheduler::task::tls::Tls;
-
 			self.tls = Tls::from_env();
 		}
-
 		unsafe {
 			// Set a marker for debugging at the very top.
 			let mut stack = self.stacks.get_kernel_stack() + self.stacks.get_kernel_stack_size()
 				- TaskStacks::MARKER_SIZE;
 			*stack.as_mut_ptr::<u64>() = 0xdead_beefu64;
 
+			// === SENTINEL FILL (Bug #3 diagnostic) ===
+			// Bug #3 is a `ret`-to-0 (PC=0, x30=0, EC=0x21) after "Jumping into
+			// application": a statically-linked libstdc++/LIEF `.init_array`
+			// constructor performs an oversized write that lands INSIDE the
+			// mapped kernel stack and zeroes a saved return-address slot. No
+			// guard page catches it (that would be a Data Abort, EC=0x96...),
+			// so we cannot see it as an overflow. To pin the clobbered slot we
+			// pre-fill the entire kernel-stack BODY with an address-encoding
+			// sentinel: word at VA `w` holds `0x5EED_0000_0000_0000 | (w & mask)`.
+			// After a crash the fault dumper can classify each word:
+			//   - value == expected_sentinel(addr)  -> untouched
+			//   - value == 0                          -> zeroed by the bad write
+			//   - value is a 0x407b.._0x4134.. text addr in a sentinel slot
+			//                                         -> a real LR displaced here
+			//   - anything else                       -> foreign write
+			// The lowest address whose sentinel is broken marks the write's
+			// start; the highest marks its end -> footprint + target slot.
+			{
+				let body_lo = self.stacks.get_kernel_stack().as_u64();
+				// Fill everything below where the State will live; the State
+				// region + marker are written explicitly afterwards.
+				let body_hi = stack.as_u64() - size_of::<State>() as u64;
+				let mut w = body_lo;
+				while w < body_hi {
+					// noalias &mut store (never merged into a memset).
+					let slot = &mut *(w as *mut u64);
+					*slot = 0x5EED_0000_0000_0000u64 | (w & 0x0000_FFFF_FFFF_FFF8u64);
+					w += 8;
+				}
+			}
+
 			// Put the State structure expected by the ASM switch() function on the stack.
 			stack -= size_of::<State>();
 
 			let state = stack.as_mut_ptr::<State>();
+
+			// write_bytes(state, 0, 288) causes LLVM to generate a memset that
+			// overflows into the guard page at kernel_stack_top. The &mut reference
+			// from slice::from_raw_parts_mut prevents the merge.
+			let nwords = size_of::<State>() / size_of::<u64>();
+			let state_words = core::slice::from_raw_parts_mut(state as *mut u64, nwords);
+			for word in state_words.iter_mut() {
+				*word = 0;
+			}
 			#[cfg(not(feature = "common-os"))]
 			if let Some(tls) = &self.tls {
 				(*state).tpidr_el0 = tls.thread_ptr().expose_provenance() as u64;
@@ -307,23 +372,109 @@ impl TaskFrame for Task {
 			(*state).elr_el1 = task_start;
 			(*state).x0 = func as usize as u64; // use second argument to transfer the entry point
 			(*state).x1 = arg as u64;
-			(*state).spsel = 1;
+			// EL1t (Option D, §1.2 / §2a.3): run tasks at EL1t so the CPU's
+			// automatic SP->SP_EL1 switch lands exception frames on the per-core
+			// exception stack E. SP_EL0 holds the task's KERNEL-stack top; SP_EL1
+			// (E) is set at boot + restored by the trap_exit D4 tail.
+			(*state).spsel = 0;
+			/* Zero the condition flags; M[3:0]=0b0100 = EL1t, SPSEL=0. */
+			(*state).spsr_el1 = 0x3e4;
 
-			/* Zero the condition flags. */
-			(*state).spsr_el1 = 0x3e5;
+			// Set the task's stack pointer entry to the stack we have just crafted.
 
-						// Set the task's stack pointer entry to the stack we have just crafted.
-						self.last_stack_pointer = stack;
+			// === INSTRUMENTATION: dump State fields after creation ===
+			let state_addr = state as u64;
+			let elr_val = (*state).elr_el1 as *const () as u64;
+			let x30_val = (*state).x30;
+			let x0_val = (*state).x0;
+			let x1_val = (*state).x1;
+			let spsel_val = (*state).spsel;
+			let spsr_val = (*state).spsr_el1;
+			let tpidr_val = (*state).tpidr_el0;
+			warn!("[TRACE-FRAME] State @ {state_addr:#x}: elr={elr_val:#x} x30={x30_val:#x} x0={x0_val:#x} x1={x1_val:#x} spsel={spsel_val:#x} spsr={spsr_val:#x} tpidr={tpidr_val:#x}");
 
-						// initialize user-level stack
-						self.user_stack_pointer = self.stacks.get_user_stack()
-						+ self.stacks.get_user_stack_size()
-						- TaskStacks::MARKER_SIZE;
-						*self.user_stack_pointer.as_mut_ptr::<u64>() = 0xdead_beefu64;
-						(*state).sp_el0 = self.user_stack_pointer.as_u64();
-						info!("[D3-TRACE] create_stack_frame: sp_el0={:#x} last_stack_pointer={:p} user_stack={:#x}",
-						self.user_stack_pointer.as_u64(), stack, self.stacks.get_user_stack().as_u64());
-						}
+			// === INSTRUMENTATION: probe State memory after all writes ===
+			// Read back raw u64 words to detect any overwrite between our
+			// write and the eventual trap_exit restore.
+			let raw_state = core::slice::from_raw_parts(state as *const u64, 36);
+			warn!(
+				"[TRACE-FRAME] raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
+				raw_state[0], raw_state[1], raw_state[8], raw_state[35]
+			);
+
+			self.last_stack_pointer = stack;
+
+			// EL1t: SP_EL0 holds the task body's stack pointer.
+			//
+			// REGRESSION FIX (2026-07-23, stopgap "a"): the previous commit
+			// moved sp_el0 from the 1 MiB user stack to the DEFAULT_STACK_SIZE
+			// (128 KiB) kernel region. The C++ static-init path
+			// (_GLOBAL__sub_I__ZN9__gnu_cxx9__freeres_ev: getenv/_findenv_r/
+			// strchr/strtoul + libstdc++ eh_alloc 0x12000 temp) overflows 128 KiB
+			// under a debug build, clobbering a return slot -> EC=0x21. For a
+			// `Common` stack (the init task) we therefore run the task body on
+			// the full user-stack region (>= 1 MiB), restoring the pre-regression
+			// headroom. The proper fix is Option D F-class C (dedicated static-init
+			// stack, docs/option-d-stack-switch-design.md §7.4 / write-bytes doc §4.0.6).
+			// `Boot` tasks keep the kernel-stack top (their only stack).
+			//
+			// kernel_stack_top = frame_base + STATE_SIZE + MARKER_SIZE.
+			// Point SP_EL0 one push *below* the chosen top (top - 16) so the task
+			// prologue's first `stp x29,x30,[sp,#-16]!` lands in the mapped
+			// stack page, not the unmapped GUARD page at top+0 (Option D §11.8).
+			let sp_top = match &self.stacks {
+				TaskStacks::Boot(_) => {
+					stack.as_u64()
+						+ core::mem::size_of::<State>() as u64
+						+ TaskStacks::MARKER_SIZE as u64
+				}
+				TaskStacks::Common(_) => {
+					// Use the top of the (much larger) user-stack region.
+					let user_top = self.stacks.get_user_stack().as_u64()
+						+ self.stacks.get_user_stack_size() as u64
+						- TaskStacks::MARKER_SIZE as u64;
+					user_top
+				}
+			};
+			(*state).sp_el0 = sp_top - 16;
+
+			// === INSTRUMENTATION: dump sp_el0 and guard page addr ===
+			let spel0_val = (*state).sp_el0;
+			warn!(
+				"[TRACE-FRAME] sp_el0={:#x} sp_top={:#x} guard={:#x}",
+				spel0_val, sp_top, sp_top
+			);
+
+			// === INSTRUMENTATION: re-read State after sp_el0 write ===
+			let raw_state2 = core::slice::from_raw_parts(state as *const u64, 36);
+			warn!(
+				"[TRACE-FRAME] post-spel0: raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
+				raw_state2[0], raw_state2[1], raw_state2[8], raw_state2[35]
+			);
+
+			// user_stack_pointer still populated for any legacy reader; the
+			// EL1t model does not run the task body on the user stack.
+			self.user_stack_pointer = self.stacks.get_user_stack()
+				+ self.stacks.get_user_stack_size()
+				- TaskStacks::MARKER_SIZE;
+
+			// === INSTRUMENTATION: probe user_stack write location ===
+			let usp_addr = self.user_stack_pointer.as_u64();
+			warn!("[TRACE-FRAME] user_stack_pointer={usp_addr:#x} writing marker");
+			*self.user_stack_pointer.as_mut_ptr::<u64>() = 0xdead_beefu64;
+
+			// === INSTRUMENTATION: final State probe after ALL writes ===
+			let raw_state3 = core::slice::from_raw_parts(state as *const u64, 36);
+			warn!(
+				"[TRACE-FRAME] FINAL: raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
+				raw_state3[0], raw_state3[1], raw_state3[8], raw_state3[35]
+			);
+			warn!(
+				"[TRACE-FRAME] last_stack_pointer={:#x} func={:#x}",
+				self.last_stack_pointer.as_u64(),
+				func as usize as u64
+			);
+		}
 	}
 }
 

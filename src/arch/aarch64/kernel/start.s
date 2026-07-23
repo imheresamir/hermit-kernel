@@ -62,28 +62,31 @@
      ldp x25, x26, [sp], #16
      ldp x27, x28, [sp], #16
      ldp x29, x30, [sp], #16
-     // D4 (trap_exit tail) DEFERRED to 2a.3 (§8.13). The tail below sets
-     // SP_EL1 = E on EL1t return to maintain INV-D. It is CORRECT in isolation
-     // (x22 holds F throughout; x21/x22 reloaded from frame slots F+0xd0/F+0xd8),
-     // but it must NOT go live until create_stack_frame gives tasks a valid EL1t
-     // kernel-stack model. Under the current (pre-2a.3) model tasks run EL1t with
-     // SP_EL1 = task KERNEL stack; firing this tail makes the task re-enter
-     // exceptions on E, its next frame lands on the shared E, last_stack_pointer
-     // goes stale, and a later switch-back pops garbage -> "Unsupported exception
-     // class: 0x0" (PC=0x410afd90, TaskId(0)). See §10.10.2. Re-enable together
-     // with the create_stack_frame EL1t conversion.
-     //
-     // sub  x22, sp, #288            // x22 = F (frame base)
-     // str  x21, [x22, #0xd0]        // task_x21 -> frame slot (x21 about to be scratch)
-     // mrs  x21, spsr_el1
-     // tst  x21, #1                  // SPSEL bit (0 = EL1t, 1 = EL1h)
-     // b.ne 1f                       // EL1h: keep SP_EL1 = incoming kernel-stack frame
-     // mrs  x21, tpidr_el1           // x21 = &CoreLocal (TPIDR_EL1)
-     // ldr  x21, [x21, #0]           // x21 = E (exception_sp, offset 0)
-     // mov  sp, x21                  // SP_EL1 = E
-     // 1:
-     // ldr  x21, [x22, #0xd0]        // task_x21 (via F in x22)
-     // ldr  x22, [x22, #0xd8]        // task_x22 (via F in x22)
+     // D4: for EL1t return (SPSR SPSEL==0), set SP_EL1 = E (per-core exception
+     // stack) so the next EL1t exception's trap_entry builds its scratch frame on E.
+     // For EL1h return (SPSEL==1), SP_EL1 MUST stay = the incoming kernel-stack
+     // frame (already set by `mov sp, x0`); overwriting it with E would strip EL1h
+     // tasks (notably the idle task) of their stack.
+     // CoreLocal is #[repr(C)] so exception_sp is at offset 0 (first field).
+     // trap_exit (above) has ALREADY restored the task's x21/x22 into those
+     // registers. D4 needs scratch registers, so save the task's x21 into its
+     // frame slot, use x21/x22 as scratch, then reload BOTH from the frame via
+     // F (= sp - STATE_SIZE, kept in x22) which stays mapped on both return paths.
+     // NOTE: do NOT `stp x21,x22` here -- by the time we compute F, x22 already
+     // holds F (not task_x22), so a paired store would write F into the x22 slot
+     // and the later reload would resume the task with x22 == frame base. Reload
+     // x22 from [F+0xd8] (its slot) instead.
+     sub  x22, sp, #288            // x22 = F (frame base; clobbers task_x22, but it's in the frame)
+     str  x21, [x22, #0xd0]        // task_x21 -> frame slot (preserve; x21 about to be clobbered)
+     mrs  x21, spsr_el1
+     tst  x21, #1                   // SPSEL bit (0 = EL1t, 1 = EL1h)
+     b.ne 1f                        // EL1h: keep SP_EL1 = incoming kernel-stack frame
+     mrs  x21, tpidr_el1           // x21 = &CoreLocal (TPIDR_EL1)
+     ldr  x21, [x21, #0]           // x21 = E (exception_sp, offset 0)
+     mov  sp, x21                  // SP_EL1 = E
+1:
+     ldr  x21, [x22, #0xd0]        // task_x21 (via F in x22)
+     ldr  x22, [x22, #0xd8]        // task_x22 (via F in x22)
 .endm
 
 /*
@@ -153,10 +156,9 @@ el1_irq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* get new sp   */
+      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
+      cbz x0, 1f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
       mov sp, x0
-      // D1: record the incoming task's restored SP_EL1 for call_with_kernel_stack (D5).
-      // trap_exit pops exactly STATE_SIZE (288) bytes from the saved frame.
       add x1, x0, #288
       mrs x2, tpidr_el1
       str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
@@ -186,10 +188,9 @@ el1_fiq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* get new sp   */
+      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
+      cbz x0, 2f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
       mov sp, x0
-      // D1: record the incoming task's restored SP_EL1 for call_with_kernel_stack (D5).
-      // trap_exit pops exactly STATE_SIZE (288) bytes from the saved frame.
       add x1, x0, #288
       mrs x2, tpidr_el1
       str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
@@ -259,10 +260,9 @@ el1_sp0_irq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* get new sp   */
+      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
+      cbz x0, 3f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
       mov sp, x0
-      // D1: record the incoming task's restored SP_EL1 for call_with_kernel_stack (D5).
-      // trap_exit pops exactly STATE_SIZE (288) bytes from the saved frame.
       add x1, x0, #288
       mrs x2, tpidr_el1
       str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
@@ -290,10 +290,9 @@ el1_sp0_fiq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* get new sp   */
+      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
+      cbz x0, 4f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
       mov sp, x0
-      // D1: record the incoming task's restored SP_EL1 for call_with_kernel_stack (D5).
-      // trap_exit pops exactly STATE_SIZE (288) bytes from the saved frame.
       add x1, x0, #288
       mrs x2, tpidr_el1
       str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */

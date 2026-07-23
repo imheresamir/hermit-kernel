@@ -51,23 +51,24 @@ pub(crate) static CURRENT_STACK_ADDRESS: AtomicPtr<u8> = AtomicPtr::new(ptr::nul
 #[unsafe(link_section = ".early_data")]
 pub(crate) static EARLY_SMP_RELEASE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU32::new(0));
 
-	/// Emergency exception stack pool used very early on aarch64.
-	///
-	/// Design:
-	/// - **Early boot** uses a small fixed pool of stacks in `.early_data` that is
-	///   guaranteed mapped. This avoids recursive exception storms if `sp` is invalid.
-	/// - **Later boot** should switch to real per-core exception stacks stored in
-	///   core-local state once the allocator/paging are fully initialized.
-	///
-	/// For now we keep only the early pool (64 stacks). This keeps `.early_data`
-	/// bounded and avoids scaling the image size linearly with core count.
-	pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_SIZE: usize = 64 * 1024;
-	pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE: usize = 64;
+/// Emergency exception stack pool used very early on aarch64.
+///
+/// Design:
+/// - **Early boot** uses a small fixed pool of stacks in `.early_data` that is
+///   guaranteed mapped. This avoids recursive exception storms if `sp` is invalid.
+/// - **Later boot** should switch to real per-core exception stacks stored in
+///   core-local state once the allocator/paging are fully initialized.
+///
+/// For now we keep only the early pool (64 stacks). This keeps `.early_data`
+/// bounded and avoids scaling the image size linearly with core count.
+pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_SIZE: usize = 64 * 1024;
+pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE: usize = 64;
 
-	#[unsafe(link_section = ".early_data")]
-	#[unsafe(no_mangle)]
-	pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE] =
-		[0; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE];
+#[unsafe(link_section = ".early_data")]
+#[unsafe(no_mangle)]
+pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8;
+	HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE] =
+	[0; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE];
 
 /// Unmap the per-core stack guard pages so a stack overflow faults (translation
 /// fault → el1_sync prints ESR/FAR/ELR) instead of silently corrupting the
@@ -91,64 +92,65 @@ pub(crate) static EARLY_SMP_RELEASE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU
 /// form evaluated `ADDR()` to 0 inside the `INSERT AFTER .tbss` script, so
 /// `&__start_X` resolved to 0 at runtime and the unmap hit garbage addresses.)
 pub(crate) fn protect_stack_guards() {
-    use crate::arch::aarch64::mm::paging::unmap;
-    use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
-    use memory_addresses::VirtAddr;
+	use memory_addresses::VirtAddr;
 
-    // Linker-provided section base symbols. These are defined with `= .` inside
-    // each `.X_stacks` section in crates/rs6/link.x, so the linker gives them a
-    // real (non-zero) link address and emits an `R_AARCH64_RELATIVE` relocation
-    // that hermit-loader rebases by the load bias (just like `executable_start`).
-    // The kernel is PIE, so we read the *runtime* address via the relocated
-    // reference — no hardcoded offsets, no ELF walk.
-    unsafe extern "C" {
-        static __start_exception_stacks: u8;
-        static __start_irq_stacks: u8;
-        static __start_overflow_stacks: u8;
-        static __start_task_stacks: u8;
-        static __start_reactor_stacks: u8;
-        static __start_idle_stacks: u8;
-    }
+	use crate::arch::aarch64::mm::paging::unmap;
+	use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 
-    let section_bases: [usize; 6] = unsafe {
-        [
-            &__start_exception_stacks as *const u8 as usize,
-            &__start_irq_stacks as *const u8 as usize,
-            &__start_overflow_stacks as *const u8 as usize,
-            &__start_task_stacks as *const u8 as usize,
-            &__start_reactor_stacks as *const u8 as usize,
-            &__start_idle_stacks as *const u8 as usize,
-        ]
-    };
-    // Per-slot stack size from config.rs, parallel to `section_bases` above.
-    // The exception stack is DEFAULT_STACK_SIZE (64KiB) -- a scratch stack for
-    // trap_entry + dispatch (§1.1); deep handler work runs on the task's kernel
-    // stack. All four sources (link.x, start.rs, core_local.rs, here) are 64KiB.
-    let stacks: [usize; 6] = [
-        DEFAULT_STACK_SIZE,
-        KERNEL_STACK_SIZE,
-        KERNEL_STACK_SIZE,
-        DEFAULT_STACK_SIZE, // no config.rs const; placeholder
-        DEFAULT_STACK_SIZE,
-        KERNEL_STACK_SIZE,
-    ];
+	// Linker-provided section base symbols. These are defined with `= .` inside
+	// each `.X_stacks` section in crates/rs6/link.x, so the linker gives them a
+	// real (non-zero) link address and emits an `R_AARCH64_RELATIVE` relocation
+	// that hermit-loader rebases by the load bias (just like `executable_start`).
+	// The kernel is PIE, so we read the *runtime* address via the relocated
+	// reference — no hardcoded offsets, no ELF walk.
+	unsafe extern "C" {
+		static __start_exception_stacks: u8;
+		static __start_irq_stacks: u8;
+		static __start_overflow_stacks: u8;
+		static __start_task_stacks: u8;
+		static __start_reactor_stacks: u8;
+		static __start_idle_stacks: u8;
+	}
 
-    let n = detected_cores();
-    let guard = BasePageSize::SIZE as u64;
-    info!("protect_stack_guards: n={n} guard_page={guard:#x}");
+	let section_bases: [usize; 6] = unsafe {
+		[
+			&__start_exception_stacks as *const u8 as usize,
+			&__start_irq_stacks as *const u8 as usize,
+			&__start_overflow_stacks as *const u8 as usize,
+			&__start_task_stacks as *const u8 as usize,
+			&__start_reactor_stacks as *const u8 as usize,
+			&__start_idle_stacks as *const u8 as usize,
+		]
+	};
+	// Per-slot stack size from config.rs, parallel to `section_bases` above.
+	// The exception stack is DEFAULT_STACK_SIZE (128KiB) -- a scratch stack for
+	// trap_entry + dispatch (§1.1); deep handler work runs on the task's kernel
+	// stack. All four sources (link.x, start.rs, core_local.rs, here) are 128KiB.
+	let stacks: [usize; 6] = [
+		DEFAULT_STACK_SIZE,
+		KERNEL_STACK_SIZE,
+		KERNEL_STACK_SIZE,
+		DEFAULT_STACK_SIZE, // no config.rs const; placeholder
+		DEFAULT_STACK_SIZE,
+		KERNEL_STACK_SIZE,
+	];
 
-    for i in 0..6 {
-        let section_base = section_bases[i] as u64;
-        let stack = stacks[i];
-        info!("protect_stack_guards: section_base={section_base:#x} stack={stack:#x}");
-        for j in 0..n {
-            let guard_addr = section_base + j as u64 * (stack as u64 + guard) + stack as u64;
-            let vaddr = VirtAddr::new(guard_addr);
-            info!("protect_stack_guards: unmapping guard at {vaddr:p}");
-            unmap::<BasePageSize>(vaddr, 1);
-        }
-    }
-    info!("protect_stack_guards: done");
+	let n = detected_cores();
+	let guard = BasePageSize::SIZE as u64;
+	info!("protect_stack_guards: n={n} guard_page={guard:#x}");
+
+	for i in 0..6 {
+		let section_base = section_bases[i] as u64;
+		let stack = stacks[i];
+		info!("protect_stack_guards: section_base={section_base:#x} stack={stack:#x}");
+		for j in 0..n {
+			let guard_addr = section_base + j as u64 * (stack as u64 + guard) + stack as u64;
+			let vaddr = VirtAddr::new(guard_addr);
+			info!("protect_stack_guards: unmapping guard at {vaddr:p}");
+			unmap::<BasePageSize>(vaddr, 1);
+		}
+	}
+	info!("protect_stack_guards: done");
 }
 
 /// Number of cores whose per-core guards to unmap.
@@ -232,18 +234,22 @@ pub fn application_processor_init() {
 fn finish_processor_init() {
 	debug!("Initialized processor {}", core_id());
 
-	// Use a static per-core slot in `.idle_stacks` instead of a heap allocation.
-	// Slot N for core N: base + N * (KERNEL_STACK_SIZE + GUARD_SIZE). The guard
-	// tail is unmapped by protect_stack_guards(), so an overflow faults instead of
-	// corrupting the adjacent slot. CURRENT_STACK_ADDRESS points at the slot base;
-	// start.s sets SP = base + KERNEL_STACK_SIZE (just below the guard).
-	unsafe extern "C" {
-		static __start_idle_stacks: u8;
-	}
+	// CURRENT_STACK_ADDRESS holds the *runtime* (rebased) base of the boot core's
+	// idle stack, captured by _start from the loader's SP. Extend it per core so
+	// each AP gets its own slot; for core 0 this is a no-op.
+	//
+	// Do NOT recompute from `&__start_idle_stacks`: that symbol resolves to the
+	// image's `.idle_stacks` *section* (used only by protect_stack_guards() to
+	// unmap per-core guard tails in the loaded image), which is a DIFFERENT VAS
+	// from the loader's live boot stack where the idle task actually runs. The
+	// DIAG in interrupts.rs confirms this: kernel_stack_top from the link-section
+	// symbol is 0x4167d000, while the live fault sits at 0x800015d82000 — two
+	// distinct addresses for "the idle stack".
+	let base = CURRENT_STACK_ADDRESS.load(Ordering::Relaxed) as usize;
 	let guard = BasePageSize::SIZE as usize;
 	let slot = KERNEL_STACK_SIZE + guard;
 	let core = core_id() as usize;
-	let stack = unsafe { &__start_idle_stacks as *const u8 as usize + core * slot };
+	let stack = base + core * slot;
 	CURRENT_STACK_ADDRESS.store(stack as *mut u8, Ordering::Relaxed);
 }
 
@@ -266,7 +272,7 @@ pub fn boot_next_processor() {
 
 		use memory_addresses::VirtAddr;
 
-		use crate::arch::aarch64::kernel::start::{TTBR0, smp_start};
+		use crate::arch::aarch64::kernel::start::{smp_start, TTBR0};
 		use crate::mm::virtual_to_physical;
 
 		if cpu_online == 0 {

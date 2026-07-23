@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::Backoff;
-use hashbrown::{HashMap, hash_map};
+use hashbrown::{hash_map, HashMap};
 use hermit_sync::*;
 #[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus;
@@ -106,7 +106,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	#[cfg(target_arch = "x86_64")]
 	fn reschedule(self) {
 		without_interrupts(|| {
-			let Some(last_stack_pointer) = self.scheduler() else {
+			let Some(last_stack_pointer) = self.scheduler(true) else {
 				return;
 			};
 
@@ -133,7 +133,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	/// Trigger an interrupt to reschedule the system
 	#[cfg(target_arch = "aarch64")]
 	fn reschedule(self) {
-		use aarch64_cpu::asm::barrier::{NSH, SY, dsb, isb};
+		use aarch64_cpu::asm::barrier::{dsb, isb, NSH, SY};
 
 		use crate::arch::kernel::interrupts::SGI_RESCHED;
 
@@ -166,15 +166,13 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 
 	#[cfg(target_arch = "riscv64")]
 	fn reschedule(self) {
-		without_interrupts(|| self.scheduler());
+		without_interrupts(|| self.scheduler(true));
 	}
 
 	fn exit(self, exit_code: i32) -> ! {
 		without_interrupts(|| {
 			// Get the current task.
 			let mut current_task_borrowed = self.current_task.borrow_mut();
-			info!("[D5-TRACE] Task::exit: id={} status={:?} (exit_code={})",
-				current_task_borrowed.id, current_task_borrowed.status, exit_code);
 			assert_ne!(
 				current_task_borrowed.status,
 				TaskStatus::Idle,
@@ -255,7 +253,6 @@ impl PerCoreScheduler {
 			stacks,
 			object_map: core_scheduler().get_current_task_object_map(),
 		};
-
 		// Add it to the task lists.
 		let wakeup = {
 			#[cfg(feature = "smp")]
@@ -396,6 +393,18 @@ impl PerCoreScheduler {
 		});
 	}
 
+	/// Minimal, bounded wake-move used on the exception stack (E) path (Part B:
+	/// "defer, don't relocate"). Moves woken/blocked tasks into `ready_queue`
+	/// WITHOUT draining the async executor (which must run off E, on the reactor
+	/// idle loop). The executor drain happens in `PerCoreScheduler::run()`.
+	#[inline]
+	pub fn wake_pending_tasks(&mut self) {
+		without_interrupts(|| {
+			self.blocked_tasks
+				.handle_waiting_tasks(&mut self.ready_queue);
+		});
+	}
+
 	#[cfg(not(feature = "smp"))]
 	pub fn custom_wakeup(&mut self, task: TaskHandle) {
 		without_interrupts(|| {
@@ -446,6 +455,29 @@ impl PerCoreScheduler {
 	#[inline]
 	pub fn get_current_task_id(&self) -> TaskId {
 		without_interrupts(|| self.current_task.borrow().id)
+	}
+
+	/// EL1t diagnostic helper: the current task's kernel_stack_top
+	/// (= base + size), i.e. the address SP_EL0 is set to on EL1t return.
+	/// Used only by the data-abort fault dumper to confirm whether a fault
+	/// at `kernel_stack_top` is an off-by-one stack-top write (Option D §11.7).
+	pub fn get_current_task_kernel_stack_top(&self) -> u64 {
+		without_interrupts(|| {
+			let t = self.current_task.borrow();
+			t.stacks.get_kernel_stack().as_u64() + t.stacks.get_kernel_stack_size() as u64
+		})
+	}
+
+	/// [ALLOC-TRACE] Returns (kernel_stack_base, kernel_stack_top, task_id_raw)
+	/// for the currently running task, without allocating. Used by the
+	/// allocator instrumentation to detect heap/stack overlap.
+	pub fn get_current_task_kstack_bounds(&self) -> (u64, u64, i32) {
+		without_interrupts(|| {
+			let t = self.current_task.borrow();
+			let base = t.stacks.get_kernel_stack().as_u64();
+			let top = base + t.stacks.get_kernel_stack_size() as u64;
+			(base, top, t.id.into())
+		})
 	}
 
 	#[inline]
@@ -731,9 +763,14 @@ impl PerCoreScheduler {
 
 	/// Triggers the scheduler to reschedule the tasks.
 	/// Interrupt flag must be cleared before calling this function.
-	pub fn scheduler(&mut self) -> Option<*mut usize> {
-		// run background tasks
-		crate::executor::run();
+	/// `drain_exec` = true drains the async executor (use OFF the exception
+	/// stack, e.g. the reactor idle loop); false skips it (use on the exception
+	/// stack E path — Part B defers executor work to the reactor).
+	pub fn scheduler(&mut self, drain_exec: bool) -> Option<*mut usize> {
+		// run background tasks (deferred off E by the IRQ path)
+		if drain_exec {
+			crate::executor::run();
+		}
 
 		// Someone wants to give up the CPU
 		// => we have time to cleanup the system

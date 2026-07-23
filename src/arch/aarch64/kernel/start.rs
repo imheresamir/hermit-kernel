@@ -6,9 +6,9 @@ use core::ptr;
 #[cfg(feature = "smp")]
 use core::sync::atomic::AtomicPtr;
 
-use aarch64_cpu::asm::barrier::{SY, dsb};
-use hermit_entry::Entry;
+use aarch64_cpu::asm::barrier::{dsb, SY};
 use hermit_entry::boot_info::RawBootInfo;
+use hermit_entry::Entry;
 
 use crate::arch::aarch64::kernel::scheduler::TaskStacks;
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
@@ -18,7 +18,7 @@ use crate::env;
 // — PIE-rebased by the loader, so `sym` yields the correct runtime address.
 // Used by Phase 2a.1 to set SP_EL1 to this core's exception stack top (Option D).
 unsafe extern "C" {
-    static __start_exception_stacks: u8;
+	static __start_exception_stacks: u8;
 }
 
 /*
@@ -49,10 +49,10 @@ const TCR_FLAGS: u64 = TCR_IRGN_WBWA | TCR_ORGN_WBWA | TCR_SHARED;
 const VA_BITS: u64 = 48;
 
 unsafe extern "C" {
-		// NOTE: The build prefixes exported kernel symbols with `hermit_`.
-		// We reference the final symbol name here so debuggers can set breakpoints by name.
-		static hermit_vector_table: u8;
-	}
+	// NOTE: The build prefixes exported kernel symbols with `hermit_`.
+	// We reference the final symbol name here so debuggers can set breakpoints by name.
+	static hermit_vector_table: u8;
+}
 
 /// Entrypoint - Initialize Stack pointer and Exception Table
 #[unsafe(no_mangle)]
@@ -129,11 +129,11 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		"and x24, x24, #0x3f",
 		"adrp x25, {exc_start}",
 		"add  x25, x25, #:lo12:{exc_start}",
-		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x20000) = MOVZ-able
 		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
 		"mul  x24, x24, x26",
 		"add  x25, x25, x24",        // base of this core's exception slot
-		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (64KiB exception scratch stack)
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (128KiB exception scratch stack)
 		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable exception stack
 		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
 		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn _start(boot_info: Option<&'static RawBootInfo>, cpu_id:
 		vt = sym hermit_vector_table,
 		pre_init = sym pre_init,
 		exc_start = sym __start_exception_stacks,
-		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (64KiB + GUARD per design §1.1)
+		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (128KiB + GUARD per design §1.1)
 	)
 }
 
@@ -274,11 +274,11 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		"and x24, x24, #0x3f",
 		"adrp x25, {exc_start}",
 		"add  x25, x25, #:lo12:{exc_start}",
-		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x10000) = MOVZ-able
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (0x20000) = MOVZ-able
 		"add  x26, x26, #0x1000",         // + GUARD => slot_stride (STACK+GUARD)
 		"mul  x24, x24, x26",
 		"add  x25, x25, x24",        // base of this core's exception slot
-		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (64KiB exception scratch stack)
+		"mov  x26, {exception_stack_size}", // DEFAULT_STACK_SIZE (128KiB exception scratch stack)
 		"add  x25, x25, x26",        // SP_EL1 = slot base + STACK = top of usable exception stack
 		// NOTE: `msr sp_el1, x25` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-writable
 		// only). At EL1h (spsel=1) `sp` aliases SP_EL1, so `mov sp, x25` is the
@@ -309,13 +309,19 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		ttbr0 = sym TTBR0,
 		pre_init = sym pre_init,
 		exc_start = sym __start_exception_stacks,
-		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (64KiB + GUARD per design §1.1)
+		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (128KiB + GUARD per design §1.1)
 	)
 }
 
 #[inline(never)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn pre_init(boot_info: Option<&'static RawBootInfo>, cpu_id: u32) -> ! {
+	let sp: u64;
+	unsafe {
+		core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack));
+	}
+	warn!("[TRACE-PRE-INIT] cpu_id={} sp={:#x}", cpu_id, sp);
+
 	// set exception table
 	unsafe {
 		asm!(

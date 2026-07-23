@@ -453,6 +453,9 @@ unreadable_literal = "warn"
 [patch.crates-io]
 safe-mmio = { git = "https://github.com/hermit-os/safe-mmio", branch = "0.3.x" }
 
+[profile.dev]
+codegen-units = 1
+
 [profile.dist]
 inherits = "release"
 lto = "thin"

@@ -71,9 +71,9 @@ impl CoreLocal {
 		// §2.2 boot (start.rs) and mod.rs::protect_stack_guards.2a1t6
 		// E(core) = &__start_exception_stacks +core*(DEFAULT_STACK_SIZE+0x1000)+DEFAULT_STACK_SIZE
 		// (0x1000 =BasePageSize::SIZE guard per slot). Exception stack is DEFAULT_STACK_SIZE
-		// (64KiB) -- a SCRATCH stack for trap_entry + dispatch (per design §1.1); the deep
+		// (128KiB) -- a SCRATCH stack for trap_entry + dispatch (per design §1.1); the deep
 		// handler work runs on the task's own kernel stack, not here. Sizing is via
-		// link.x + start.rs + core_local.rs + protect_stack_guards (all 64KiB), kept
+		// link.x + start.rs + core_local.rs + protect_stack_guards (all 128KiB), kept
 		// consistent; do NOT widen one without the other (see OPEN-2 re: measuring depth).
 		let e_top = {
 			let base = &raw const __start_exception_stacks as usize;
