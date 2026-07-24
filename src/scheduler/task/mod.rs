@@ -4,6 +4,7 @@
 pub(crate) mod tls;
 
 use alloc::collections::{LinkedList, VecDeque};
+use alloc::vec::Vec;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -485,6 +486,16 @@ pub(crate) struct Task {
 	/// Index of this task's assigned scratch slot within the current core's
 	/// pool (-1 = none). Valid only while `frame_location == IN_SLOT`.
 	pub slot: i32,
+	/// Eviction/wake protocol (slot-eviction-wake-protocol.md §4.4 INV-S3):
+	/// set by the wake path (`mark_ready`) when it observes `BeingEvicted`,
+	/// signalling the eviction copy is in flight; the eviction completion
+	/// (`evict_victim` in slot_pool.rs) reads it and completes the wake.
+	/// Owned by the owning core (single-core ownership), no atomics needed.
+	pub wake_pending: bool,
+	/// Staleness signal for victim selection (§4.1): monotonic ticks of the
+	/// last dispatch of this task. Updated once per `ensure_slot` call
+	/// (T2). Default 0 (very old -> most evictable) until first dispatch.
+	pub last_touch: u64,
 	/// Mapping between file descriptor and the referenced IO interface
 	pub object_map: Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
 	/// Task Thread-Local-Storage (TLS)
@@ -522,6 +533,8 @@ impl Task {
 			stacks,
 			frame_location: FrameLocation::InSlot,
 			slot: -1,
+			wake_pending: false,
+			last_touch: 0,
 			object_map,
 			#[cfg(not(feature = "common-os"))]
 			tls: None,
@@ -605,6 +618,8 @@ impl Task {
 			// `last_stack_pointer` to the slot frame base.
 			frame_location: FrameLocation::InSlot,
 			slot: -1,
+			wake_pending: false,
+			last_touch: 0,
 			object_map: OBJECT_MAP.get().unwrap().clone(),
 			#[cfg(not(feature = "common-os"))]
 			tls,
@@ -652,8 +667,18 @@ impl BlockedTaskQueue {
 		}
 	}
 
-	fn mark_ready(task: &RefCell<Task>) {
+	// T6 (slot-eviction-wake-protocol.md §5.1, R1.4): returns `true` iff it
+	// newly flipped the task to Ready (caller must push to ready_queue);
+	// `false` if deferred (BeingEvicted) or already Ready (no push).
+	pub(crate) fn mark_ready(task: &RefCell<Task>) -> bool {
 		let mut borrowed = task.borrow_mut();
+		// T9-V-RW1: wake-path discriminator (§8.2). Logs the frame_location
+		// the wake observed and whether a deferral fired. Confirms INV-S3
+		// reader behaviour. STRIP in T10.
+		info!(
+			"[V-RW1] mark_ready task {} core {} frame_location={:?} wake_pending(was)={}",
+			borrowed.id, borrowed.core_id, borrowed.frame_location, borrowed.wake_pending
+		);
 		debug!(
 			"Waking up task {} on core {}",
 			borrowed.id, borrowed.core_id
@@ -667,12 +692,36 @@ impl BlockedTaskQueue {
 			core_id()
 		);
 
+		// R1.4: tolerate an already-Ready task (e.g. double wake: timer +
+		// explicit close together, or a second Evicted-path wake). The
+		// invariant we protect is "do not double-push to ready_queue" and
+		// "do not wake a Running/Invalid task" — NOT "must be Blocked".
 		assert!(
-			borrowed.status == TaskStatus::Blocked,
-			"Trying to wake up task {} which is not blocked",
-			borrowed.id
+			borrowed.status == TaskStatus::Blocked
+				|| borrowed.status == TaskStatus::Ready,
+			"Trying to wake up task {} in unexpected status {:?}",
+			borrowed.id,
+			borrowed.status
 		);
-		borrowed.status = TaskStatus::Ready;
+		if borrowed.status == TaskStatus::Ready {
+			// Already readied (concurrent Evicted-path wake or double wake).
+			// Do not re-push; the task is already scheduled.
+			return false;
+		}
+
+		// INV-S3 reader: the wake path defers while an eviction copy is in
+		// flight. We never touch the frame here; we only record the wake and
+		// let `evict_victim` complete it (R1.1: caller-side completion).
+		match borrowed.frame_location {
+			FrameLocation::BeingEvicted => {
+				borrowed.wake_pending = true;
+				false // deferred; eviction completion will re-enter + flip Ready
+			}
+			FrameLocation::Evicted | FrameLocation::InSlot => {
+				borrowed.status = TaskStatus::Ready;
+				true // newly readied
+			}
+		}
 	}
 
 	/// Blocks the given task for `wakeup_time` ticks, or indefinitely if None is given.
@@ -717,13 +766,90 @@ impl BlockedTaskQueue {
 
 	/// Iterate the blocked tasks resident in this queue (used by the
 	/// per-task exception-slot eviction protocol to pick a stale victim,
-	/// per-task-exception-slot-design.md §4.2). Read-only.
+	/// per-task-exception-slot-design.md §4.2).
 	pub fn iter(&self) -> impl Iterator<Item = &Rc<RefCell<Task>>> {
 		self.list.iter().map(|node| &node.task)
 	}
 
-	/// Manually wake up a blocked task.
-	pub fn custom_wakeup(&mut self, task: TaskHandle) -> Rc<RefCell<Task>> {
+	/// T3 (slot-eviction-wake-protocol.md §4.1, R1.2): select an eviction
+	/// victim for the per-task slot pool when exhausted.
+	///
+	/// Candidate filter (all required):
+	///   - not the task being resumed (`exclude_id`)         [INV-S4 no self]
+	///   - `frame_location == InSlot && slot >= 0`           [only slot residents]
+	///   - `status == TaskStatus::Blocked`                   [R1.2: never evict a
+	///     task that is InSlot + Ready — its frame would move under a task
+	///     about to run]
+	///
+	/// Staleness policy (prefer the WORST victim to evict):
+	///   primary  key: negated `wakeup_time` (far-deadline / no-deadline first)
+	///   secondary key: `last_touch` ascending (oldest-touch first)
+	/// A candidate touched within `LAST_TOUCH_THRESHOLD_MS` is skipped (too
+	/// fresh, about to wake) -> returns None -> graceful degradation.
+	///
+	/// Returns the chosen `Rc<RefCell<Task>>`, or None if no eligible
+	/// victim (caller degrades to kernel-stack frame).
+	pub(crate) fn select_eviction_victim(
+		&self,
+		exclude_id: TaskId,
+	) -> Option<Rc<RefCell<Task>>> {
+		// TUNABLE (L2): deliberate build-time knob, not a hardcoded literal.
+		const LAST_TOUCH_THRESHOLD_MS: u64 = 10;
+		let now = processor::get_timer_ticks();
+
+		let mut candidates: Vec<(Rc<RefCell<Task>>, u64)> = Vec::new();
+		for node in self.list.iter() {
+			let t = &node.task;
+			let b = t.borrow();
+			// INV-S4 (doc §11: assert!, compiled in release — self-eviction
+			// would deadlock resume, a real bug not a recoverable condition).
+			assert!(
+				b.id != exclude_id,
+				"select_eviction_victim: self-eviction attempt for task {} (INV-S4)",
+				b.id
+			);
+			if b.frame_location != FrameLocation::InSlot || b.slot < 0 {
+				continue; // not a slot resident
+			}
+			if b.status != TaskStatus::Blocked {
+				continue; // R1.2: never evict a readied/running task
+			}
+			// Primary staleness key: far deadline (or no deadline) first.
+			let wake_key: u64 = match node.wakeup_time {
+				Some(w) => u64::MAX - w, // smaller key = further in the future
+				None => 0,               // no deadline = most evictable
+			};
+			candidates.push((t.clone(), wake_key));
+		}
+		// Order by primary key, then by last_touch ascending (oldest first).
+		candidates.sort_by(|a, b| {
+			a.1.cmp(&b.1)
+				.then_with(|| a.0.borrow().last_touch.cmp(&b.0.borrow().last_touch))
+		});
+		// Skip too-fresh candidates (about to wake) -> graceful degradation.
+		let chosen = candidates
+			.into_iter()
+			.find(|(t, _)| now.saturating_sub(t.borrow().last_touch) >= LAST_TOUCH_THRESHOLD_MS)
+			.map(|(t, _)| t);
+		// T9-V-RW3: victim-selection discriminator (§8.2). Confirms the
+		// staleness policy (NOT first-fit) drove the choice. STRIP in T10.
+		match &chosen {
+			Some(t) => info!(
+				"[V-RW3] select_eviction_victim chose task {} (staleness policy)",
+				t.borrow().id
+			),
+			None => info!("[V-RW3] select_eviction_victim: no eligible victim (degrade)"),
+		}
+		chosen
+	}
+
+	/// Manually wake up a blocked task. Returns the woken task and whether
+	/// the wake actually completed (status flipped to Ready). A `false`
+	/// completion means the wake was deferred (the task was `BeingEvicted`);
+	/// the caller must NOT push to the ready queue in that case — the
+	/// eviction completion will re-enter `mark_ready` and schedule it.
+	/// (slot-eviction-wake-protocol.md §5.1 R1.4.)
+	pub fn custom_wakeup(&mut self, task: TaskHandle) -> (Rc<RefCell<Task>>, bool) {
 		let mut first_task = true;
 		let mut cursor = self.list.cursor_front_mut();
 
@@ -744,10 +870,10 @@ impl BlockedTaskQueue {
 					create_timer_abs(Source::Scheduler, wakeup);
 				}
 
-				// Wake it up.
-				Self::mark_ready(&task_ref);
+				// Wake it up (returns true iff newly readied).
+				let completed = Self::mark_ready(&task_ref);
 
-				return task_ref;
+				return (task_ref, completed);
 			}
 
 			first_task = false;
@@ -775,8 +901,12 @@ impl BlockedTaskQueue {
 		});
 
 		for task in newly_ready_tasks {
-			Self::mark_ready(&task.task);
-			ready_queue.push(task.task);
+			// T6/R1.4: only push if the wake actually completed (status
+			// flipped to Ready). A deferred/already-Ready wake returns
+			// false and must not be pushed again here.
+			if Self::mark_ready(&task.task) {
+				ready_queue.push(task.task);
+			}
 		}
 
 		let new_task_wakeup_time = self.list.front().and_then(|task| task.wakeup_time);

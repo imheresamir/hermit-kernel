@@ -448,8 +448,13 @@ impl PerCoreScheduler {
 	#[cfg(not(feature = "smp"))]
 	pub fn custom_wakeup(&mut self, task: TaskHandle) {
 		without_interrupts(|| {
-			let task = self.blocked_tasks.custom_wakeup(task);
-			self.ready_queue.push(task);
+			let (task, completed) = self.blocked_tasks.custom_wakeup(task);
+			// T6/R1.4: only push if the wake completed (status flipped to
+			// Ready). A deferred wake (BeingEvicted) returns completed=false
+			// and is scheduled later by the eviction completion.
+			if completed {
+				self.ready_queue.push(task);
+			}
 		});
 	}
 
@@ -457,8 +462,10 @@ impl PerCoreScheduler {
 	pub fn custom_wakeup(&mut self, task: TaskHandle) {
 		if task.get_core_id() == self.core_id {
 			without_interrupts(|| {
-				let task = self.blocked_tasks.custom_wakeup(task);
-				self.ready_queue.push(task);
+				let (task, completed) = self.blocked_tasks.custom_wakeup(task);
+				if completed {
+					self.ready_queue.push(task);
+				}
 			});
 		} else {
 			get_scheduler_input(task.get_core_id())
@@ -751,8 +758,13 @@ impl PerCoreScheduler {
 		let mut input_locked = CoreLocal::get().scheduler_input.lock();
 
 		while let Some(task) = input_locked.wakeup_tasks.pop_front() {
-			let task = self.blocked_tasks.custom_wakeup(task);
-			self.ready_queue.push(task);
+			// T6/R1.4: gate the push on completion. A deferred cross-core
+			// wake (the task was BeingEvicted on this core) returns
+			// completed=false; the eviction completion schedules it later.
+			let (task, completed) = self.blocked_tasks.custom_wakeup(task);
+			if completed {
+				self.ready_queue.push(task);
+			}
 		}
 
 		while let Some(new_task) = input_locked.new_tasks.pop_front() {
@@ -811,9 +823,16 @@ impl PerCoreScheduler {
 	#[cfg(target_arch = "aarch64")]
 	fn ensure_slot(&mut self, task: &Rc<RefCell<Task>>) {
 		use crate::arch::kernel::slot_pool;
+		use crate::config::SLOTS_PER_CORE;
 
-		// Already resident in a slot? Nothing to do (last_stack_pointer already
-		// points at the slot frame base from a prior dispatch).
+		// T2: update the staleness signal on every dispatch attempt (one
+		// write per context switch; zero asm changes — R1.3).
+		{
+			let mut b = task.borrow_mut();
+			b.last_touch = crate::arch::kernel::processor::get_timer_ticks();
+		}
+
+		// Step 1: already resident in a slot? (or EL1h in-place via spsel gate)
 		{
 			let b = task.borrow();
 			if b.slot >= 0 && b.frame_location == FrameLocation::InSlot {
@@ -842,7 +861,26 @@ impl PerCoreScheduler {
 			}
 		}
 
-		// Fast path: pool has a free slot.
+		// Step 2 (R2.1): Evicted check MUST precede dispatch_acquire_slot.
+		// An Evicted task has frame_location==Evicted (not InSlot), so it
+		// fell through step 1. Route it through resume_from_evicted — the ONLY
+		// Evicted->InSlot path (INV-S8). If the pool is full, resume_from_evicted
+		// returns false (leaves Evicted) and we fall through to eviction below.
+		{
+			let is_evicted = task.borrow().frame_location == FrameLocation::Evicted;
+			if is_evicted {
+				let resumed = {
+					let mut b = task.borrow_mut();
+					slot_pool::resume_from_evicted(&mut b)
+				};
+				if resumed {
+					return; // resumed into a fresh slot
+				}
+				// pool full: leave Evicted, fall through to eviction below
+			}
+		}
+
+		// Step 3: fast path — pool has a free slot (non-Evicted task).
 		{
 			let mut b = task.borrow_mut();
 			if slot_pool::dispatch_acquire_slot(&mut b) {
@@ -850,33 +888,57 @@ impl PerCoreScheduler {
 			}
 		}
 
-		// Slow path: pool exhausted. Evict a stale blocked resident, then retry.
-		// Scan this core's blocked tasks for a victim (exclude the task being
-		// resumed — no self-eviction, design INV-S4).
+		// Steps 4-5: bounded recursive eviction (§6.1, INV-S5). Each iteration
+		// evicts the stalest eligible blocked resident and retries acquisition
+		// for OUR task. Bound = SLOTS_PER_CORE-1 (pool is finite; no infinite
+		// loop). The Evicted->InSlot transition for any woken victim is
+		// completed here (R1.1 caller-side wake completion).
 		let self_id = task.borrow().id;
-		let mut victim: Option<Rc<RefCell<Task>>> = None;
-		for blocked in self.blocked_tasks.iter() {
-			let b = blocked.borrow();
-			if b.id == self_id {
-				continue;
+		let mut evictions = 0usize;
+		loop {
+			if let Some(v) = self.blocked_tasks.select_eviction_victim(self_id) {
+				let slot_idx = v.borrow().slot as usize;
+				// T4: evict_victim returns whether a wake was deferred.
+				let woken = slot_pool::evict_victim(&mut v.borrow_mut(), slot_idx);
+				if woken {
+					// T5/R1.1: complete the deferred wake now (frame is Evicted).
+					// mark_ready returns true (status Blocked->Ready); push it.
+					let completed =
+						crate::scheduler::task::BlockedTaskQueue::mark_ready(&v);
+					if completed {
+						self.ready_queue.push(v);
+					}
+				}
+				// Retry acquisition for OUR task.
+				{
+					let mut b = task.borrow_mut();
+					if slot_pool::dispatch_acquire_slot(&mut b) {
+						return;
+					}
+				}
+				evictions += 1;
+				// INV-S5 (doc §11): debug_assert tripwire — the loop bound
+				// (SLOTS_PER_CORE-1) is the authoritative guard; this catches a
+				// future edit that wrongly grows the loop before the break.
+				debug_assert!(
+					evictions <= (SLOTS_PER_CORE - 1),
+					"ensure_slot: eviction count {} exceeds bound SLOTS_PER_CORE-1={}",
+					evictions,
+					SLOTS_PER_CORE - 1
+				);
+				if evictions >= (SLOTS_PER_CORE - 1) {
+					break;
+				}
+			} else {
+				break; // no eligible victim -> graceful degradation
 			}
-			if b.frame_location != FrameLocation::InSlot || b.slot < 0 {
-				continue;
-			}
-			victim = Some(blocked.clone());
-			break; // simplest selection: first eligible resident
-		}
-		if let Some(v) = victim {
-			let slot_idx = v.borrow().slot as usize;
-			slot_pool::evict_victim(&mut v.borrow_mut(), slot_idx);
 		}
 
-		// Retry acquisition. If still exhausted (e.g. no blocked victim),
-		// fall back to running on the kernel-stack frame: the switch path
-		// publishes scratch_slot = last_stack_pointer + 288 = kernel_stack_top,
-		// so the frame lands on the task's OWN kernel stack — safe (no shared
-		// E), just without per-slot isolation. This is graceful degradation,
-		// not a crash (design §5.3 bounded exhaustion fallback).
+		// Hard exhaustion beyond bound: run on kernel-stack frame (graceful
+		// degradation, design §5.3). The switch path publishes
+		// scratch_slot = last_stack_pointer + 288 = kernel_stack_top, so the
+		// frame lands on the task's OWN kernel stack — safe (no shared E),
+		// just without per-slot isolation. Not a crash.
 		let mut b = task.borrow_mut();
 		if !slot_pool::dispatch_acquire_slot(&mut b) {
 			warn!(

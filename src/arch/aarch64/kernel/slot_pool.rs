@@ -129,6 +129,9 @@ pub fn dispatch_acquire_slot(task: &mut Task) -> bool {
 	task.last_stack_pointer = VirtAddr::new(frame_base);
 	task.slot = idx as i32;
 	task.frame_location = FrameLocation::InSlot;
+	// T7/R1.5: clear any stale deferred-wake flag on (re)acquiring a slot.
+	// A prior BeingEvicted deferral belongs to a previous eviction cycle.
+	task.wake_pending = false;
 	// INVARIANT (per-task-exception-slot-design.md): a frame resident in a
 	// slot MUST satisfy frame_base + STATE_SIZE == slot_top(core, idx), i.e.
 	// the 288-byte State occupies exactly the slot body's tail and
@@ -177,7 +180,14 @@ pub fn release_slot(task: &Task) {
 /// `PerCoreScheduler` (scheduler/mod.rs), which owns the `Rc<RefCell<Task>>`
 /// collections. This function only performs the copy + state transition for a
 /// victim the scheduler has already chosen and borrowed mutably.
-pub fn evict_victim(victim: &mut Task, slot_idx: usize) {
+///
+/// Returns `true` if a wake was deferred while this victim was
+/// `BeingEvicted` (the wake path set `wake_pending`). The CALLER
+/// (ensure_slot) must complete that wake by calling `mark_ready` on the
+/// victim once it is `Evicted` — this avoids re-borrowing the `RefCell`
+/// here (R1.1: evict_victim holds `&mut Task`, cannot call `mark_ready`
+/// which needs `&RefCell<Task>`).
+pub fn evict_victim(victim: &mut Task, slot_idx: usize) -> bool {
 	// §3F: precondition — victim must have its frame in a slot.
 	assert_eq!(
 		victim.frame_location,
@@ -212,6 +222,17 @@ pub fn evict_victim(victim: &mut Task, slot_idx: usize) {
 	victim.frame_location = FrameLocation::Evicted;
 	victim.slot = -1;
 	owners_for_core(core_id() as usize).release(slot_idx);
+	// R1.1/R1.5: hand off any deferred wake to the caller. Clear the flag
+	// here so a future eviction on this task can't replay a stale wake.
+	let woken = victim.wake_pending;
+	victim.wake_pending = false;
+	// T9-V-RW2: eviction discriminator (§8.2). Confirms claim->copy->Evicted
+	// and whether a deferred wake is being handed off. STRIP in T10.
+	info!(
+		"[V-RW2] evict_victim task {} slot {} -> Evicted, woken(deferred)={}",
+		victim.id, slot_idx, woken
+	);
+	woken
 }
 
 /// Resume a task whose frame was evicted: acquire a fresh slot, copy the
@@ -251,6 +272,14 @@ pub fn resume_from_evicted(task: &mut Task) -> bool {
 	task.last_stack_pointer = VirtAddr::new(frame_base);
 	task.slot = idx as i32;
 	task.frame_location = FrameLocation::InSlot;
+	// T7/R1.5: clear any stale deferred-wake flag on resuming into a slot.
+	task.wake_pending = false;
+	// T9-V-RW4: Evicted->InSlot re-dispatch discriminator (§8.2). Confirms
+	// the slow path is exercised (not the unused-today dead path). STRIP T10.
+	info!(
+		"[V-RW4] resume_from_evicted task {} -> slot {} (InSlot)",
+		task.id, idx
+	);
 	owners.set_owner(idx, task.id.into());
 	true
 }
