@@ -3,20 +3,41 @@ use core::cell::Cell;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use aarch64_cpu::registers::{Readable, Writeable, TPIDR_EL1};
+use aarch64_cpu::registers::{Readable, TPIDR_EL1, Writeable};
 use async_executor::StaticLocalExecutor;
 #[cfg(feature = "smp")]
 use hermit_sync::InterruptTicketMutex;
 use hermit_sync::{RawRwSpinLock, RawSpinMutex};
 
-use super::interrupts::{IrqStatistics, IRQ_COUNTERS};
 use super::CPU_ONLINE;
+use super::interrupts::{IRQ_COUNTERS, IrqStatistics};
 use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize};
-use crate::config::DEFAULT_STACK_SIZE;
+use crate::config::{ARCH_STATE_SIZE, DEFAULT_STACK_SIZE};
 use crate::mm::{kernel_end_address, kernel_start_address};
 #[cfg(feature = "smp")]
 use crate::scheduler::SchedulerInput;
 use crate::scheduler::{CoreId, PerCoreScheduler};
+
+// Invariant guard: start.s D4 tail hardcodes `ldr x21, [x21, #24]` to load
+// CoreLocal.scratch_slot, and the switch vectors hardcode `str x1, [x2, #24]`.
+// If the CoreLocal repr(C) layout ever drifts, SP_EL1 would be loaded from the
+// wrong offset (silently corrupting the per-task exception stack). Pin it.
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, scratch_slot) == 24,
+	"CoreLocal.scratch_slot must be at offset 24 (start.s D4 tail / switch vectors hardcode #24)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, exception_sp) == 0,
+	"CoreLocal.exception_sp must be at offset 0 (D4 tail: ldr x21,[x21,#0])"
+);
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, kernel_sp) == 16,
+	"CoreLocal.kernel_sp must be at offset 16 (D5: ldr x9,[x9,#16]; switch: str x1,[x2,#16])"
+);
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, this) == 8,
+	"CoreLocal.this must be at offset 8 (between exception_sp@0 and kernel_sp@16)"
+);
 
 // Linker-defined per-core exception-stack base (one slot per core, each
 // `DEFAULT_STACK_SIZE +0x1000` (guard) wide; the top of slot N is E(N)).
@@ -29,7 +50,8 @@ unsafe extern "C" {
 // `kernel_sp` is the SP_EL1 value after trap_exit pops the 18 stp pairs made by
 // trap_entry. The creation-time stack marker is outside State and must not be
 // added here; doing so advances kernel_sp by 16 bytes on every context switch.
-const _: () = assert!(18 * 16 == 288);
+// Cross-checks both the asm arithmetic (18 pairs × 16 B) and ARCH_STATE_SIZE.
+const _: () = assert!(18 * 16 == ARCH_STATE_SIZE);
 
 #[repr(C)]
 pub(crate) struct CoreLocal {
@@ -49,7 +71,17 @@ pub(crate) struct CoreLocal {
 	/// Offset 16 (= 2×8): u64, 8-byte aligned. Updated on EVERY switch (D1/D3)
 	/// before `trap_exit` runs, because a freshly-switched task body may call a
 	/// `kernel_function` on its first instruction.
-	kernel_sp: u64,
+	pub(crate) kernel_sp: u64,
+	/// Current task's **scratch-slot TOP** (per-task exception slot design).
+	/// This is the top of the task's private exception scratch slot; the D4
+	/// tail (start.s `trap_exit`) loads it into SP_EL1 on every EL1t return so
+	/// the next EL1t exception builds its trap frame on the task's OWN slot
+	/// instead of the shared per-core E. Offset 24 (= 3×8): u64. NOT to be
+	/// conflated with `kernel_sp` (@16) — that stays the 128 KiB kernel-stack
+	/// top for `call_with_kernel_stack`; overloading it with the ~5 KiB slot
+	/// would overflow the handler stack (design D-1). Initialized at
+	/// `install()` to this core's slot 0 top (idle/boot task's slot).
+	scratch_slot: u64,
 	/// ID of the current Core.
 	core_id: CoreId,
 	/// Scheduler of the current Core.
@@ -109,6 +141,18 @@ impl CoreLocal {
 			kernel_sp: e_top, // D1/D6: boot/idle default = E (per-core exception stack).
 			// Updated to the incoming task's kernel-stack top on every
 			// switch (start.s switch path).
+			// Per-task exception slot design: `scratch_slot` holds the TOP of
+			// this core's current task's scratch slot; the D4 tail loads it
+			// into SP_EL1 on EL1t returns. At boot the current "task" is the
+			// idle/boot task, whose effective slot is E (the per-core
+			// exception stack) until a real slot pool is allocated
+			// (per-task-exception-slot-design.md Step 1). Initializing to
+			// e_top keeps boot correct; the switch path republishes the real
+			// per-task slot top on the first dispatch.
+			// TODO(slot-pool): once .exception_slots is allocated, set this
+			// to `slot_pool_base(core_id) + SLOT_STRIDE * 0 + SLOT_SIZE`
+			// (core 0's slot 0 top = idle task's slot) per doc V-D5.
+			scratch_slot: e_top,
 			scheduler: Cell::new(ptr::null_mut()),
 			irq_statistics,
 			ex: StaticLocalExecutor::new(),
@@ -135,6 +179,30 @@ impl CoreLocal {
 		let addr = TPIDR_EL1.get().try_into().unwrap();
 		let ptr = ptr::with_exposed_provenance(addr);
 		unsafe { &*ptr }
+	}
+
+	/// §4D: Update kernel_sp for the incoming task. Called from the scheduler
+	/// BEFORE the asm switch path (start.s). The asm publishes scratch_slot
+	/// (@24) but NOT kernel_sp (@16); call_with_kernel_stack reads kernel_sp
+	/// to set SP_EL1 for deep handler work. This must be set per-task-switch.
+	///
+	/// SAFETY: the caller must ensure `sp` is a valid kernel-stack top for the
+	/// task about to be dispatched. A stale value causes call_with_kernel_stack
+	/// to run deep work on the wrong stack → overflow → silent corruption.
+	pub fn set_kernel_sp(&self, sp: u64) {
+		// kernel_sp is not behind a Cell (unlike scheduler/scheduler_input),
+		// so we write through a volatile raw pointer. This is safe because:
+		//  (a) only the scheduler on this core calls this, between ensure_slot
+		//      and the asm switch — no concurrent writer,
+		//  (b) the asm reads this AFTER the `bl get_last_stack_pointer` return,
+		//      which is a compiler barrier (bl implies memory clobber).
+		unsafe {
+			let ptr = (self as *const Self as *mut Self)
+				.cast::<u8>()
+				.add(core::mem::offset_of!(Self, kernel_sp))
+				.cast::<u64>();
+			ptr.write_volatile(sp);
+		}
 	}
 
 	pub fn add_irq_counter(&self) {

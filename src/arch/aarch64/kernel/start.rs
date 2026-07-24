@@ -6,9 +6,9 @@ use core::ptr;
 #[cfg(feature = "smp")]
 use core::sync::atomic::AtomicPtr;
 
-use aarch64_cpu::asm::barrier::{dsb, SY};
-use hermit_entry::boot_info::RawBootInfo;
+use aarch64_cpu::asm::barrier::{SY, dsb};
 use hermit_entry::Entry;
+use hermit_entry::boot_info::RawBootInfo;
 
 use crate::arch::aarch64::kernel::scheduler::TaskStacks;
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};

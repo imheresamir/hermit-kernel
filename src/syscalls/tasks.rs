@@ -62,6 +62,45 @@ pub extern "C" fn sys_thread_exit(status: i32) -> ! {
 #[hermit_macro::system]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_abort() -> ! {
+	// DISCRIMINATOR (per-task-exception-slot-design.md R4-FU2): userspace
+	// task-1 panic `slice index 1610613287 (0x60000207)` — SPSR-shaped, KNOWN
+	// app code => kernel-induced corruption. Dump current task's saved State
+	// (36 u64) and flag any slot (esp. x-slots 5..35) == 0x60000207. Covers
+	// the app-panic -> sys_abort syscall route. READ-ONLY.
+	{
+		let cs = core_scheduler();
+		let tid = cs.get_current_task_id();
+		let lsp = cs.get_last_stack_pointer().as_u64();
+		error!(
+			"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} (0x60000207 = SPSR-shaped panic index)"
+		);
+		if lsp != 0 {
+			let slot = lsp as *const u64;
+			let mut hit_any = false;
+			let mut hit_x = false;
+			for i in 0..36u64 {
+				let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
+				let is_x = i >= 5 && i <= 35;
+				if v == 0x60000207 {
+					hit_any = true;
+					if is_x {
+						hit_x = true;
+					}
+					error!(
+						"[ABORT-DUMP] slot[{i}] @+{:#x} = 0x60000207  <<< MATCH (is_x={is_x})",
+						8 * i
+					);
+				} else if i == 2 {
+					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (spsr)", 8 * i, v);
+				} else if i == 1 {
+					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (elr)", 8 * i, v);
+				}
+			}
+			error!(
+				"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
+			);
+		}
+	}
 	exit(-1)
 }
 

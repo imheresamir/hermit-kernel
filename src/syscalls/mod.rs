@@ -80,7 +80,8 @@ pub(crate) fn init() {
 /// ctor loop reads this to bisect WHICH ctor first deposits `V` onto the kernel
 /// stack. 0 means "not yet set".
 #[cfg(all(target_os = "none", not(feature = "common-os")))]
-pub(crate) static LAST_ALLOC_V: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(crate) static LAST_ALLOC_V: core::sync::atomic::AtomicU64 =
+	core::sync::atomic::AtomicU64::new(0);
 
 /// Scan the current task's kernel stack for a specific 64-bit value `v` and
 /// report the lowest slot that holds it. Used to pinpoint the clobber writer.
@@ -173,9 +174,7 @@ fn alloc_trace(tag: &str, size: usize, align: usize, ptr: *mut u8) {
 	}
 	// SP outside the declared kernel stack (stack overflow / wrong stack).
 	if sp < kstack_lo || sp >= kstack_hi {
-		warn!(
-			"[ALLOC-TRACE] *** SP {sp:#x} OUTSIDE kstack [{kstack_lo:#x}..{kstack_hi:#x}] ***"
-		);
+		warn!("[ALLOC-TRACE] *** SP {sp:#x} OUTSIDE kstack [{kstack_lo:#x}..{kstack_hi:#x}] ***");
 	}
 
 	// FP-chain walk: dump each frame's saved {FP, LR} so we can see which
@@ -195,7 +194,11 @@ fn alloc_trace(tag: &str, size: usize, align: usize, ptr: *mut u8) {
 		let lr_in_stack = saved_lr >= kstack_lo && saved_lr < kstack_hi;
 		warn!(
 			"[ALLOC-TRACE]   frame[{depth}] fp={fp:#x} saved_fp={saved_fp:#x} saved_lr={saved_lr:#x}{}",
-			if lr_in_stack { "  <== LR POINTS INTO STACK" } else { "" }
+			if lr_in_stack {
+				"  <== LR POINTS INTO STACK"
+			} else {
+				""
+			}
 		);
 		if saved_fp <= fp {
 			break; // FP must increase up the stack; stop on corruption/end.

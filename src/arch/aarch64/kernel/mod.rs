@@ -10,6 +10,7 @@ pub mod pci;
 pub mod processor;
 pub mod scheduler;
 pub mod serial;
+pub mod slot_pool;
 #[cfg(target_os = "none")]
 mod start;
 pub mod systemtime;
@@ -94,7 +95,7 @@ pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8;
 pub(crate) fn protect_stack_guards() {
 	use memory_addresses::VirtAddr;
 
-	use crate::arch::aarch64::mm::paging::unmap;
+	use crate::arch::aarch64::mm::paging::{get_page_table_entry, unmap};
 	use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 
 	// Linker-provided section base symbols. These are defined with `= .` inside
@@ -110,9 +111,50 @@ pub(crate) fn protect_stack_guards() {
 		static __start_task_stacks: u8;
 		static __start_reactor_stacks: u8;
 		static __start_idle_stacks: u8;
+		static __start_exception_slots: u8;
+		static __end_exception_slots: u8;
 	}
 
-	let section_bases: [usize; 6] = unsafe {
+	// The per-task exception-slot pool (`.exception_slots`) is a NEW section the
+	// hermit-loader's grow/rebase pass does not yet know about, so it maps
+	// `.exception_stacks` (and the other stack sections) but leaves the slot
+	// region with NO page-table entries. `&__start_exception_slots` is already
+	// the correct *runtime* VA (the loader rebases it via R_AARCH64_RELATIVE,
+	// like every other kernel symbol), but without PTEs trap_entry faults with
+	// a translation abort the first time it writes a frame there. Map the whole
+	// region RW (identity phys==virt, matching how the loader maps the rest of
+	// the kernel image) before protect_stack_guards() unmaps the per-slot guard
+	// tails. Slot contents are scratch (overwritten on first dispatch), so the
+	// exact prior contents don't matter.
+	{
+		use memory_addresses::PhysAddr;
+
+		use crate::arch::aarch64::mm::paging::{PageTableEntryFlags, map};
+
+		let start = &raw const __start_exception_slots as usize;
+		let end = &raw const __end_exception_slots as usize;
+		let size = end.saturating_sub(start);
+		if size > 0 {
+			let pages = size.div_ceil(BasePageSize::SIZE as usize);
+			let mut flags = PageTableEntryFlags::empty();
+			flags.normal().writable().execute_disable();
+			// SAFETY: `start`/`end` are linker-provided section bounds; mapping
+			// this VA range identity is what the loader should have done.
+			unsafe {
+				map::<BasePageSize>(
+					VirtAddr::new(start as u64),
+					PhysAddr::new(start as u64),
+					pages,
+					flags,
+				);
+			}
+			info!(
+				"protect_stack_guards: mapped .exception_slots [{start:#x}, {end:#x}) = {pages} pages"
+			);
+		}
+	}
+
+	let section_bases: [usize; 7] = unsafe {
 		[
 			&__start_exception_stacks as *const u8 as usize,
 			&__start_irq_stacks as *const u8 as usize,
@@ -120,34 +162,68 @@ pub(crate) fn protect_stack_guards() {
 			&__start_task_stacks as *const u8 as usize,
 			&__start_reactor_stacks as *const u8 as usize,
 			&__start_idle_stacks as *const u8 as usize,
+			&__start_exception_slots as *const u8 as usize,
 		]
 	};
 	// Per-slot stack size from config.rs, parallel to `section_bases` above.
 	// The exception stack is DEFAULT_STACK_SIZE (128KiB) -- a scratch stack for
 	// trap_entry + dispatch (§1.1); deep handler work runs on the task's kernel
 	// stack. All four sources (link.x, start.rs, core_local.rs, here) are 128KiB.
-	let stacks: [usize; 6] = [
+	let stacks: [usize; 7] = [
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
 		KERNEL_STACK_SIZE,
 		DEFAULT_STACK_SIZE, // no config.rs const; placeholder
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
+		crate::config::EXCEPTION_SLOT_SIZE, // per-task scratch slot
 	];
 
 	let n = detected_cores();
 	let guard = BasePageSize::SIZE as u64;
 	info!("protect_stack_guards: n={n} guard_page={guard:#x}");
 
-	for i in 0..6 {
+	for i in 0..7 {
 		let section_base = section_bases[i] as u64;
 		let stack = stacks[i];
-		info!("protect_stack_guards: section_base={section_base:#x} stack={stack:#x}");
-		for j in 0..n {
+		// The exception-slot section holds SLOTS_PER_CORE slots PER core
+		// (stride = slot + guard), so its guard count is cores × SLOTS_PER_CORE.
+		// Every other section has exactly one element per core.
+		let elements = if i == 6 {
+			n * crate::config::SLOTS_PER_CORE
+		} else {
+			n
+		};
+		info!(
+			"protect_stack_guards: section_base={section_base:#x} stack={stack:#x} elements={elements}"
+		);
+		for j in 0..elements {
 			let guard_addr = section_base + j as u64 * (stack as u64 + guard) + stack as u64;
 			let vaddr = VirtAddr::new(guard_addr);
 			info!("protect_stack_guards: unmapping guard at {vaddr:p}");
 			unmap::<BasePageSize>(vaddr, 1);
+			// Runtime invariant net (R3): for the per-task slot section, the
+			// State frame (slot_top - 288) must NOT share a page with the guard
+			// we just unmapped. If the frame page is now unmapped, the guard
+			// unmap zapped the frame -> the next exception faults. This would
+			// have caught the 0x1200 (non-page-aligned) body bug at boot.
+			if i == 6 {
+				let frame_base = guard_addr - 288; // State frame size (288 B), pinned by config/slot_pool const-asserts
+				let frame_page = frame_base & !0xfff;
+				let guard_page = guard_addr & !0xfff;
+				debug_assert_ne!(
+					frame_page, guard_page,
+					"slot frame page aliases guard page -- EXCEPTION_SLOT_SIZE not page-aligned"
+				);
+				debug_assert!(
+					get_page_table_entry::<BasePageSize>(VirtAddr::new(frame_page)).is_some(),
+					"slot frame page must remain MAPPED after guard unmap"
+				);
+				debug_assert!(
+					get_page_table_entry::<BasePageSize>(VirtAddr::new(guard_page)).is_none(),
+					"slot guard page must be UNMAPPED"
+				);
+			}
 		}
 	}
 	info!("protect_stack_guards: done");
@@ -272,7 +348,7 @@ pub fn boot_next_processor() {
 
 		use memory_addresses::VirtAddr;
 
-		use crate::arch::aarch64::kernel::start::{smp_start, TTBR0};
+		use crate::arch::aarch64::kernel::start::{TTBR0, smp_start};
 		use crate::mm::virtual_to_physical;
 
 		if cpu_online == 0 {

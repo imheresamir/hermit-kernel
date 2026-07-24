@@ -4,6 +4,7 @@
 .extern do_fiq
 .extern do_sync
 .extern do_error
+.extern D4_TRACE
 	.extern get_last_stack_pointer
 	.extern HERMIT_EARLY_EXCEPTION_STACK_POOL
 
@@ -62,31 +63,58 @@
      ldp x25, x26, [sp], #16
      ldp x27, x28, [sp], #16
      ldp x29, x30, [sp], #16
-     // D4: for EL1t return (SPSR SPSEL==0), set SP_EL1 = E (per-core exception
-     // stack) so the next EL1t exception's trap_entry builds its scratch frame on E.
+     // D4: for EL1t return (SPSR SPSEL==0), set SP_EL1 = the CURRENT task's
+     // scratch slot (per-task exception slot design). The slot TOP was
+     // published by the switch path into CoreLocal.scratch_slot (offset 24).
+     // This makes SP_EL1 per-task instead of the shared per-core E.
      // For EL1h return (SPSEL==1), SP_EL1 MUST stay = the incoming kernel-stack
-     // frame (already set by `mov sp, x0`); overwriting it with E would strip EL1h
-     // tasks (notably the idle task) of their stack.
-     // CoreLocal is #[repr(C)] so exception_sp is at offset 0 (first field).
-     // trap_exit (above) has ALREADY restored the task's x21/x22 into those
-     // registers. D4 needs scratch registers, so save the task's x21 into its
-     // frame slot, use x21/x22 as scratch, then reload BOTH from the frame via
-     // F (= sp - STATE_SIZE, kept in x22) which stays mapped on both return paths.
-     // NOTE: do NOT `stp x21,x22` here -- by the time we compute F, x22 already
-     // holds F (not task_x22), so a paired store would write F into the x22 slot
-     // and the later reload would resume the task with x22 == frame base. Reload
-     // x22 from [F+0xd8] (its slot) instead.
-     sub  x22, sp, #288            // x22 = F (frame base; clobbers task_x22, but it's in the frame)
-     str  x21, [x22, #0xd0]        // task_x21 -> frame slot (preserve; x21 about to be clobbered)
-     mrs  x21, spsr_el1
-     tst  x21, #1                   // SPSEL bit (0 = EL1t, 1 = EL1h)
-     b.ne 1f                        // EL1h: keep SP_EL1 = incoming kernel-stack frame
+     // frame (already set by `mov sp, x0`); overwriting it would strip EL1h
+     // tasks of their stack.
+     // CoreLocal is #[repr(C)]; scratch_slot is at offset 24 (after
+     // exception_sp@0 / this@8 / kernel_sp@16 — see design D-1).
+     sub  x22, sp, #288            // x22 = F (frame base; task_x22 preserved in frame)
+     str  x21, [x22, #0xd0]        // preserve task_x21 (x21 about to be scratch)
+     str  x23, [x22, #0xe0]        // preserve task_x23 (D4-TRACE scratch)
+     str  x24, [x22, #0xe8]        // preserve task_x24 (D4-TRACE scratch)
+     // Load scratch_slot + saved SPSR for the SP_EL1 gate (below).
      mrs  x21, tpidr_el1           // x21 = &CoreLocal (TPIDR_EL1)
-     ldr  x21, [x21, #0]           // x21 = E (exception_sp, offset 0)
-     mov  sp, x21                  // SP_EL1 = E
-1:
-     ldr  x21, [x22, #0xd0]        // task_x21 (via F in x22)
-     ldr  x22, [x22, #0xd8]        // task_x22 (via F in x22)
+     ldr  x21, [x21, #24]          // x21 = scratch_slot (offset 24) = current task's slot TOP (or kstack top)
+     str  x20, [x22, #0xc8]        // preserve task_x20 FIRST (frame slot @ 40+8*20 = 0xc8)
+     mrs  x20, spsr_el1            // THEN x20 = saved SPSR_EL1 (scratch; restored at tail)
+     // SP_EL1 gate (per-task-exception-slot-design.md R4; nested-EL1h fix):
+     //   - EL1t return (SPSR.SPSEL==0): the resumed context uses SP_EL0, so
+     //     SP_EL1 is "free" -> stage it to scratch_slot so the NEXT exception
+     //     builds its frame on the per-task slot (not the shared per-core E).
+     //     This is the path idle takes (create_stack_frame sets spsel=0, and
+     //     H-a4 preserves idle's crafted frame), so idle is correct here.
+     //   - EL1h return (SPSR.SPSEL==1): the resumed context USES SP_EL1 as its
+     //     stack. The 18 ldp pairs already restored sp to that live stack;
+     //     forcing scratch_slot would destroy a nested-EL1h handler / kernel
+     //     context (PROVEN by D4-TRACE clobbered_live_stack? true at fault
+     //     PC 0x4115589c). Leave sp untouched.
+     tst  x20, #1                  // SPSR.SPSEL (bit 0): 0=EL1t, 1=EL1h
+     b.ne 2f                       // EL1h: leave SP_EL1 = restored live stack
+     mov  sp, x21                  // EL1t: SP_EL1 = task's scratch slot (staged)
+2:
+     // === D4-TRACE (temporary): record the SP_EL1 decision on EVERY return. ===
+     adrp x23, D4_TRACE
+     add  x23, x23, #:lo12:D4_TRACE
+     str  x20, [x23, #0]           // [0] = saved SPSR (M[3:0]: 0b0101=EL1h, 0b0100=EL1t)
+     mov  x24, sp
+     str  x24, [x23, #8]           // [1] = resume SP (post-gate: slot for EL1t, live stack for EL1h)
+     str  x21, [x23, #16]          // [2] = scratch_slot
+     mrs  x24, elr_el1
+     str  x24, [x23, #24]          // [3] = ELR being returned to
+     ldr  x24, [x23, #32]
+     add  x24, x24, #1
+     str  x24, [x23, #32]          // [4] = call counter++
+     mov  x24, #0xd4
+     str  x24, [x23, #40]          // [5] = magic (trace written)
+     ldr  x21, [x22, #0xd0]        // restore task_x21
+     ldr  x23, [x22, #0xe0]        // restore task_x23
+     ldr  x24, [x22, #0xe8]        // restore task_x24
+     ldr  x20, [x22, #0xc8]        // restore task_x20
+     ldr  x22, [x22, #0xd8]        // restore task_x22 (via F, MUST be last)
 .endm
 
 /*
@@ -154,36 +182,20 @@ el1_irq:
       cmp x0, 0
       b.eq 1f
       // switch to the next task
-      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
-      // landed on the per-core exception stack E (EL1t-origin: sp <
-      // exception_sp), copy the 288-byte State from E into the old task's
-      // persistent frame (*x0, still intact) and record that persistent base.
-      // This keeps last_stack_pointer valid for ANY EL1t task (idle, init,
-      // spawned-at-EL1t) across switches. EL1h frames already live on the
-      // task's own kernel stack, so a plain store suffices.
-      mov x1, sp                       /* x1 = old frame top */
-      mrs x9, tpidr_el1
-      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
-      cmp x1, x9                       /* sp vs E_top */
-      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
-      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
-      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
-      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
-      mov x3, x2                       /* running dst ptr */
-      mov x4, #18                      /* 18 stp pairs = 288 bytes */
-5:    ldp x5, x6, [x1], #16
-      stp x5, x6, [x3], #16
-      sub x4, x4, #1
-      cbnz x4, 5b
-      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
-      b 7f
-6:    str x1, [x0]                     /* EL1h: store frame top directly */
-7:
-      bl get_last_stack_pointer     /* get new sp   */
-      mov sp, x0
-      add x1, x0, #288
+      // Per-task exception slot design (per-task-exception-slot-design.md):
+      // The old task's trap frame already lives on ITS OWN scratch slot
+      // (SP_EL1 == scratch_slot at entry). No D3 copy. Record the old task's
+      // frame base, then load the new task's slot.
+      mov x1, sp                       /* x1 = old frame base (on old task's slot) */
+      str x1, [x0]                     /* *x0 = old task's frame base (unchanged) */
+      bl get_last_stack_pointer     /* get new sp (frame base in new task's slot) */
+      mov sp, x0                       /* SP_EL1 = new task's slot (via D4 tail) */
+      // Publish new task's scratch-slot TOP for the D4 tail to load.
+      // scratch_slot is @24 (NOT kernel_sp @16, which stays the 128KiB
+      // kernel-stack top for call_with_kernel_stack — see D-1 in the doc).
+      add x1, x0, #288                /* x1 = new task's scratch slot TOP (= frame base + 288) */
       mrs x2, tpidr_el1
-      str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
+      str x1, [x2, #24]             /* CoreLocal.scratch_slot = slot TOP */
 1:
       trap_exit
       eret
@@ -206,37 +218,23 @@ el1_fiq:
       mov     x0, sp
       bl      do_fiq
       cmp x0, 0
-      b.eq 2f
+      b.eq 1f
       // switch to the next task
-      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
-      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
-      // State from E into the old task's persistent frame (*x0, intact) and
-      // record that persistent base. EL1h frames already live on the task's
-      // own kernel stack, so a plain store suffices.
-      mov x1, sp                       /* x1 = old frame top */
-      mrs x9, tpidr_el1
-      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
-      cmp x1, x9                       /* sp vs E_top */
-      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
-      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
-      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
-      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
-      mov x3, x2                       /* running dst ptr */
-      mov x4, #18                      /* 18 stp pairs = 288 bytes */
-5:    ldp x5, x6, [x1], #16
-      stp x5, x6, [x3], #16
-      sub x4, x4, #1
-      cbnz x4, 5b
-      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
-      b 7f
-6:    str x1, [x0]                     /* EL1h: store frame top directly */
-7:
-      bl get_last_stack_pointer     /* get new sp   */
-      mov sp, x0
-      add x1, x0, #288
+      // Per-task exception slot design (per-task-exception-slot-design.md):
+      // The old task's trap frame already lives on ITS OWN scratch slot
+      // (SP_EL1 == scratch_slot at entry). No D3 copy. Record the old task's
+      // frame base, then load the new task's slot.
+      mov x1, sp                       /* x1 = old frame base (on old task's slot) */
+      str x1, [x0]                     /* *x0 = old task's frame base (unchanged) */
+      bl get_last_stack_pointer     /* get new sp (frame base in new task's slot) */
+      mov sp, x0                       /* SP_EL1 = new task's slot (via D4 tail) */
+      // Publish new task's scratch-slot TOP for the D4 tail to load.
+      // scratch_slot is @24 (NOT kernel_sp @16, which stays the 128KiB
+      // kernel-stack top for call_with_kernel_stack — see D-1 in the doc).
+      add x1, x0, #288                /* x1 = new task's scratch slot TOP (= frame base + 288) */
       mrs x2, tpidr_el1
-      str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
-2:
+      str x1, [x2, #24]             /* CoreLocal.scratch_slot = slot TOP */
+1:
       trap_exit
       eret
       // speculation barrier after the ERET to prevent the CPU
@@ -298,37 +296,23 @@ el1_sp0_irq:
       mov     x0, sp
       bl      do_irq
       cmp x0, 0
-      b.eq 3f
+      b.eq 1f
       // switch to the next task
-      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
-      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
-      // State from E into the old task's persistent frame (*x0, intact) and
-      // record that persistent base. EL1h frames already live on the task's
-      // own kernel stack, so a plain store suffices.
-      mov x1, sp                       /* x1 = old frame top */
-      mrs x9, tpidr_el1
-      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
-      cmp x1, x9                       /* sp vs E_top */
-      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
-      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
-      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
-      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
-      mov x3, x2                       /* running dst ptr */
-      mov x4, #18                      /* 18 stp pairs = 288 bytes */
-5:    ldp x5, x6, [x1], #16
-      stp x5, x6, [x3], #16
-      sub x4, x4, #1
-      cbnz x4, 5b
-      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
-      b 7f
-6:    str x1, [x0]                     /* EL1h: store frame top directly */
-7:
-      bl get_last_stack_pointer     /* get new sp   */
-      mov sp, x0
-      add x1, x0, #288
+      // Per-task exception slot design (per-task-exception-slot-design.md):
+      // The old task's trap frame already lives on ITS OWN scratch slot
+      // (SP_EL1 == scratch_slot at entry). No D3 copy. Record the old task's
+      // frame base, then load the new task's slot.
+      mov x1, sp                       /* x1 = old frame base (on old task's slot) */
+      str x1, [x0]                     /* *x0 = old task's frame base (unchanged) */
+      bl get_last_stack_pointer     /* get new sp (frame base in new task's slot) */
+      mov sp, x0                       /* SP_EL1 = new task's slot (via D4 tail) */
+      // Publish new task's scratch-slot TOP for the D4 tail to load.
+      // scratch_slot is @24 (NOT kernel_sp @16, which stays the 128KiB
+      // kernel-stack top for call_with_kernel_stack — see D-1 in the doc).
+      add x1, x0, #288                /* x1 = new task's scratch slot TOP (= frame base + 288) */
       mrs x2, tpidr_el1
-      str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
-3:
+      str x1, [x2, #24]             /* CoreLocal.scratch_slot = slot TOP */
+1:
       trap_exit
       eret
       // speculation barrier after the ERET to prevent the CPU
@@ -348,37 +332,23 @@ el1_sp0_fiq:
       mov     x0, sp
       bl      do_fiq
       cmp x0, 0
-      b.eq 4f
+      b.eq 1f
       // switch to the next task
-      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
-      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
-      // State from E into the old task's persistent frame (*x0, intact) and
-      // record that persistent base. EL1h frames already live on the task's
-      // own kernel stack, so a plain store suffices.
-      mov x1, sp                       /* x1 = old frame top */
-      mrs x9, tpidr_el1
-      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
-      cmp x1, x9                       /* sp vs E_top */
-      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
-      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
-      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
-      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
-      mov x3, x2                       /* running dst ptr */
-      mov x4, #18                      /* 18 stp pairs = 288 bytes */
-5:    ldp x5, x6, [x1], #16
-      stp x5, x6, [x3], #16
-      sub x4, x4, #1
-      cbnz x4, 5b
-      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
-      b 7f
-6:    str x1, [x0]                     /* EL1h: store frame top directly */
-7:
-      bl get_last_stack_pointer     /* get new sp   */
-      mov sp, x0
-      add x1, x0, #288
+      // Per-task exception slot design (per-task-exception-slot-design.md):
+      // The old task's trap frame already lives on ITS OWN scratch slot
+      // (SP_EL1 == scratch_slot at entry). No D3 copy. Record the old task's
+      // frame base, then load the new task's slot.
+      mov x1, sp                       /* x1 = old frame base (on old task's slot) */
+      str x1, [x0]                     /* *x0 = old task's frame base (unchanged) */
+      bl get_last_stack_pointer     /* get new sp (frame base in new task's slot) */
+      mov sp, x0                       /* SP_EL1 = new task's slot (via D4 tail) */
+      // Publish new task's scratch-slot TOP for the D4 tail to load.
+      // scratch_slot is @24 (NOT kernel_sp @16, which stays the 128KiB
+      // kernel-stack top for call_with_kernel_stack — see D-1 in the doc).
+      add x1, x0, #288                /* x1 = new task's scratch slot TOP (= frame base + 288) */
       mrs x2, tpidr_el1
-      str x1, [x2, #16]             /* CoreLocal.kernel_sp = kernel stack top */
-4:
+      str x1, [x2, #24]             /* CoreLocal.scratch_slot = slot TOP */
+1:
       trap_exit
       eret
       // speculation barrier after the ERET to prevent the CPU

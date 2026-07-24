@@ -97,6 +97,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use self::arch::kernel;
 use self::arch::kernel::core_local::{core_id, core_scheduler};
 use self::arch::kernel::interrupts;
+use crate::alloc::string::ToString;
 use crate::scheduler::{PerCoreScheduler, PerCoreSchedulerExt};
 
 #[macro_use]
@@ -287,7 +288,8 @@ extern "C" fn initd(_arg: usize) {
 				// is absent before and present immediately after, THIS
 				// ctor (or a callee) is the writer. Fixed tags (no
 				// format!) to avoid perturbing the layout-sensitive fault.
-				let v_before = crate::syscalls::LAST_ALLOC_V.load(core::sync::atomic::Ordering::Relaxed);
+				let v_before =
+					crate::syscalls::LAST_ALLOC_V.load(core::sync::atomic::Ordering::Relaxed);
 				if v_before != 0 {
 					crate::syscalls::scan_kstack_for_v("pre", v_before);
 					warn!("[B2-VCHECK] ctor #{i} pre-scan done", i = i);
@@ -428,6 +430,51 @@ fn application_processor_main() -> ! {
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 	let core_id = core_id();
 	panic_println!("[{core_id}][PANIC] {info}\n");
+
+	// DISCRIMINATOR (per-task-exception-slot-design.md R4-FU2): a userspace
+	// task-1 panic reported `slice index 1610613287 (0x60000207)` — an
+	// SPSR-shaped value. App code is KNOWN-GOOD, so this is KERNEL-induced
+	// corruption from our per-task slot / context-switch changes. Dump the
+	// current task's saved trap frame (State, 36 u64) and flag any slot
+	// (esp. x-slots 5..35) holding 0x60000207, BEFORE shutdown() may switch
+	// context away from the faulting task. READ-ONLY — no behavior change.
+	{
+		let cs = core_scheduler();
+		let tid = cs.get_current_task_id();
+		let lsp = cs.get_last_stack_pointer().as_u64();
+		let loc = info.location().map(|l| l.to_string()).unwrap_or_default();
+		error!(
+			"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} panic_loc={loc} (0x60000207 = SPSR-shaped panic index)"
+		);
+		if lsp != 0 {
+			let slot = lsp as *const u64;
+			let mut hit_any = false;
+			let mut hit_x = false;
+			for i in 0..36u64 {
+				let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
+				// State layout: spsel@0, elr@8, spsr@16, sp_el0@24, x0@40..x30@280
+				// => x-slots are u64 indices 5..35.
+				let is_x = i >= 5 && i <= 35;
+				if v == 0x60000207 {
+					hit_any = true;
+					if is_x {
+						hit_x = true;
+					}
+					error!(
+						"[ABORT-DUMP] slot[{i}] @+{:#x} = 0x60000207  <<< MATCH (is_x={is_x})",
+						8 * i
+					);
+				} else if i == 2 {
+					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (spsr)", 8 * i, v);
+				} else if i == 1 {
+					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (elr)", 8 * i, v);
+				}
+			}
+			error!(
+				"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
+			);
+		}
+	}
 
 	scheduler::shutdown(1);
 }

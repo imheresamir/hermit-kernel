@@ -23,6 +23,149 @@ use crate::env;
 use crate::mm::{PageAlloc, PageRangeAllocator};
 use crate::scheduler::{self, CoreId, timer_interrupts};
 
+/// R4-FU2 one-shot frame dump: task 1's known-good app panics with
+/// `slice index 1610613287 (0x60000207)` (SPSR-shaped) — kernel-induced
+/// corruption. The app handles its own panic in userspace and never calls
+/// exit()/abort(), so the exit-path dump never fires. The only GUARANTEED
+/// capture of task 1's live frame is at the exception entry (do_sync/do_irq),
+/// which every syscall/IRQ hits. Dump the first N exceptions' full State.
+/// `frame` is the `&State` trap_entry built (frame base), so it is exact
+/// (no SP-prologue offset error).
+static mut FRAME_DUMP_COUNT: u64 = 0;
+const FRAME_DUMP_LIMIT: u64 = 6;
+
+#[allow(dead_code)]
+unsafe fn dump_frame_once(tag: &str, frame: *const State) {
+	// Only capture task 1's frames (the faulting app task). The first
+	// exceptions during boot belong to the idle task and would exhaust the
+	// limit before task 1 runs.
+	let tid = core_scheduler().get_current_task_id();
+	// Only capture task 1's frames (the faulting app task, "thread 'main' (1)").
+	// `TaskId`'s inner field is private, so compare via its Display form.
+	if format!("{}", tid) != "1" {
+		return;
+	}
+	// R4-FU2: only capture task 1's USERSPACE (EL1t) exceptions, where
+	// spsel==0x0. The EL1h (kernel-context) do_sync frames during network
+	// init are repetitive noise that exhaust the dump limit before the
+	// memory scan ever prints. The userspace frame is where 0x60000207
+	// (SPSR-shaped) would surface in TLS/stack/heap.
+	let base0 = frame as u64;
+	let spsel0 = core::ptr::addr_of!(*(base0 as *const u64)).read_volatile();
+	if spsel0 != 0x0 {
+		return;
+	}
+	let c = FRAME_DUMP_COUNT;
+	if c >= FRAME_DUMP_LIMIT {
+		return;
+	}
+	FRAME_DUMP_COUNT = c + 1;
+	let base = frame as u64;
+	let slot = base as *const u64;
+	// Read key slots directly (State layout: spsel@0, elr@8, spsr@16,
+	// sp_el0@24, tpidr@32, x0@40..x30@280).
+	let spsel = core::ptr::addr_of!(*slot.add(0)).read_volatile();
+	let elr = core::ptr::addr_of!(*slot.add(1)).read_volatile();
+	let spsr = core::ptr::addr_of!(*slot.add(2)).read_volatile();
+	let sp_el0 = core::ptr::addr_of!(*slot.add(3)).read_volatile();
+	let tpidr = core::ptr::addr_of!(*slot.add(4)).read_volatile();
+	error!(
+		"[FRAME-DUMP #{c}] {tag} task={tid:?} frame_base={base:#x} | spsel={spsel:#x} elr={elr:#x} spsr={spsr:#x} sp_el0={sp_el0:#x} tpidr={tpidr:#x}"
+	);
+	// Dump all GPRs (x0..x30 = slots 5..35) inline.
+	let mut hit_x = false;
+	for i in 5..=35u64 {
+		let v = core::ptr::addr_of!(*slot.add(i as usize)).read_volatile();
+		if v == 0x60000207 {
+			hit_x = true;
+		}
+		error!(
+			"[FRAME-DUMP] x{}={:#x}{}",
+			i - 5,
+			v,
+			if v == 0x60000207 { "  <<< MATCH" } else { "" }
+		);
+	}
+	error!("[FRAME-DUMP] kernel_leak? x_slot={hit_x} (any x-slot == 0x60000207)",);
+	// R4-FU2: kernel restore path is clean (no x-slot == 0x60000207), so the
+	// bad value must live in task 1's USERSPACE memory. `0x60000207` is
+	// SPSR-shaped (same family as task 1's saved SPSRs 0x60000204/0x60000205),
+	// so an SPSR is leaking into a data word. Scan several task-1 regions for
+	// it READ-ONLY. The two heap blocks below are stable across boots (seen in
+	// ALLOC-TRACE: 0x800000018b00 and 0x80000002d160, size 0x12010 each).
+	let scan = |name: &str, lo: u64, hi: u64| {
+		let targets = [0x60000207u64, 0x7ffffffff8a0u64];
+		let mut found: u64 = 0;
+		let mut found_val: u64 = 0;
+		for a in (lo..hi).step_by(8) {
+			let v = core::ptr::addr_of!(*(a as *const u64)).read_volatile();
+			if targets.contains(&v) {
+				found = a;
+				found_val = v;
+				break;
+			}
+		}
+		if found != 0 {
+			error!("[FRAME-DUMP] SCAN[{name}] {found_val:#x} found at {found:#x}");
+		} else {
+			error!("[FRAME-DUMP] SCAN[{name}] neither target found in [{lo:#x}..{hi:#x})");
+		}
+	};
+	// SAFE regions only (read_volatile faults on unmapped pages and halts):
+	//  - TLS: ABOVE tpidr only. The page BELOW tpidr (tpidr-0x1000) is
+	//    UNMAPPED (faults). Above tpidr, scan a SAFE 1 KiB window — TLS is
+	//    typically <= 1 page, so 0x400 stays inside the mapped TLS block.
+	//  - STACK: task 1's user stack is mapped [0x800015dd6000, 0x800015ed6000)
+	//    (log: va=0x800015dd6000 size=0x100000). sp_el0 (~0x800015ed5ab0) is
+	//    near the top. Clamp the LOW end to the stack base so we never read
+	//    BELOW the mapping (sp-0x80000 would be 0x550 bytes under the base ->
+	//    unmapped -> fault). Scan the full mapped stack up to sp.
+	//  - HEAP0/HEAP1: the two stable blocks from ALLOC-TRACE.
+	let sp = sp_el0;
+	let stack_base: u64 = 0x800015dd6000;
+	let stack_lo = core::cmp::max(sp.saturating_sub(0x80000), stack_base);
+	scan("TLS", tpidr, tpidr + 0x400);
+	scan("STACK", stack_lo, sp + 0x200);
+	scan("HEAP0", 0x800000018b00, 0x800000018b00 + 0x12010);
+	scan("HEAP1", 0x80000002d160, 0x80000002d160 + 0x12010);
+}
+
+/// R4-FU3: check the RESUME registers (what task 1 actually resumes with
+/// after this exception — i.e. the frame `*state` as modified by the handler,
+/// e.g. a syscall/page-fault return value written into x0). The entry-time
+/// dump only shows ARGUMENTS; a corrupted SYSCALL RETURN in x0 would never
+/// appear in memory (so the SCAN misses it) and never in the entry frame.
+/// This fires at do_sync/do_irq EXIT (post-handler) and is SILENT unless it
+/// finds 0x60000207 in an x-slot, so it cannot flood the log.
+#[allow(dead_code)]
+unsafe fn check_resume_x0(state: &State) {
+	let tid = core_scheduler().get_current_task_id();
+	if format!("{}", tid) != "1" {
+		return;
+	}
+	let slot = state as *const State as *const u64;
+	let mut found = false;
+	let mut vals = [0u64; 31];
+	for i in 5..=35u64 {
+		let v = core::ptr::addr_of!(*slot.add(i as usize)).read_volatile();
+		vals[(i - 5) as usize] = v;
+		if v == 0x60000207 {
+			found = true;
+		}
+	}
+	if found {
+		error!("[RESUME-DUMP] task=1 found 0x60000207 in a resume GPR (syscall/page-fault return value)");
+		for i in 0..31u64 {
+			error!(
+				"[RESUME-DUMP] x{}={:#x}{}",
+				i,
+				vals[i as usize],
+				if vals[i as usize] == 0x60000207 { "  <<< MATCH" } else { "" }
+			);
+		}
+	}
+}
+
 /// The ID of the first Private Peripheral Interrupt.
 const PPI_START: u8 = 16;
 /// The ID of the first Shared Peripheral Interrupt.
@@ -35,6 +178,19 @@ pub(crate) const SGI_RESCHED: u8 = 1;
 static mut TIMER_INTERRUPT: u32 = 0;
 /// Number of the UART interrupt
 static mut UART_INTERRUPT: u32 = 0;
+/// D4-TRACE (temporary, per-task-exception-slot-design R3-FU/nested): the
+/// `trap_exit` D4 tail writes here on EVERY exception return so the fault
+/// handler can prove/deny the nested-EL1h SP_EL1 clobber hypothesis without a
+/// live debugger. Layout (u64 each):
+///   [0] = saved SPSR_EL1 (M[3:0]: 0b0101=EL1h, 0b0100=EL1t) at this return
+///   [1] = SP after the trap_exit ldp pops = the CORRECT SP to resume with
+///         (for an EL1h return this is the interrupted context's live stack)
+///   [2] = scratch_slot (CoreLocal@24) that D4 is about to force into SP_EL1
+///   [3] = ELR_EL1 being returned to
+///   [4] = monotonically incremented call counter (sanity/liveness)
+///   [5] = magic 0xD4D4D4D4 once written at least once
+#[unsafe(no_mangle)]
+pub(crate) static mut D4_TRACE: [u64; 8] = [0u64; 8];
 /// Possible interrupt handlers
 static INTERRUPT_HANDLERS: OnceCell<InterruptHandlerMap> = OnceCell::new();
 /// Driver for the Arm Generic Interrupt Controller version 3 (or 4).
@@ -148,6 +304,8 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
+	unsafe { dump_frame_once("do_irq", _state as *const State) };
+	unsafe { check_resume_x0(_state) };
 	let Some(irqid) = GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1) else {
 		return ptr::null_mut();
 	};
@@ -177,6 +335,7 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn do_sync(state: &State) {
+	unsafe { dump_frame_once("do_sync", state as *const State) };
 	let esr = ESR_EL1.get();
 	let ec_raw = ESR_EL1.read(ESR_EL1::EC);
 	let ec: ESR_EL1::EC::Value = ESR_EL1.read_as_enum(ESR_EL1::EC).unwrap();
@@ -208,12 +367,8 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 			let sp_el0_fault = state.sp_el0;
 			let cur_id = core_scheduler().get_current_task_id();
 			let ktop = core_scheduler().get_current_task_kernel_stack_top();
-			error!(
-				"DIAG sp_el0_fault={sp_el0_fault:#x} far={far:#x} cur_task={cur_id:?}"
-			);
-			error!(
-				"DIAG kernel_stack_top={ktop:#x} (base+KERNEL_STACK_SIZE)"
-			);
+			error!("DIAG sp_el0_fault={sp_el0_fault:#x} far={far:#x} cur_task={cur_id:?}");
+			error!("DIAG kernel_stack_top={ktop:#x} (base+KERNEL_STACK_SIZE)");
 			// Runtime image base (rebased). link_pc = fault_pc - base lets us
 			// map the fault to a function in the (link-addressed) binary via
 			// host objdump. kernel_start_address() == executable_start() rebased.
@@ -229,6 +384,130 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 				far == ktop,
 				sp_el0_fault == far
 			);
+
+			// === D4-TRACE dump: the last trap_exit D4-tail decision inputs. ===
+			// Proves/denies the nested-EL1h SP_EL1 clobber: if [0] M[3:0]==0b0101
+			// (EL1h) AND [1] (the correct resume SP) != [2] (scratch_slot forced
+			// into SP_EL1), then D4 destroyed an interrupted EL1h context's live
+			// stack. [1] should be the stack the faulting ELR resumes on.
+			{
+				let t = unsafe { core::ptr::addr_of!(D4_TRACE).read_volatile() };
+				let m = t[0] & 0xf;
+				let el1h = m == 0b0101;
+				error!(
+					"D4-TRACE spsr={:#x} M[3:0]={m:#x} (EL1h={el1h}) resume_sp={:#x} scratch_slot={:#x} elr={:#x} calls={} magic={:#x}",
+					t[0], t[1], t[2], t[3], t[4], t[5]
+				);
+				error!(
+					"D4-TRACE clobbered_live_stack? {} (EL1h && resume_sp != scratch_slot)",
+					el1h && t[1] != t[2]
+				);
+			}
+
+			// === SLOT-REGION DIAGNOSTIC (per-task exception slot design) ===
+			// If `far` lands inside the .exception_slots region, a slot
+			// address leaked into task-visible state (a frame field or a
+			// pointer the task followed at EL0). Dump the task's slot
+			// assignment and the live frame's key fields to find which
+			// field holds the bad slot pointer.
+			{
+				// Linker base of the slot section (single-core template;
+				// matches protect_stack_guards' mapped region). Widen the
+				// window to also catch UNDERFLOWS (far just BELOW the base),
+				// which is the signature of the handler running with
+				// SP_EL1 = slot base and growing downward past the slot.
+				const SLOT_BASE: u64 = 0x4180e000;
+				// stride = SLOT_SIZE + GUARD; total = SLOTS_PER_CORE * stride.
+				const SLOT_STRIDE: u64 = (crate::config::EXCEPTION_SLOT_SIZE
+					+ crate::config::EXCEPTION_SLOT_GUARD) as u64;
+				const SLOT_END: u64 =
+					SLOT_BASE + (crate::config::SLOTS_PER_CORE as u64) * SLOT_STRIDE;
+				if far >= SLOT_BASE - SLOT_STRIDE && far < SLOT_END {
+					// CoreLocal.scratch_slot is at offset 24; TPIDR_EL1 holds
+					// &CoreLocal.
+					let cl_ptr = TPIDR_EL1.get() as *const u64;
+					let scratch_slot = unsafe { core::ptr::read_volatile(cl_ptr.add(24 / 8)) };
+					error!(
+						"DIAG-SLOT far={far:#x} (SLOT_BASE=0x4180e000); scratch_slot(CoreLocal@24)={scratch_slot:#x}"
+					);
+					// State is #[repr(C)] now (naturally aligned), so direct
+					// field access is fine. `state` is a &State: read fields
+					// straight through the reference.
+					let f_spsr = state.spsr_el1;
+					let f_elr = state.elr_el1 as *const () as u64;
+					let f_sp_el0 = state.sp_el0;
+					let f_tpidr = state.tpidr_el0;
+					error!(
+						"DIAG-SLOT frame: spsr={f_spsr:#x} elr={f_elr:#x} sp_el0={f_sp_el0:#x} tpidr={f_tpidr:#x}"
+					);
+					error!(
+						"DIAG-SLOT frame: x0={0:#x} x1={1:#x} x2={2:#x} x3={3:#x} x4={4:#x} x5={5:#x} x6={6:#x} x7={7:#x}",
+						state.x0,
+						state.x1,
+						state.x2,
+						state.x3,
+						state.x4,
+						state.x5,
+						state.x6,
+						state.x7
+					);
+					error!(
+						"DIAG-SLOT frame: x8={0:#x} x9={1:#x} x10={2:#x} x11={3:#x} x12={4:#x} x13={5:#x} x14={6:#x} x15={7:#x}",
+						state.x8,
+						state.x9,
+						state.x10,
+						state.x11,
+						state.x12,
+						state.x13,
+						state.x14,
+						state.x15
+					);
+					error!(
+						"DIAG-SLOT frame: x16={0:#x} x17={1:#x} x18={2:#x} x19={3:#x} x20={4:#x} x21={5:#x} x22={6:#x} x23={7:#x}",
+						state.x16,
+						state.x17,
+						state.x18,
+						state.x19,
+						state.x20,
+						state.x21,
+						state.x22,
+						state.x23
+					);
+					error!(
+						"DIAG-SLOT frame: x24={0:#x} x25={1:#x} x26={2:#x} x27={3:#x} x28={4:#x} x29={5:#x} x30={6:#x}",
+						state.x24, state.x25, state.x26, state.x27, state.x28, state.x29, state.x30
+					);
+					// Also dump a window of the USER stack around sp_el0 so we
+					// can see if the bad slot pointer was LOADED FROM the stack
+					// (rather than sitting in a live GPR). Only read >= sp_el0
+					// to avoid crossing a page boundary into an unmapped page
+					// (which would fault inside the diagnostic itself). Guard
+					// against a non-8-aligned sp_el0 (would UB in read_volatile).
+					let usp = f_sp_el0;
+					error!("DIAG-SLOT user_sp=0x{usp:x}");
+					if usp != 0 && usp % 8 == 0 {
+						for k in 0..16u64 {
+							let va = usp + k * 8;
+							let v = unsafe { core::ptr::read_volatile(va as *const u64) };
+							error!("DIAG-SLOT ustk[{k}]@0x{va:x} = 0x{v:x}");
+						}
+					} else {
+						error!("DIAG-SLOT user_sp not 8-aligned/zero; skipping ustk dump");
+					}
+					// Slot index + body/guard decode (signed so underflows show
+					// as negative offsets, making the base-vs-top mistake obvious).
+					let off = (far as i64) - (SLOT_BASE as i64);
+					let underflow = off < 0;
+					let stride = SLOT_STRIDE as i64;
+					let body = crate::config::EXCEPTION_SLOT_SIZE as i64;
+					let slot_idx = off / stride;
+					let within = off % stride;
+					let in_guard = within >= body;
+					error!(
+						"DIAG-SLOT far-off-from-base={off:#x} underflow={underflow} slot_idx={slot_idx} within_slot={within:#x} in_guard={in_guard} (stride={stride:#x}, body=[+0,+{body:#x}), guard=[+{body:#x},+{stride:#x}))"
+					);
+				}
+			}
 
 			if let Some(irqid) =
 				GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1)
@@ -279,26 +558,41 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		// locals to avoid unaligned-reference errors.
 		let state_addr = state as *const State as u64;
 		let (sx0, sx1, sx25, sx30_val, sspsel, sspsr, stpidr, ssp_el0) = (
-			state.x0, state.x1, state.x25, state.x30, state.spsel, state.spsr_el1, state.tpidr_el0, state.sp_el0
+			state.x0,
+			state.x1,
+			state.x25,
+			state.x30,
+			state.spsel,
+			state.spsr_el1,
+			state.tpidr_el0,
+			state.sp_el0,
 		);
 		let s_elr = state.elr_el1 as *const () as u64;
-		error!("[TRACE-SYNC] State @ {state_addr:#x}: elr_el1={s_elr:#x} x0={sx0:#x} x1={sx1:#x} x25={sx25:#x} x30={sx30_val:#x} spsel={sspsel:#x} spsr={sspsr:#x} tpidr={stpidr:#x} sp_el0={ssp_el0:#x}");
+		error!(
+			"[TRACE-SYNC] State @ {state_addr:#x}: elr_el1={s_elr:#x} x0={sx0:#x} x1={sx1:#x} x25={sx25:#x} x30={sx30_val:#x} spsel={sspsel:#x} spsr={sspsr:#x} tpidr={stpidr:#x} sp_el0={ssp_el0:#x}"
+		);
 
 		let task_id = core_scheduler().get_current_task_id();
 		error!("Crashed in task {task_id:?}");
 
 		// === INSTRUMENTATION: read raw State words for cross-check ===
 		let raw = unsafe { core::slice::from_raw_parts(state as *const State as *const u64, 36) };
-		error!("[TRACE-SYNC] raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
-			raw[0], raw[1], raw[8], raw[35]);
+		error!(
+			"[TRACE-SYNC] raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
+			raw[0], raw[1], raw[8], raw[35]
+		);
 
 		// === INSTRUMENTATION: check task_start trace buffer ===
 		unsafe {
 			let trace = crate::arch::aarch64::kernel::scheduler::TASK_START_TRACE;
-			error!("[TRACE-SYNC] TASK_START_TRACE[8]={:#x} (0x42=reached) [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x}",
-				trace[8], trace[0], trace[1], trace[2], trace[3]);
-			error!("[TRACE-SYNC] TASK_START_TRACE SP_after_spsel={:#x} SP_after_func={:#x}",
-				trace[4], trace[5]);
+			error!(
+				"[TRACE-SYNC] TASK_START_TRACE[8]={:#x} (0x42=reached) [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x}",
+				trace[8], trace[0], trace[1], trace[2], trace[3]
+			);
+			error!(
+				"[TRACE-SYNC] TASK_START_TRACE SP_after_spsel={:#x} SP_after_func={:#x}",
+				trace[4], trace[5]
+			);
 		}
 
 		// === INSTRUMENTATION: dump stack memory around SP_EL0 and FP ===
@@ -308,23 +602,31 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		let fp_fault = sx29;
 		if sp_el0_fault != 0 {
 			// Use TASK_START_TRACE[4] as the initial SP_EL0 (set in task_start after spsel)
-			let initial_sp_el0: u64 = unsafe { crate::arch::aarch64::kernel::scheduler::TASK_START_TRACE[4] };
+			let initial_sp_el0: u64 =
+				unsafe { crate::arch::aarch64::kernel::scheduler::TASK_START_TRACE[4] };
 			// Sentinel-encoding helper (mirror of create_stack_frame):
 			// sentinel(w) = 0x5EED_0000_0000_0000 | (w & 0x0000_FFFF_FFFF_FFF8).
 			let is_sentinel = |w: u64, addr: u64| -> bool {
-				(w & 0xFFFF_0000_0000_0000) == 0x5EED_0000_0000_0000
-					&& (w & 0x0000_FFFF_FFFF_FFFF) == (addr & 0x0000_FFFF_FFFF_FFF8)
+				(w & 0xffff_0000_0000_0000) == 0x5eed_0000_0000_0000
+					&& (w & 0x0000_ffff_ffff_ffff) == (addr & 0x0000_ffff_ffff_fff8)
 			};
 			// Classify: a window around SP_EL0. Report *how many* slots
 			// broke and list the first/last broken VA so the footprint
 			// and clobbered-slot is derivable from one line.
-			let guard_page = if initial_sp_el0 > 0 { initial_sp_el0 + 16 } else { sp_el0_fault + 0x200 };
+			let guard_page = if initial_sp_el0 > 0 {
+				initial_sp_el0 + 16
+			} else {
+				sp_el0_fault + 0x200
+			};
 			let lo = sp_el0_fault.saturating_sub(16);
 			let hi = guard_page.max(sp_el0_fault + 8);
 			let nwords = ((hi - lo) / 8) as usize;
 			if nwords > 0 && nwords <= 128 {
 				let words = unsafe { core::slice::from_raw_parts(lo as *const u64, nwords) };
-				error!("[TRACE-SYNC] STACK DUMP lo={lo:#x} hi={hi:#x} ({} words):", nwords);
+				error!(
+					"[TRACE-SYNC] STACK DUMP lo={lo:#x} hi={hi:#x} ({} words):",
+					nwords
+				);
 				let mut i = 0;
 				let mut first_broke: Option<u64> = None;
 				let mut last_broke: Option<u64> = None;
@@ -345,17 +647,26 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 							// intact
 						} else {
 							broke_count += 1;
-							if first_broke.is_none() { first_broke = Some(a); }
+							if first_broke.is_none() {
+								first_broke = Some(a);
+							}
 							last_broke = Some(a);
 						}
 					}
-					error!("  {:#x}: {:#x} {:#x} {:#x} {:#x}",
-						addr, line[0], line[1], line[2], line[3]);
+					error!(
+						"  {:#x}: {:#x} {:#x} {:#x} {:#x}",
+						addr, line[0], line[1], line[2], line[3]
+					);
 					i += show;
 				}
 				if let (Some(f), Some(l)) = (first_broke, last_broke) {
-					error!("[TRACE-SYNC] SENTINEL broken: count={} first_broke_va={:#x} last_broke_va={:#x} span={} bytes",
-						broke_count, f, l, l - f + 8);
+					error!(
+						"[TRACE-SYNC] SENTINEL broken: count={} first_broke_va={:#x} last_broke_va={:#x} span={} bytes",
+						broke_count,
+						f,
+						l,
+						l - f + 8
+					);
 				} else {
 					error!("[TRACE-SYNC] SENTINEL intact: no clobber in dumped window");
 				}
@@ -363,8 +674,10 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 		}
 		if fp_fault != 0 && fp_fault >= sp_el0_fault && fp_fault < 0x800015d92000 {
 			let fp_words = unsafe { core::slice::from_raw_parts(fp_fault as *const u64, 4) };
-			error!("[TRACE-SYNC] Frame @ FP={fp_fault:#x}: [FP_chain={:#x} LR={:#x} {:#x} {:#x}]",
-				fp_words[0], fp_words[1], fp_words[2], fp_words[3]);
+			error!(
+				"[TRACE-SYNC] Frame @ FP={fp_fault:#x}: [FP_chain={:#x} LR={:#x} {:#x} {:#x}]",
+				fp_words[0], fp_words[1], fp_words[2], fp_words[3]
+			);
 		}
 
 		scheduler::abort()
@@ -379,6 +692,8 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 
 		// Let the scheduler set up the FPU for the current task
 		core_scheduler().fpu_switch();
+		// R4-FU3: capture RESUME registers (post-handler) for task 1.
+		unsafe { check_resume_x0(state); };
 	} else {
 		let far = FAR_EL1.get();
 		let sp_val: u64;

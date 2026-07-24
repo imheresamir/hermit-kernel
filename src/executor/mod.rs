@@ -158,7 +158,12 @@ where
 		let backoff_done = backoff.is_completed();
 		debug!(
 			"BLOCK_ON iter={} start={} now={} elapsed_ms={} timeout_ms={} backoff_done={} ready={}",
-			iter, start, now, elapsed_ms, timeout_ms, backoff_done,
+			iter,
+			start,
+			now,
+			elapsed_ms,
+			timeout_ms,
+			backoff_done,
 			matches!(result, Poll::Ready(_))
 		);
 		iter += 1;
@@ -175,11 +180,13 @@ where
 		}
 
 		if backoff.is_completed() {
-			let wakeup_time =
-				timeout.map(|duration| u64::try_from(duration.as_micros()).unwrap());
+			let wakeup_time = timeout.map(|duration| u64::try_from(duration.as_micros()).unwrap());
 
 			// switch to another task
-			warn!("BLOCK_ON parking via task_notify.wait(wakeup_time={:?})", wakeup_time);
+			warn!(
+				"BLOCK_ON parking via task_notify.wait(wakeup_time={:?})",
+				wakeup_time
+			);
 			task_notify.wait(wakeup_time);
 			warn!("BLOCK_ON woke from task_notify.wait");
 

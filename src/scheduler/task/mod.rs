@@ -8,8 +8,8 @@ use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU64;
-use core::{cmp, fmt};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{cmp, fmt};
 
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
@@ -49,8 +49,9 @@ struct BitmapSlot {
 	bitmap: CachePadded<u64>,
 }
 
-static mut BITMAP_POOL: [BitmapSlot; MAX_BITMAP_POOL] =
-	[BitmapSlot { bitmap: CachePadded::new(0) }; MAX_BITMAP_POOL];
+static mut BITMAP_POOL: [BitmapSlot; MAX_BITMAP_POOL] = [BitmapSlot {
+	bitmap: CachePadded::new(0),
+}; MAX_BITMAP_POOL];
 static NEXT_BITMAP_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn alloc_bitmap_id() -> usize {
@@ -447,6 +448,18 @@ impl PriorityTaskQueue {
 	not(any(target_arch = "x86_64", target_arch = "aarch64")),
 	repr(align(64))
 )]
+/// Per-task exception slot design: tracks where a task's 288-byte State
+/// frame lives. See per-task-exception-slot-design.md §4.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameLocation {
+	/// Frame is in the task's assigned scratch slot.
+	InSlot,
+	/// Eviction in progress (claim flag set); serializes with the wake path.
+	BeingEvicted,
+	/// Frame was copied to the persistent (kernel-stack) frame; slot freed.
+	Evicted,
+}
+
 pub(crate) struct Task {
 	/// The ID of this context
 	pub id: TaskId,
@@ -464,6 +477,14 @@ pub(crate) struct Task {
 	pub core_id: CoreId,
 	/// Stack of the task
 	pub stacks: TaskStacks,
+	/// Per-task exception slot design: where this task's 288-byte State frame
+	/// currently lives. `IN_SLOT` = in the assigned scratch slot; `EVICTED` =
+	/// copied to the persistent (kernel-stack) frame; `BEING_EVICTED` = a
+	/// claim is held mid-copy (serializes with the wake path, design §4.4).
+	pub frame_location: FrameLocation,
+	/// Index of this task's assigned scratch slot within the current core's
+	/// pool (-1 = none). Valid only while `frame_location == IN_SLOT`.
+	pub slot: i32,
 	/// Mapping between file descriptor and the referenced IO interface
 	pub object_map: Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
 	/// Task Thread-Local-Storage (TLS)
@@ -499,6 +520,8 @@ impl Task {
 			last_fpu_state: FPUState::new(),
 			core_id,
 			stacks,
+			frame_location: FrameLocation::InSlot,
+			slot: -1,
 			object_map,
 			#[cfg(not(feature = "common-os"))]
 			tls: None,
@@ -576,6 +599,12 @@ impl Task {
 			stacks: TaskStacks::new(crate::config::DEFAULT_STACK_SIZE),
 			#[cfg(not(target_arch = "aarch64"))]
 			stacks: TaskStacks::from_boot_stacks(),
+			// Idle participates in the scratch-slot pool like any other EL1t
+			// task (per-task-exception-slot-design.md §8.2). It starts with
+			// no slot; the first dispatch allocates one and sets
+			// `last_stack_pointer` to the slot frame base.
+			frame_location: FrameLocation::InSlot,
+			slot: -1,
 			object_map: OBJECT_MAP.get().unwrap().clone(),
 			#[cfg(not(feature = "common-os"))]
 			tls,
@@ -684,6 +713,13 @@ impl BlockedTaskQueue {
 		}
 
 		self.list.push_back(new_node);
+	}
+
+	/// Iterate the blocked tasks resident in this queue (used by the
+	/// per-task exception-slot eviction protocol to pick a stale victim,
+	/// per-task-exception-slot-design.md §4.2). Read-only.
+	pub fn iter(&self) -> impl Iterator<Item = &Rc<RefCell<Task>>> {
+		self.list.iter().map(|node| &node.task)
 	}
 
 	/// Manually wake up a blocked task.

@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use ahash::RandomState;
 use crossbeam_utils::Backoff;
-use hashbrown::{hash_map, HashMap};
+use hashbrown::{HashMap, hash_map};
 use hermit_sync::*;
 #[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus;
@@ -133,7 +133,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	/// Trigger an interrupt to reschedule the system
 	#[cfg(target_arch = "aarch64")]
 	fn reschedule(self) {
-		use aarch64_cpu::asm::barrier::{dsb, isb, NSH, SY};
+		use aarch64_cpu::asm::barrier::{NSH, SY, dsb, isb};
 
 		use crate::arch::kernel::interrupts::SGI_RESCHED;
 
@@ -170,6 +170,46 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	}
 
 	fn exit(self, exit_code: i32) -> ! {
+		// DISCRIMINATOR (per-task-exception-slot-design.md R4-FU2): userspace
+		// task-1 panic `slice index 1610613287 (0x60000207)` — SPSR-shaped,
+		// KNOWN app code => kernel-induced corruption. `exit()` is the
+		// CONVERGENCE of every abort path (sys_abort, scheduler::abort, direct
+		// exit) and runs BEFORE reschedule() switches away from the faulting
+		// task. Dump the current task's saved State (36 u64) and flag any slot
+		// (esp. x-slots 5..35) == 0x60000207. READ-ONLY.
+		{
+			let lsp = self.current_task.borrow().last_stack_pointer.as_u64();
+			let tid = self.current_task.borrow().id;
+			error!(
+				"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} exit_code={exit_code} (0x60000207 = SPSR-shaped panic index)"
+			);
+			if lsp != 0 {
+				let slot = lsp as *const u64;
+				let mut hit_any = false;
+				let mut hit_x = false;
+				for i in 0..36u64 {
+					let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
+					let is_x = i >= 5 && i <= 35;
+					if v == 0x60000207 {
+						hit_any = true;
+						if is_x {
+							hit_x = true;
+						}
+						error!(
+							"[ABORT-DUMP] slot[{i}] @+{:#x} = 0x60000207  <<< MATCH (is_x={is_x})",
+							8 * i
+						);
+					} else if i == 2 {
+						error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (spsr)", 8 * i, v);
+					} else if i == 1 {
+						error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (elr)", 8 * i, v);
+					}
+				}
+				error!(
+					"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
+				);
+			}
+		}
 		without_interrupts(|| {
 			// Get the current task.
 			let mut current_task_borrowed = self.current_task.borrow_mut();
@@ -761,6 +801,91 @@ impl PerCoreScheduler {
 		self.current_task.borrow().last_stack_pointer
 	}
 
+	/// Per-task exception slot design (per-task-exception-slot-design.md):
+	/// ensure `task` has a scratch slot before it is dispatched. On first
+	/// dispatch the frame lives on the kernel stack (slot == -1); we acquire a
+	/// slot and copy the frame into it, updating `last_stack_pointer` to the
+	/// slot frame base so the switch path (start.s) publishes the correct
+	/// `scratch_slot`. If the pool is exhausted, evict a stale blocked task
+	/// (claim-before-copy) and retry. Bounded recursion via SLOTS_PER_CORE.
+	#[cfg(target_arch = "aarch64")]
+	fn ensure_slot(&mut self, task: &Rc<RefCell<Task>>) {
+		use crate::arch::kernel::slot_pool;
+
+		// Already resident in a slot? Nothing to do (last_stack_pointer already
+		// points at the slot frame base from a prior dispatch).
+		{
+			let b = task.borrow();
+			if b.slot >= 0 && b.frame_location == FrameLocation::InSlot {
+				return;
+			}
+
+			// EL1h GATE (R5 errata): slot relocation is ONLY valid for EL1t
+			// frames. An EL1t context resumes on SP_EL0, so its State frame
+			// can live anywhere — the frame's address carries no meaning to
+			// the resumed code. An EL1h context, however, resumes on SP_EL1,
+			// and trap_exit's 18 ldp pops define resume SP = frame_base + 288:
+			// the frame's ADDRESS *is* the resume stack pointer. Copying an
+			// EL1h frame into a slot makes the task resume with SP = slot top
+			// on a 288-byte "stack" that immediately runs into the guard page
+			// (PROVEN: idle suspended at EL1h, dispatched from slot 1,
+			// faulted writing slot1_top+0x50 = guard). Dispatch EL1h frames
+			// IN PLACE — they already sit on their own kernel stack, which is
+			// exactly the stack they must resume on.
+			// Frame word[0] = spsel saved by trap_entry (1 = EL1h).
+			let frame = b.last_stack_pointer.as_u64();
+			if frame != 0 {
+				let spsel = unsafe { core::ptr::read_volatile(frame as *const u64) };
+				if spsel & 1 == 1 {
+					return;
+				}
+			}
+		}
+
+		// Fast path: pool has a free slot.
+		{
+			let mut b = task.borrow_mut();
+			if slot_pool::dispatch_acquire_slot(&mut b) {
+				return;
+			}
+		}
+
+		// Slow path: pool exhausted. Evict a stale blocked resident, then retry.
+		// Scan this core's blocked tasks for a victim (exclude the task being
+		// resumed — no self-eviction, design INV-S4).
+		let self_id = task.borrow().id;
+		let mut victim: Option<Rc<RefCell<Task>>> = None;
+		for blocked in self.blocked_tasks.iter() {
+			let b = blocked.borrow();
+			if b.id == self_id {
+				continue;
+			}
+			if b.frame_location != FrameLocation::InSlot || b.slot < 0 {
+				continue;
+			}
+			victim = Some(blocked.clone());
+			break; // simplest selection: first eligible resident
+		}
+		if let Some(v) = victim {
+			let slot_idx = v.borrow().slot as usize;
+			slot_pool::evict_victim(&mut v.borrow_mut(), slot_idx);
+		}
+
+		// Retry acquisition. If still exhausted (e.g. no blocked victim),
+		// fall back to running on the kernel-stack frame: the switch path
+		// publishes scratch_slot = last_stack_pointer + 288 = kernel_stack_top,
+		// so the frame lands on the task's OWN kernel stack — safe (no shared
+		// E), just without per-slot isolation. This is graceful degradation,
+		// not a crash (design §5.3 bounded exhaustion fallback).
+		let mut b = task.borrow_mut();
+		if !slot_pool::dispatch_acquire_slot(&mut b) {
+			warn!(
+				"ensure_slot: pool exhausted, task {} running on kernel-stack frame (no isolated slot)",
+				self_id
+			);
+		}
+	}
+
 	/// Triggers the scheduler to reschedule the tasks.
 	/// Interrupt flag must be cleared before calling this function.
 	/// `drain_exec` = true drains the async executor (use OFF the exception
@@ -826,6 +951,27 @@ impl PerCoreScheduler {
 		}
 
 		// Handle the new task and get information about it.
+		#[cfg(target_arch = "aarch64")]
+		self.ensure_slot(&task);
+
+		// §4D (invariant-assertion-surface-area.md): update CoreLocal.kernel_sp
+		// to the new task's kernel-stack top BEFORE the asm switch path runs.
+		// The asm switch (start.s) publishes scratch_slot (@24) but NOT kernel_sp
+		// (@16). call_with_kernel_stack reads kernel_sp to set SP_EL1 for deep
+		// handler work. If kernel_sp is stale (boot/E value), deep work runs on
+		// the wrong stack → overflow → silent memory corruption.
+		//
+		// kernel_stack_top = get_kernel_stack() + get_kernel_stack_size(): the
+		// top of the 128 KiB kernel-stack region. For EL1t tasks the frame sits
+		// at the BOTTOM of this region (frame_base ≈ kstack + kstack_size - 288),
+		// so kernel_stack_top is well ABOVE the frame and safe for deep work.
+		#[cfg(target_arch = "aarch64")]
+		{
+			let kernel_stack_top = task.borrow().stacks.get_kernel_stack().as_u64()
+				+ task.borrow().stacks.get_kernel_stack_size() as u64;
+			CoreLocal::get().set_kernel_sp(kernel_stack_top);
+		}
+
 		let (new_id, new_stack_pointer) = {
 			let mut borrowed = task.borrow_mut();
 			if borrowed.status != TaskStatus::Idle {

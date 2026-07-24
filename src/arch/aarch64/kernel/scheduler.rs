@@ -3,22 +3,28 @@
 use core::arch::naked_asm;
 use core::sync::atomic::Ordering;
 
-use aarch64_cpu::asm::barrier::{isb, SY};
+use aarch64_cpu::asm::barrier::{SY, isb};
 use aarch64_cpu::registers::*;
 use align_address::Align;
 use free_list::{PageLayout, PageRange};
 use memory_addresses::{PhysAddr, VirtAddr};
 
-use crate::arch::aarch64::kernel::core_local::core_scheduler;
 use crate::arch::aarch64::kernel::CURRENT_STACK_ADDRESS;
+use crate::arch::aarch64::kernel::core_local::core_scheduler;
 use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize, PageTableEntryFlags};
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 use crate::mm::{FrameAlloc, PageAlloc, PageRangeAllocator};
-use crate::scheduler::task::{Task, TaskFrame, TaskId};
 use crate::scheduler::PerCoreSchedulerExt;
+use crate::scheduler::task::{Task, TaskFrame, TaskId};
 
 #[derive(Debug)]
-#[repr(C, packed)]
+// NOTE: was `#[repr(C, packed)]`; every field is a u64 / fn-pointer (all
+// 8-byte aligned), so packed changes NOTHING about the layout but makes every
+// field access an unaligned-reference hazard (E0793) — e.g. `state.x3` passed
+// to `error!`, or `(*state).spsel` in `debug_assert_eq!`. `#[repr(C)]` gives
+// the identical layout (verified by the offset_of! asserts below) without the
+// hazard. The asm coupling relies on those offset asserts, not on packing.
+#[repr(C)]
 pub(crate) struct State {
 	/// Stack selector
 	pub spsel: u64,
@@ -93,6 +99,46 @@ pub(crate) struct State {
 	/// X30 register
 	pub x30: u64,
 }
+
+// === asm↔Rust offset coupling (start.s trap_exit / D4 tail) ===
+// trap_exit restores registers via consecutive ldp pairs; reordering State
+// fields silently shifts which value lands in which register.
+const _: () = assert!(
+	core::mem::offset_of!(State, sp_el0) == 24,
+	"State.sp_el0 must be at offset 24 (trap_exit 2nd ldp pair, 2nd element)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, spsr_el1) == 16,
+	"State.spsr_el1 must be at offset 16 (trap_exit 2nd ldp pair, 1st element)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, elr_el1) == 8,
+	"State.elr_el1 must be at offset 8 (trap_exit 1st ldp pair, 2nd element)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, tpidr_el0) == 32,
+	"State.tpidr_el0 must be at offset 32 (trap_exit 3rd ldp pair, 1st element)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, x21) == 0xd0,
+	"State.x21 must be at offset 0xd0 (D4 tail hardcodes [x22, #0xd0])"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, x22) == 0xd8,
+	"State.x22 must be at offset 0xd8 (D4 tail hardcodes [x22, #0xd8])"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, x0) == 40,
+	"State.x0 must be at offset 40 (trap_exit 1st ldp pair, 2nd element reads x0 from [sp])"
+);
+const _: () = assert!(
+	core::mem::offset_of!(State, x30) == 0x118,
+	"State.x30 must be at offset 0x118 (x0@40 + 30*8 = 280; frame size 288)"
+);
+const _: () = assert!(
+	core::mem::size_of::<State>() == 288,
+	"State must be exactly 288 bytes (18 ldp pairs in trap_exit; asm hardcodes #288)"
+);
 
 pub struct BootStack {
 	/// Stack for kernel tasks
@@ -344,7 +390,7 @@ impl TaskFrame for Task {
 				while w < body_hi {
 					// noalias &mut store (never merged into a memset).
 					let slot = &mut *(w as *mut u64);
-					*slot = 0x5EED_0000_0000_0000u64 | (w & 0x0000_FFFF_FFFF_FFF8u64);
+					*slot = 0x5eed_0000_0000_0000u64 | (w & 0x0000_ffff_ffff_fff8u64);
 					w += 8;
 				}
 			}
@@ -379,10 +425,44 @@ impl TaskFrame for Task {
 			(*state).spsel = 0;
 			/* Zero the condition flags; M[3:0]=0b0100 = EL1t, SPSEL=0. */
 			(*state).spsr_el1 = 0x3e4;
+			// §1C/§1D: verify the EL1t constants we just set. State is
+			// #[repr(C, packed)], so read fields via addr_of!().read_unaligned()
+			// (taking a field reference would be an unaligned-reference error).
+			let got_spsel = {
+				let p = core::ptr::addr_of!((*state).spsel);
+				unsafe { p.read_unaligned() }
+			};
+			debug_assert_eq!(
+				got_spsel, 0,
+				"create_stack_frame: spsel must be 0 (EL1t) for hardware SP_EL1 auto-switch"
+			);
+			let got_spsr = {
+				let p = core::ptr::addr_of!((*state).spsr_el1);
+				unsafe { p.read_unaligned() }
+			};
+			debug_assert_eq!(
+				got_spsr, 0x3e4,
+				"create_stack_frame: spsr_el1 must be 0x3e4 (EL1t, SPSEL=0, FPU trap, DAIF masked)"
+			);
 
 			// Set the task's stack pointer entry to the stack we have just crafted.
 
 			self.last_stack_pointer = stack;
+
+			// §5A: verify frame lies within the mapped kernel stack region.
+			{
+				let kstack_lo = self.stacks.get_kernel_stack().as_u64();
+				let kstack_hi = kstack_lo + self.stacks.get_kernel_stack_size() as u64;
+				debug_assert!(
+					stack.as_u64() >= kstack_lo
+						&& stack.as_u64() + core::mem::size_of::<State>() as u64 <= kstack_hi,
+					"create_stack_frame: frame [{:#x}, {:#x}) outside kernel stack [{:#x}, {:#x})",
+					stack.as_u64(),
+					stack.as_u64() + core::mem::size_of::<State>() as u64,
+					kstack_lo,
+					kstack_hi
+				);
+			}
 
 			// EL1t: SP_EL0 holds the task body's stack pointer.
 			//
@@ -418,6 +498,29 @@ impl TaskFrame for Task {
 			};
 			(*state).sp_el0 = sp_top - 16;
 
+			// §5B: verify sp_el0 lies within the mapped user stack region (Common).
+			if let TaskStacks::Common(_) = &self.stacks {
+				let ustack_lo = self.stacks.get_user_stack().as_u64();
+				let ustack_hi = ustack_lo + self.stacks.get_user_stack_size() as u64;
+				let sp_el0_val = sp_top - 16;
+				debug_assert!(
+					sp_el0_val >= ustack_lo && sp_el0_val < ustack_hi,
+					"create_stack_frame: sp_el0 {sp_el0_val:#x} outside user stack [{ustack_lo:#x}, {ustack_hi:#x})"
+				);
+			}
+			// §5C: verify frame + marker don't overflow into the guard page.
+			{
+				let frame_end = stack.as_u64() + core::mem::size_of::<State>() as u64;
+				let guard_start = self.stacks.get_kernel_stack().as_u64()
+					+ self.stacks.get_kernel_stack_size() as u64;
+				debug_assert!(
+					frame_end + TaskStacks::MARKER_SIZE as u64 <= guard_start,
+					"create_stack_frame: frame+marker ({:#x}) overflows into guard ({:#x})",
+					frame_end + TaskStacks::MARKER_SIZE as u64,
+					guard_start
+				);
+			}
+
 			// [V1] verification trace — idle-el1t-switch-redesign.md §6.
 			// Placed AFTER the sp_el0 assignment (line above) so it captures the
 			// TRUE pristine value, not the zeroed slot. Logs frame_base,
@@ -426,8 +529,7 @@ impl TaskFrame for Task {
 			// pristine frame wrong (create_stack_frame defect).
 			// State is #[repr(C, packed)] — read the field via a raw pointer
 			// with read_unaligned to avoid an unaligned reference (E0793).
-			let v1_sp_el0 =
-				unsafe { core::ptr::addr_of!((*state).sp_el0).read_unaligned() };
+			let v1_sp_el0 = unsafe { core::ptr::addr_of!((*state).sp_el0).read_unaligned() };
 			warn!(
 				"[V1] CREATE frame_base={:#x} ktop={:#x} size_of_State={} sp_el0_slot={:#x}",
 				stack.as_u64(),

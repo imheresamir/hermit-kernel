@@ -1,5 +1,7 @@
 use core::mem;
 
+use crate::arch::aarch64::kernel::core_local::CoreLocal;
+
 type Reg = mem::MaybeUninit<usize>;
 
 #[unsafe(naked)]
@@ -57,12 +59,22 @@ macro_rules! kernel_function_impl {
 				assert!(size_of::<R>() <= size_of::<Reg>());
 
 				let call_with_kernel_stack = mem::transmute::<*const (), unsafe extern "C" fn(
-					$($arg: $A,)*
-					$($z: Reg,)*
-					f: unsafe extern "C" fn(
 						$($arg: $A,)*
-					) -> R,
-				) -> R>(call_with_kernel_stack as *const ());
+						$($z: Reg,)*
+						f: unsafe extern "C" fn(
+							$($arg: $A,)*
+						) -> R,
+					) -> R>(call_with_kernel_stack as *const ());
+
+				// §4D: verify CoreLocal.kernel_sp was updated by the scheduler before
+				// the asm switch (start.s only publishes scratch_slot @24, not kernel_sp
+				// @16). A zero or stale value means deep handler work runs on the wrong
+				// stack → overflow → silent memory corruption (not caught by hardware
+				// until adjacent memory is already clobbered).
+				assert!(
+					CoreLocal::get().kernel_sp != 0,
+					"call_with_kernel_stack: kernel_sp is zero — scheduler did not update CoreLocal.kernel_sp (§4D)"
+				);
 
 				$(
 					let $z = Reg::uninit();
