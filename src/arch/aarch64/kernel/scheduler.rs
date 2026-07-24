@@ -14,7 +14,7 @@ use crate::arch::aarch64::kernel::CURRENT_STACK_ADDRESS;
 use crate::arch::aarch64::mm::paging::{BasePageSize, PageSize, PageTableEntryFlags};
 use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 use crate::mm::{FrameAlloc, PageAlloc, PageRangeAllocator};
-use crate::scheduler::task::{Task, TaskFrame};
+use crate::scheduler::task::{Task, TaskFrame, TaskId};
 use crate::scheduler::PerCoreSchedulerExt;
 
 #[derive(Debug)]
@@ -418,6 +418,25 @@ impl TaskFrame for Task {
 			};
 			(*state).sp_el0 = sp_top - 16;
 
+			// [V1] verification trace — idle-el1t-switch-redesign.md §6.
+			// Placed AFTER the sp_el0 assignment (line above) so it captures the
+			// TRUE pristine value, not the zeroed slot. Logs frame_base,
+			// kernel_stack_top, size_of::<State>(), and the pristine sp_el0.
+			// size_of_State != 288 => H-a3 (off-by size). sp_el0_slot == 0 =>
+			// pristine frame wrong (create_stack_frame defect).
+			// State is #[repr(C, packed)] — read the field via a raw pointer
+			// with read_unaligned to avoid an unaligned reference (E0793).
+			let v1_sp_el0 =
+				unsafe { core::ptr::addr_of!((*state).sp_el0).read_unaligned() };
+			warn!(
+				"[V1] CREATE frame_base={:#x} ktop={:#x} size_of_State={} sp_el0_slot={:#x}",
+				stack.as_u64(),
+				self.stacks.get_kernel_stack().as_u64()
+					+ self.stacks.get_kernel_stack_size() as u64,
+				core::mem::size_of::<State>(),
+				v1_sp_el0,
+			);
+
 			// user_stack_pointer still populated for any legacy reader; the
 			// EL1t model does not run the task body on the user stack.
 			self.user_stack_pointer = self.stacks.get_user_stack()
@@ -435,6 +454,25 @@ pub(crate) extern "C" fn get_last_stack_pointer() -> u64 {
 	CPACR_EL1.modify(CPACR_EL1::FPEN::TrapEl0El1);
 	isb(SY);
 	let sp = core_scheduler().get_last_stack_pointer().as_u64();
+	// [V3] verification trace — idle-el1t-switch-redesign.md §6. Fires on
+	// EVERY idle switch-IN (this fn is called on every switch). Shows the
+	// POST-D3 frame idle will resume from. Valid for several cycles then bad
+	// => recent corruption window; bad from the FIRST switch-IN => pristine
+	// frame wrong (H-a3 / create_stack_frame defect). Pins when idle.lsp was
+	// first corrupted.
+	{
+		let cs = core_scheduler();
+		if cs.get_current_task_id() == TaskId::from(0) {
+			// current task being switched to IS idle: sp == idle frame base
+			let slot = sp as *const u64;
+			warn!(
+				"[V3] idle selected: frame_base={:#x} sp_el0={:#x} elr={:#x}",
+				sp,
+				unsafe { *slot.add(3) },
+				unsafe { *slot.add(1) },
+			);
+		}
+	}
 	// NOTE: do NOT fatal on 0 here. The early-boot/idle task (TaskStacks::Boot)
 	// legitimately has last_stack_pointer == 0; callers that copy the frame
 	// (D3) guard with cbz. A 0 here only matters on the real switch path
