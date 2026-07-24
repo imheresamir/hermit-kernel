@@ -154,8 +154,29 @@ el1_irq:
       cmp x0, 0
       b.eq 1f
       // switch to the next task
-      mov x1, sp
-      str x1, [x0]                  /* store old sp */
+      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
+      // landed on the per-core exception stack E (EL1t-origin: sp <
+      // exception_sp), copy the 288-byte State from E into the old task's
+      // persistent frame (*x0, still intact) and record that persistent base.
+      // This keeps last_stack_pointer valid for ANY EL1t task (idle, init,
+      // spawned-at-EL1t) across switches. EL1h frames already live on the
+      // task's own kernel stack, so a plain store suffices.
+      mov x1, sp                       /* x1 = old frame top */
+      mrs x9, tpidr_el1
+      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
+      cmp x1, x9                       /* sp vs E_top */
+      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
+      mov x3, x2                       /* running dst ptr */
+      mov x4, #18                      /* 18 stp pairs = 288 bytes */
+5:    ldp x5, x6, [x1], #16
+      stp x5, x6, [x3], #16
+      sub x4, x4, #1
+      cbnz x4, 5b
+      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
+      b 7f
+6:    str x1, [x0]                     /* EL1h: store frame top directly */
+7:
       bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
@@ -185,8 +206,27 @@ el1_fiq:
       cmp x0, 0
       b.eq 2f
       // switch to the next task
-      mov x1, sp
-      str x1, [x0]                  /* store old sp */
+      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
+      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
+      // State from E into the old task's persistent frame (*x0, intact) and
+      // record that persistent base. EL1h frames already live on the task's
+      // own kernel stack, so a plain store suffices.
+      mov x1, sp                       /* x1 = old frame top */
+      mrs x9, tpidr_el1
+      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
+      cmp x1, x9                       /* sp vs E_top */
+      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
+      mov x3, x2                       /* running dst ptr */
+      mov x4, #18                      /* 18 stp pairs = 288 bytes */
+5:    ldp x5, x6, [x1], #16
+      stp x5, x6, [x3], #16
+      sub x4, x4, #1
+      cbnz x4, 5b
+      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
+      b 7f
+6:    str x1, [x0]                     /* EL1h: store frame top directly */
+7:
       bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
@@ -256,8 +296,27 @@ el1_sp0_irq:
       cmp x0, 0
       b.eq 3f
       // switch to the next task
-      mov x1, sp
-      str x1, [x0]                  /* store old sp */
+      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
+      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
+      // State from E into the old task's persistent frame (*x0, intact) and
+      // record that persistent base. EL1h frames already live on the task's
+      // own kernel stack, so a plain store suffices.
+      mov x1, sp                       /* x1 = old frame top */
+      mrs x9, tpidr_el1
+      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
+      cmp x1, x9                       /* sp vs E_top */
+      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
+      mov x3, x2                       /* running dst ptr */
+      mov x4, #18                      /* 18 stp pairs = 288 bytes */
+5:    ldp x5, x6, [x1], #16
+      stp x5, x6, [x3], #16
+      sub x4, x4, #1
+      cbnz x4, 5b
+      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
+      b 7f
+6:    str x1, [x0]                     /* EL1h: store frame top directly */
+7:
       bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
@@ -285,8 +344,27 @@ el1_sp0_fiq:
       cmp x0, 0
       b.eq 4f
       // switch to the next task
-      mov x1, sp
-      str x1, [x0]                  /* store old sp */
+      // D3 (generalized, Option-D §10.4.2): if the old task's trap frame
+      // landed on E (EL1t-origin: sp < exception_sp), copy the 288-byte
+      // State from E into the old task's persistent frame (*x0, intact) and
+      // record that persistent base. EL1h frames already live on the task's
+      // own kernel stack, so a plain store suffices.
+      mov x1, sp                       /* x1 = old frame top */
+      mrs x9, tpidr_el1
+      ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
+      cmp x1, x9                       /* sp vs E_top */
+      b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
+      mov x3, x2                       /* running dst ptr */
+      mov x4, #18                      /* 18 stp pairs = 288 bytes */
+5:    ldp x5, x6, [x1], #16
+      stp x5, x6, [x3], #16
+      sub x4, x4, #1
+      cbnz x4, 5b
+      str x2, [x0]                     /* *x0 = persistent base (unchanged) */
+      b 7f
+6:    str x1, [x0]                     /* EL1h: store frame top directly */
+7:
       bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288

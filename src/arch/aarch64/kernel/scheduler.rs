@@ -382,26 +382,6 @@ impl TaskFrame for Task {
 
 			// Set the task's stack pointer entry to the stack we have just crafted.
 
-			// === INSTRUMENTATION: dump State fields after creation ===
-			let state_addr = state as u64;
-			let elr_val = (*state).elr_el1 as *const () as u64;
-			let x30_val = (*state).x30;
-			let x0_val = (*state).x0;
-			let x1_val = (*state).x1;
-			let spsel_val = (*state).spsel;
-			let spsr_val = (*state).spsr_el1;
-			let tpidr_val = (*state).tpidr_el0;
-			warn!("[TRACE-FRAME] State @ {state_addr:#x}: elr={elr_val:#x} x30={x30_val:#x} x0={x0_val:#x} x1={x1_val:#x} spsel={spsel_val:#x} spsr={spsr_val:#x} tpidr={tpidr_val:#x}");
-
-			// === INSTRUMENTATION: probe State memory after all writes ===
-			// Read back raw u64 words to detect any overwrite between our
-			// write and the eventual trap_exit restore.
-			let raw_state = core::slice::from_raw_parts(state as *const u64, 36);
-			warn!(
-				"[TRACE-FRAME] raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
-				raw_state[0], raw_state[1], raw_state[8], raw_state[35]
-			);
-
 			self.last_stack_pointer = stack;
 
 			// EL1t: SP_EL0 holds the task body's stack pointer.
@@ -438,42 +418,13 @@ impl TaskFrame for Task {
 			};
 			(*state).sp_el0 = sp_top - 16;
 
-			// === INSTRUMENTATION: dump sp_el0 and guard page addr ===
-			let spel0_val = (*state).sp_el0;
-			warn!(
-				"[TRACE-FRAME] sp_el0={:#x} sp_top={:#x} guard={:#x}",
-				spel0_val, sp_top, sp_top
-			);
-
-			// === INSTRUMENTATION: re-read State after sp_el0 write ===
-			let raw_state2 = core::slice::from_raw_parts(state as *const u64, 36);
-			warn!(
-				"[TRACE-FRAME] post-spel0: raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
-				raw_state2[0], raw_state2[1], raw_state2[8], raw_state2[35]
-			);
-
 			// user_stack_pointer still populated for any legacy reader; the
 			// EL1t model does not run the task body on the user stack.
 			self.user_stack_pointer = self.stacks.get_user_stack()
 				+ self.stacks.get_user_stack_size()
 				- TaskStacks::MARKER_SIZE;
 
-			// === INSTRUMENTATION: probe user_stack write location ===
-			let usp_addr = self.user_stack_pointer.as_u64();
-			warn!("[TRACE-FRAME] user_stack_pointer={usp_addr:#x} writing marker");
 			*self.user_stack_pointer.as_mut_ptr::<u64>() = 0xdead_beefu64;
-
-			// === INSTRUMENTATION: final State probe after ALL writes ===
-			let raw_state3 = core::slice::from_raw_parts(state as *const u64, 36);
-			warn!(
-				"[TRACE-FRAME] FINAL: raw[0]={:#x} raw[1]={:#x} raw[8]={:#x} raw[35]={:#x}",
-				raw_state3[0], raw_state3[1], raw_state3[8], raw_state3[35]
-			);
-			warn!(
-				"[TRACE-FRAME] last_stack_pointer={:#x} func={:#x}",
-				self.last_stack_pointer.as_u64(),
-				func as usize as u64
-			);
 		}
 	}
 }

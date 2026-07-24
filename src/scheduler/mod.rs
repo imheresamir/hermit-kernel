@@ -91,15 +91,6 @@ pub(crate) struct PerCoreScheduler {
 	blocked_tasks: BlockedTaskQueue,
 	/// Queue of timer interrupts.
 	pub timers: TimerList,
-	/// Scratch slot for the Idle task's old-stack pointer. When the Idle task
-	/// (an EL1t task) is switched *out*, the asm switch path stores its SP_EL1
-	/// (a transient frame on the per-core exception stack E) into
-	/// `old_task.last_stack_pointer`. That would overwrite Idle's persistent
-	/// `Common`-stack resume frame with an E-frame address, corrupting the next
-	/// Idle resume (illegal SPSR -> EC=0xe / do_bad_mode). Redirecting Idle's
-	/// old-task store here (instead of into `idle_task.last_stack_pointer`)
-	/// keeps Idle's real frame intact. Per-core, so SMP-safe. See Option B.
-	idle_old_lsp_scratch: usize,
 }
 
 pub(crate) trait PerCoreSchedulerExt {
@@ -776,13 +767,6 @@ impl PerCoreScheduler {
 	/// stack, e.g. the reactor idle loop); false skips it (use on the exception
 	/// stack E path — Part B defers executor work to the reactor).
 	pub fn scheduler(&mut self, drain_exec: bool) -> Option<*mut usize> {
-		warn!(
-			"[TRACE-IDLE] scheduler() entry: idle.lsp={:#x} current.id={} current.lsp={:#x} current.status={:?}",
-			self.idle_task.borrow().last_stack_pointer.as_u64(),
-			self.current_task.borrow().id,
-			self.current_task.borrow().last_stack_pointer.as_u64(),
-			self.current_task.borrow().status,
-		);
 		// run background tasks (deferred off E by the IRQ path)
 		if drain_exec {
 			crate::executor::run();
@@ -793,32 +777,11 @@ impl PerCoreScheduler {
 		self.cleanup_tasks();
 
 		// Get information about the current task.
-		// NOTE (Option B): if the current (old) task is the Idle task, its
-		// frame is a static `Common`-stack frame. The asm switch path would
-		// otherwise store the Idle task's SP_EL1 (a transient frame on the
-		// per-core exception stack E, because Idle runs EL1t) into
-		// `idle.last_stack_pointer`, corrupting the next Idle resume. Redirect
-		// the old-task store into the per-core `idle_old_lsp_scratch` so
-		// `idle.last_stack_pointer` stays frozen at its valid frame. This is
-		// the generalized fix for the EL1t idle-switch corruption (replaces the
-		// D3 frame-copy approach in start.s, which only covered the IRQ path).
 		let (id, last_stack_pointer, prio, status) = {
 			let mut borrowed = self.current_task.borrow_mut();
-			let ptr = if borrowed.status == TaskStatus::Idle {
-				#[cfg(not(target_arch = "riscv64"))]
-				{
-					ptr::from_mut(&mut self.idle_old_lsp_scratch).cast::<usize>()
-				}
-				#[cfg(target_arch = "riscv64")]
-				{
-					ptr::from_mut(&mut borrowed.last_stack_pointer).cast::<usize>()
-				}
-			} else {
-				ptr::from_mut(&mut borrowed.last_stack_pointer).cast::<usize>()
-			};
 			(
 				borrowed.id,
-				ptr,
+				ptr::from_mut(&mut borrowed.last_stack_pointer).cast::<usize>(),
 				borrowed.prio,
 				borrowed.status,
 			)
@@ -848,13 +811,6 @@ impl PerCoreScheduler {
 			} else if status != TaskStatus::Idle {
 				// The Idle task becomes the new task.
 				debug!("Only Idle Task is available.");
-				warn!(
-					"[TRACE-IDLE] picking idle: idle.lsp={:#x} idle.stacks_is_common={} current_task.id={} status={:?}",
-					self.idle_task.borrow().last_stack_pointer.as_u64(),
-					matches!(self.idle_task.borrow().stacks, TaskStacks::Common(_)),
-					self.current_task.borrow().id,
-					self.current_task.borrow().status,
-				);
 				new_task = Some(self.idle_task.clone());
 			}
 		}
@@ -970,7 +926,6 @@ pub(crate) fn add_current_core() {
 		finished_tasks: VecDeque::new(),
 		blocked_tasks: BlockedTaskQueue::new(),
 		timers: TimerList::new(),
-		idle_old_lsp_scratch: 0,
 	});
 
 	let scheduler = Box::into_raw(boxed_scheduler);

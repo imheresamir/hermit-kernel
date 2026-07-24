@@ -590,12 +590,6 @@ impl Task {
 		// `idle_entry` -> `run()` (the scheduler loop).
 		#[cfg(target_arch = "aarch64")]
 		idle_task.create_stack_frame(idle_entry, 0);
-		#[cfg(target_arch = "aarch64")]
-		warn!(
-			"[TRACE-IDLE] new_idle: after create_stack_frame idle.lsp={:#x} stacks_common={}",
-			idle_task.last_stack_pointer.as_u64(),
-			matches!(idle_task.stacks, TaskStacks::Common(_)),
-		);
 
 		idle_task
 	}

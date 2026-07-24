@@ -148,19 +148,6 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
-	// [MEASURE] peak E usage: read SP_EL1 (current depth on E) and compare to
-	// exception_sp (E top). delta = bytes consumed by this point in the handler.
-	let sp_el1: u64;
-	unsafe { core::arch::asm!("mov {val}, sp", val = out(reg) sp_el1) };
-	let e_top = crate::arch::aarch64::kernel::core_local::CoreLocal::get().exception_sp as u64;
-	// Only meaningful when this IRQ was taken from the exception stack E
-	// (e_top is the top of E; sp_el1 on E is < e_top). In the current EL1h
-	// model, task IRQs instead land on the task's kernel stack (sp_el1 > e_top),
-	// so skip those to avoid underflow and to isolate the peak E depth.
-	if sp_el1 < e_top {
-		let used = e_top - sp_el1;
-		debug!("[E-DEPTH] do_irq on E: sp_el1={:#x} exception_sp={:#x} used={:#x} ({} bytes)", sp_el1, e_top, used, used);
-	}
 	let Some(irqid) = GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1) else {
 		return ptr::null_mut();
 	};
