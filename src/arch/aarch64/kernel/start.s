@@ -166,6 +166,8 @@ el1_irq:
       ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
       cmp x1, x9                       /* sp vs E_top */
       b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
+      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
       ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
       mov x3, x2                       /* running dst ptr */
       mov x4, #18                      /* 18 stp pairs = 288 bytes */
@@ -216,6 +218,8 @@ el1_fiq:
       ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
       cmp x1, x9                       /* sp vs E_top */
       b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
+      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
       ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
       mov x3, x2                       /* running dst ptr */
       mov x4, #18                      /* 18 stp pairs = 288 bytes */
@@ -306,6 +310,8 @@ el1_sp0_irq:
       ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
       cmp x1, x9                       /* sp vs E_top */
       b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
+      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
       ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
       mov x3, x2                       /* running dst ptr */
       mov x4, #18                      /* 18 stp pairs = 288 bytes */
@@ -354,6 +360,8 @@ el1_sp0_fiq:
       ldr x9, [x9, #0]                 /* x9 = exception_sp (E top) */
       cmp x1, x9                       /* sp vs E_top */
       b.ge 6f                         /* sp >= E_top => not on E => EL1h, skip copy */
+      tst x1, #(1 << 47)              /* frame in kernel task-stack VAS (bit 47 set)? */
+      b.eq 7f                         /* no: boot/C-stack sp, not an E-frame; preserve lsp */
       ldr x2, [x0]                     /* x2 = dst = persistent frame base (intact) */
       mov x3, x2                       /* running dst ptr */
       mov x4, #18                      /* 18 stp pairs = 288 bytes */
