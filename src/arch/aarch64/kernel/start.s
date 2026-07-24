@@ -156,8 +156,7 @@ el1_irq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
-      cbz x0, 1f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
+      bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
       mrs x2, tpidr_el1
@@ -188,8 +187,7 @@ el1_fiq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
-      cbz x0, 2f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
+      bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
       mrs x2, tpidr_el1
@@ -260,8 +258,7 @@ el1_sp0_irq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
-      cbz x0, 3f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
+      bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
       mrs x2, tpidr_el1
@@ -290,8 +287,7 @@ el1_sp0_fiq:
       // switch to the next task
       mov x1, sp
       str x1, [x0]                  /* store old sp */
-      bl get_last_stack_pointer     /* x0 = new sp (0 for idle/boot) */
-      cbz x0, 4f                    /* idle/boot: keep current frame; skip sp switch + kernel_sp store */
+      bl get_last_stack_pointer     /* get new sp   */
       mov sp, x0
       add x1, x0, #288
       mrs x2, tpidr_el1

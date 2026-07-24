@@ -483,7 +483,6 @@ pub(crate) extern "C" fn get_last_stack_pointer() -> u64 {
 	// Trap next FPU instruction so we can lazily restore FPU state
 	CPACR_EL1.modify(CPACR_EL1::FPEN::TrapEl0El1);
 	isb(SY);
-
 	let sp = core_scheduler().get_last_stack_pointer().as_u64();
 	// NOTE: do NOT fatal on 0 here. The early-boot/idle task (TaskStacks::Boot)
 	// legitimately has last_stack_pointer == 0; callers that copy the frame

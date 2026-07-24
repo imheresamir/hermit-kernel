@@ -510,6 +510,25 @@ impl Task {
 	pub fn new_idle(tid: TaskId, core_id: CoreId) -> Task {
 		debug!("Creating idle task {tid}");
 
+		/// Idle-task resume entry (aarch64 / Option D EL1t model).
+		///
+		/// The idle/boot task has no `SP_EL0` body stack and never re-enters
+		/// via `task_start` the way spawned tasks do (option-d doc §2.3 / D6).
+		/// Its `State` is built once at creation (see the `create_stack_frame`
+		/// call below) with `elr = task_start` and `x0 = idle_entry`, so when
+		/// the scheduler switches to the idle task, `trap_exit` restores this
+		/// frame and `task_start(idle_entry, 0)` runs `idle_entry` -> `run()`.
+		/// `run()` is the scheduler loop: it drains the executor, and when the
+		/// ready queue is empty it calls `enable_and_wait()` (wfi); the IRQ
+		/// handler (`do_irq`) then switches to a ready task. On the next park
+		/// the scheduler switches back to idle and `run()` resumes from the
+		/// wfi — i.e. the idle task re-enters `run()` by RESUME, not by fresh
+		/// call, so the boot stack is not consumed per idle cycle.
+		#[cfg(target_arch = "aarch64")]
+		unsafe extern "C" fn idle_entry(_arg: usize) -> () {
+			crate::scheduler::PerCoreScheduler::run();
+		}
+
 		/// All cores use the same mapping between file descriptor and the referenced object
 		static OBJECT_MAP: OnceCell<
 			Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
@@ -538,7 +557,7 @@ impl Task {
 			None
 		};
 
-		Task {
+		let mut idle_task = Task {
 			id: tid,
 			status: TaskStatus::Idle,
 			prio: IDLE_PRIO,
@@ -546,13 +565,39 @@ impl Task {
 			user_stack_pointer: VirtAddr::zero(),
 			last_fpu_state: FPUState::new(),
 			core_id,
+			// Option D / D4 tail: the idle task needs a *real* resume State so
+			// the scheduler can switch to it (`last_stack_pointer != 0`). The
+			// original `Boot` stack places that frame in the unmapped top guard
+			// page (poison on read -> "unhandled exception: 0"), so give the
+			// idle task a proper allocated `Common` stack like a spawned task.
+			// `create_stack_frame` then builds a valid frame on it (proven by
+			// the init task), and `trap_exit` restores it correctly.
+			#[cfg(target_arch = "aarch64")]
+			stacks: TaskStacks::new(crate::config::DEFAULT_STACK_SIZE),
+			#[cfg(not(target_arch = "aarch64"))]
 			stacks: TaskStacks::from_boot_stacks(),
 			object_map: OBJECT_MAP.get().unwrap().clone(),
 			#[cfg(not(feature = "common-os"))]
 			tls,
 			#[cfg(all(target_arch = "x86_64", feature = "common-os"))]
 			root_page_table: *crate::scheduler::BOOT_ROOT_PAGE_TABLE.get().unwrap(),
-		}
+		};
+
+		// D4 tail / idle-frame (Option D): build a real resume State for the
+		// idle/boot task so `last_stack_pointer != 0`. On aarch64 we use a
+		// `Common` stack (allocated) so `create_stack_frame` places the frame
+		// in mapped memory, with `elr = task_start`, `x0 = idle_entry` ->
+		// `idle_entry` -> `run()` (the scheduler loop).
+		#[cfg(target_arch = "aarch64")]
+		idle_task.create_stack_frame(idle_entry, 0);
+		#[cfg(target_arch = "aarch64")]
+		warn!(
+			"[TRACE-IDLE] new_idle: after create_stack_frame idle.lsp={:#x} stacks_common={}",
+			idle_task.last_stack_pointer.as_u64(),
+			matches!(idle_task.stacks, TaskStacks::Common(_)),
+		);
+
+		idle_task
 	}
 }
 

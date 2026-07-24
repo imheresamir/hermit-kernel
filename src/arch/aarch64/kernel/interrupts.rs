@@ -150,9 +150,6 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 	// [MEASURE] peak E usage: read SP_EL1 (current depth on E) and compare to
 	// exception_sp (E top). delta = bytes consumed by this point in the handler.
-	// NOTE: `mrs {}, sp_el1` is UNDEFINED at EL1 (SP_EL1 is EL2/EL3-readable only)
-	// and traps as EC=0x0 (Unknown) -- do_irq runs EL1h (SPSEL=1) so `sp` aliases
-	// SP_EL1; read it with `mov` (same workaround as do_sync's error handler).
 	let sp_el1: u64;
 	unsafe { core::arch::asm!("mov {val}, sp", val = out(reg) sp_el1) };
 	let e_top = crate::arch::aarch64::kernel::core_local::CoreLocal::get().exception_sp as u64;
@@ -188,24 +185,7 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 
-	let result = core_scheduler().scheduler(false).unwrap_or_default();
-
-	// === INSTRUMENTATION: log context switch result ===
-	if !result.is_null() {
-		// result = ptr to old task's last_stack_pointer field
-		// *result = old task's SP_EL1 (the trap_entry frame on E)
-		let old_sp = unsafe { *result };
-		let new_task_id = core_scheduler().get_current_task_id();
-		let new_lsp = core_scheduler().get_last_stack_pointer();
-		warn!("[TRACE-IRQ] ctx switch: old_sp={old_sp:#x} new_task={new_task_id:?} new_lsp={:#x}", new_lsp.as_u64());
-		// Dump the new task's State at new_lsp
-		let state_ptr = new_lsp.as_usize() as *const u64;
-		let raw = unsafe { core::slice::from_raw_parts(state_ptr, 36) };
-		warn!("[TRACE-IRQ] new State[0]={:#x} [1]={:#x} [8]={:#x} [35]={:#x}",
-			raw[0], raw[1], raw[8], raw[35]);
-	}
-
-	result
+	core_scheduler().scheduler(false).unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]
