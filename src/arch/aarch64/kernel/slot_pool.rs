@@ -16,7 +16,7 @@
 //! storage, and reuses the slot. The claim flag (`FrameLocation::BeingEvicted`)
 //! serializes the eviction copy with the cross-core wake path.
 
-use core::mem;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use memory_addresses::VirtAddr;
@@ -27,7 +27,7 @@ use crate::scheduler::task::{FrameLocation, Task};
 
 /// Size of the State frame in bytes. Single source of truth for all slot
 /// copy/offset arithmetic — never hardcode 288.
-const STATE_SIZE: usize = mem::size_of::<crate::arch::aarch64::kernel::scheduler::State>();
+const STATE_SIZE: usize = size_of::<crate::arch::aarch64::kernel::scheduler::State>();
 
 // Cross-check against the asm-hardcoded `#288` in start.s (D4 tail / switch
 // vectors) AND the `ARCH_STATE_SIZE` literal in config.rs. The asm cannot call
@@ -122,7 +122,7 @@ pub fn dispatch_acquire_slot(task: &mut Task) -> bool {
 	let src = task.last_stack_pointer.as_u64() as *const u64;
 	let dst = frame_base as *mut u64;
 	unsafe {
-		for w in 0..(STATE_SIZE / mem::size_of::<u64>()) {
+		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);
 		}
 	}
@@ -208,7 +208,7 @@ pub fn evict_victim(victim: &mut Task, slot_idx: usize) -> bool {
 	let src = frame_base as *const u64;
 	let dst = victim.last_stack_pointer.as_u64() as *mut u64;
 	unsafe {
-		for w in 0..(STATE_SIZE / mem::size_of::<u64>()) {
+		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);
 		}
 	}
@@ -259,7 +259,7 @@ pub fn resume_from_evicted(task: &mut Task) -> bool {
 	let src = task.last_stack_pointer.as_u64() as *const u64;
 	let dst = frame_base as *mut u64;
 	unsafe {
-		for w in 0..(STATE_SIZE / mem::size_of::<u64>()) {
+		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);
 		}
 	}

@@ -430,7 +430,7 @@ impl TaskFrame for Task {
 			// (taking a field reference would be an unaligned-reference error).
 			let got_spsel = {
 				let p = core::ptr::addr_of!((*state).spsel);
-				unsafe { p.read_unaligned() }
+				p.read_unaligned()
 			};
 			debug_assert_eq!(
 				got_spsel, 0,
@@ -438,7 +438,7 @@ impl TaskFrame for Task {
 			);
 			let got_spsr = {
 				let p = core::ptr::addr_of!((*state).spsr_el1);
-				unsafe { p.read_unaligned() }
+				p.read_unaligned()
 			};
 			debug_assert_eq!(
 				got_spsr, 0x3e4,
@@ -455,10 +455,10 @@ impl TaskFrame for Task {
 				let kstack_hi = kstack_lo + self.stacks.get_kernel_stack_size() as u64;
 				debug_assert!(
 					stack.as_u64() >= kstack_lo
-						&& stack.as_u64() + core::mem::size_of::<State>() as u64 <= kstack_hi,
+						&& stack.as_u64() + size_of::<State>() as u64 <= kstack_hi,
 					"create_stack_frame: frame [{:#x}, {:#x}) outside kernel stack [{:#x}, {:#x})",
 					stack.as_u64(),
-					stack.as_u64() + core::mem::size_of::<State>() as u64,
+					stack.as_u64() + size_of::<State>() as u64,
 					kstack_lo,
 					kstack_hi
 				);
@@ -485,7 +485,7 @@ impl TaskFrame for Task {
 			let sp_top = match &self.stacks {
 				TaskStacks::Boot(_) => {
 					stack.as_u64()
-						+ core::mem::size_of::<State>() as u64
+						+ size_of::<State>() as u64
 						+ TaskStacks::MARKER_SIZE as u64
 				}
 				TaskStacks::Common(_) => {
@@ -510,7 +510,7 @@ impl TaskFrame for Task {
 			}
 			// §5C: verify frame + marker don't overflow into the guard page.
 			{
-				let frame_end = stack.as_u64() + core::mem::size_of::<State>() as u64;
+				let frame_end = stack.as_u64() + size_of::<State>() as u64;
 				let guard_start = self.stacks.get_kernel_stack().as_u64()
 					+ self.stacks.get_kernel_stack_size() as u64;
 				debug_assert!(
@@ -529,13 +529,13 @@ impl TaskFrame for Task {
 			// pristine frame wrong (create_stack_frame defect).
 			// State is #[repr(C, packed)] — read the field via a raw pointer
 			// with read_unaligned to avoid an unaligned reference (E0793).
-			let v1_sp_el0 = unsafe { core::ptr::addr_of!((*state).sp_el0).read_unaligned() };
+			let v1_sp_el0 = core::ptr::addr_of!((*state).sp_el0).read_unaligned();
 			warn!(
 				"[V1] CREATE frame_base={:#x} ktop={:#x} size_of_State={} sp_el0_slot={:#x}",
 				stack.as_u64(),
 				self.stacks.get_kernel_stack().as_u64()
 					+ self.stacks.get_kernel_stack_size() as u64,
-				core::mem::size_of::<State>(),
+				size_of::<State>(),
 				v1_sp_el0,
 			);
 

@@ -51,31 +51,31 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 	// memory scan ever prints. The userspace frame is where 0x60000207
 	// (SPSR-shaped) would surface in TLS/stack/heap.
 	let base0 = frame as u64;
-	let spsel0 = core::ptr::addr_of!(*(base0 as *const u64)).read_volatile();
+	let spsel0 = unsafe { core::ptr::addr_of!(*(base0 as *const u64)).read_volatile() };
 	if spsel0 != 0x0 {
 		return;
 	}
-	let c = FRAME_DUMP_COUNT;
+	let c = unsafe { FRAME_DUMP_COUNT };
 	if c >= FRAME_DUMP_LIMIT {
 		return;
 	}
-	FRAME_DUMP_COUNT = c + 1;
+	unsafe { FRAME_DUMP_COUNT = c + 1; }
 	let base = frame as u64;
 	let slot = base as *const u64;
 	// Read key slots directly (State layout: spsel@0, elr@8, spsr@16,
 	// sp_el0@24, tpidr@32, x0@40..x30@280).
-	let spsel = core::ptr::addr_of!(*slot.add(0)).read_volatile();
-	let elr = core::ptr::addr_of!(*slot.add(1)).read_volatile();
-	let spsr = core::ptr::addr_of!(*slot.add(2)).read_volatile();
-	let sp_el0 = core::ptr::addr_of!(*slot.add(3)).read_volatile();
-	let tpidr = core::ptr::addr_of!(*slot.add(4)).read_volatile();
+	let spsel = unsafe { core::ptr::addr_of!(*slot.add(0)).read_volatile() };
+	let elr = unsafe { core::ptr::addr_of!(*slot.add(1)).read_volatile() };
+	let spsr = unsafe { core::ptr::addr_of!(*slot.add(2)).read_volatile() };
+	let sp_el0 = unsafe { core::ptr::addr_of!(*slot.add(3)).read_volatile() };
+	let tpidr = unsafe { core::ptr::addr_of!(*slot.add(4)).read_volatile() };
 	error!(
 		"[FRAME-DUMP #{c}] {tag} task={tid:?} frame_base={base:#x} | spsel={spsel:#x} elr={elr:#x} spsr={spsr:#x} sp_el0={sp_el0:#x} tpidr={tpidr:#x}"
 	);
 	// Dump all GPRs (x0..x30 = slots 5..35) inline.
 	let mut hit_x = false;
 	for i in 5..=35u64 {
-		let v = core::ptr::addr_of!(*slot.add(i as usize)).read_volatile();
+		let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
 		if v == 0x60000207 {
 			hit_x = true;
 		}
@@ -98,7 +98,7 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 		let mut found: u64 = 0;
 		let mut found_val: u64 = 0;
 		for a in (lo..hi).step_by(8) {
-			let v = core::ptr::addr_of!(*(a as *const u64)).read_volatile();
+			let v = unsafe { core::ptr::addr_of!(*(a as *const u64)).read_volatile() };
 			if targets.contains(&v) {
 				found = a;
 				found_val = v;
@@ -147,7 +147,7 @@ unsafe fn check_resume_x0(state: &State) {
 	let mut found = false;
 	let mut vals = [0u64; 31];
 	for i in 5..=35u64 {
-		let v = core::ptr::addr_of!(*slot.add(i as usize)).read_volatile();
+		let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
 		vals[(i - 5) as usize] = v;
 		if v == 0x60000207 {
 			found = true;
@@ -426,7 +426,7 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 					// CoreLocal.scratch_slot is at offset 24; TPIDR_EL1 holds
 					// &CoreLocal.
 					let cl_ptr = TPIDR_EL1.get() as *const u64;
-					let scratch_slot = unsafe { core::ptr::read_volatile(cl_ptr.add(24 / 8)) };
+					let scratch_slot = unsafe { ptr::read_volatile(cl_ptr.add(24 / 8)) };
 					error!(
 						"DIAG-SLOT far={far:#x} (SLOT_BASE=0x4180e000); scratch_slot(CoreLocal@24)={scratch_slot:#x}"
 					);
@@ -488,7 +488,7 @@ pub(crate) extern "C" fn do_sync(state: &State) {
 					if usp != 0 && usp % 8 == 0 {
 						for k in 0..16u64 {
 							let va = usp + k * 8;
-							let v = unsafe { core::ptr::read_volatile(va as *const u64) };
+							let v = unsafe { ptr::read_volatile(va as *const u64) };
 							error!("DIAG-SLOT ustk[{k}]@0x{va:x} = 0x{v:x}");
 						}
 					} else {

@@ -15,8 +15,6 @@ pub mod slot_pool;
 mod start;
 pub mod systemtime;
 
-use alloc::alloc::alloc;
-use core::alloc::Layout;
 use core::arch::global_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -96,7 +94,6 @@ pub(crate) fn protect_stack_guards() {
 	use memory_addresses::VirtAddr;
 
 	use crate::arch::aarch64::mm::paging::{get_page_table_entry, unmap};
-	use crate::config::{DEFAULT_STACK_SIZE, KERNEL_STACK_SIZE};
 
 	// Linker-provided section base symbols. These are defined with `= .` inside
 	// each `.X_stacks` section in crates/rs6/link.x, so the linker gives them a
@@ -176,7 +173,7 @@ pub(crate) fn protect_stack_guards() {
 		DEFAULT_STACK_SIZE, // no config.rs const; placeholder
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
-		crate::config::EXCEPTION_SLOT_SIZE, // per-task scratch slot
+		EXCEPTION_SLOT_SIZE, // per-task scratch slot
 	];
 
 	let n = max_bootable_cores();
@@ -190,7 +187,7 @@ pub(crate) fn protect_stack_guards() {
 		// (stride = slot + guard), so its guard count is cores × SLOTS_PER_CORE.
 		// Every other section has exactly one element per core.
 		let elements = if i == 6 {
-			n * crate::config::SLOTS_PER_CORE
+			n * SLOTS_PER_CORE
 		} else {
 			n
 		};
@@ -260,11 +257,11 @@ fn detected_cores() -> usize {
 /// symbols defined by link.x (INSERT AFTER .tbss). They bracket one contiguous
 /// region; reading them as addresses is sound.
 fn linker_supported_cores() -> usize {
-	extern "C" {
+	unsafe extern "C" {
 		static __start_exception_stacks: u8;
 		static __end_exception_stacks: u8;
 	}
-	let size = unsafe {
+	let size = {
 		(&__end_exception_stacks as *const u8 as usize)
 			- (&__start_exception_stacks as *const u8 as usize)
 	};

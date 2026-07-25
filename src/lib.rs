@@ -202,7 +202,9 @@ unsafe fn init_c_runtime() {
 	// `tpidr_el0 + 0x130`. Initialize it to `&__sf` so ctor-time reent access
 	// is valid before any thread-local reent is set up.
 	let tpidr_el0: usize;
-	core::arch::asm!("mrs {0}, tpidr_el0", out(reg) tpidr_el0);
+	unsafe {
+		core::arch::asm!("mrs {0}, tpidr_el0", out(reg) tpidr_el0);
+	}
 	unsafe {
 		*(tpidr_el0 as *mut u64).add(0x130 / 8) = &raw mut __sf as *mut _ as u64;
 	}
@@ -273,7 +275,7 @@ extern "C" fn initd(_arg: usize) {
 		}
 		let start = &raw const __init_array_start as usize;
 		let end = &raw const __init_array_end as usize;
-		let n = (end - start) / core::mem::size_of::<usize>();
+		let n = (end - start) / size_of::<usize>();
 		warn!("[B2-CTOR] init_array start={start:#x} end={end:#x} count={n}");
 		let table = start as *const Option<extern "C" fn()>;
 		for i in 0..n {
@@ -289,12 +291,12 @@ extern "C" fn initd(_arg: usize) {
 				// ctor (or a callee) is the writer. Fixed tags (no
 				// format!) to avoid perturbing the layout-sensitive fault.
 				let v_before =
-					crate::syscalls::LAST_ALLOC_V.load(core::sync::atomic::Ordering::Relaxed);
+					syscalls::LAST_ALLOC_V.load(Ordering::Relaxed);
 				if v_before != 0 {
-					crate::syscalls::scan_kstack_for_v("pre", v_before);
+					syscalls::scan_kstack_for_v("pre", v_before);
 					warn!("[B2-VCHECK] ctor #{i} pre-scan done", i = i);
 					f();
-					crate::syscalls::scan_kstack_for_v("post", v_before);
+					syscalls::scan_kstack_for_v("post", v_before);
 					warn!("[B2-VCHECK] ctor #{i} post-scan done", i = i);
 				} else {
 					f();
@@ -390,7 +392,7 @@ fn boot_processor_main() -> ! {
 
 	#[cfg(not(target_arch = "riscv64"))]
 	scheduler::add_current_core();
-	warn!("[TRACE-SMP] add_current_core done, core_id={}", crate::core_id());
+	warn!("[TRACE-SMP] add_current_core done, core_id={}", core_id());
 	interrupts::enable();
 	warn!("[TRACE-SMP] IRQs enabled, calling boot_next_processor");
 
@@ -413,16 +415,16 @@ fn boot_processor_main() -> ! {
 /// Entry Point of Hermit for an Application Processor
 #[cfg(all(target_os = "none", feature = "smp"))]
 fn application_processor_main() -> ! {
-	warn!("[TRACE-SMP] AP entering application_processor_main, cpu_id={}", crate::core_id());
+	warn!("[TRACE-SMP] AP entering application_processor_main, cpu_id={}", core_id());
 	kernel::application_processor_init();
-	warn!("[TRACE-SMP] AP application_processor_init done, cpu_id={}", crate::core_id());
+	warn!("[TRACE-SMP] AP application_processor_init done, cpu_id={}", core_id());
 	#[cfg(not(target_arch = "riscv64"))]
 	scheduler::add_current_core();
-	warn!("[TRACE-SMP] AP add_current_core done, cpu_id={}", crate::core_id());
+	warn!("[TRACE-SMP] AP add_current_core done, cpu_id={}", core_id());
 	interrupts::enable();
-	warn!("[TRACE-SMP] AP IRQs enabled, calling boot_next_processor, cpu_id={}", crate::core_id());
+	warn!("[TRACE-SMP] AP IRQs enabled, calling boot_next_processor, cpu_id={}", core_id());
 	kernel::boot_next_processor();
-	warn!("[TRACE-SMP] AP boot_next_processor returned, cpu_id={}", crate::core_id());
+	warn!("[TRACE-SMP] AP boot_next_processor returned, cpu_id={}", core_id());
 
 	synch_all_cores();
 	executor::init();

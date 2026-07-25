@@ -432,7 +432,7 @@ impl PerCoreScheduler {
 			// decoupled by M8.2 (migrate_waiting_tasks). Until M8.2 lands,
 			// gate the drain to the I/O core so the reactor remains the
 			// sole drainer.
-			if crate::core_id() == 0 {
+			if core_id() == 0 {
 				crate::executor::run();
 			}
 			self.blocked_tasks
@@ -799,7 +799,7 @@ impl PerCoreScheduler {
 			// INV-R8.1: executor::run() is drained ONLY on the I/O core.
 			if crate::core_id() == 0 {
 				debug_assert!(
-					crate::core_id() == 0,
+					core_id() == 0,
 					"executor::run() drained off the I/O core violates M8.4 INV-R8.1"
 				);
 				// run async tasks
@@ -849,7 +849,7 @@ impl PerCoreScheduler {
 		// write per context switch; zero asm changes — R1.3).
 		{
 			let mut b = task.borrow_mut();
-			b.last_touch = crate::arch::kernel::processor::get_timer_ticks();
+			b.last_touch = kernel::processor::get_timer_ticks();
 		}
 
 		// Step 1: already resident in a slot? (or EL1h in-place via spsel gate)
@@ -874,7 +874,7 @@ impl PerCoreScheduler {
 			// Frame word[0] = spsel saved by trap_entry (1 = EL1h).
 			let frame = b.last_stack_pointer.as_u64();
 			if frame != 0 {
-				let spsel = unsafe { core::ptr::read_volatile(frame as *const u64) };
+				let spsel = unsafe { ptr::read_volatile(frame as *const u64) };
 				if spsel & 1 == 1 {
 					return;
 				}
@@ -924,7 +924,7 @@ impl PerCoreScheduler {
 					// T5/R1.1: complete the deferred wake now (frame is Evicted).
 					// mark_ready returns true (status Blocked->Ready); push it.
 					let completed =
-						crate::scheduler::task::BlockedTaskQueue::mark_ready(&v);
+						BlockedTaskQueue::mark_ready(&v);
 					if completed {
 						self.ready_queue.push(v);
 					}
@@ -977,9 +977,9 @@ impl PerCoreScheduler {
 		// run background tasks (deferred off E by the IRQ path)
 		// M8.4 INV-R8.1: only the I/O core (core 0) drains the executor;
 		// on compute cores drop drain_exec to honor the reactor contract.
-		if drain_exec && crate::core_id() == 0 {
+		if drain_exec && core_id() == 0 {
 			debug_assert!(
-				crate::core_id() == 0,
+				core_id() == 0,
 				"scheduler(drain_exec=true) off the I/O core violates M8.4 INV-R8.1"
 			);
 			crate::executor::run();

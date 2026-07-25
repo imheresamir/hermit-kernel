@@ -99,16 +99,16 @@ pub(crate) fn scan_kstack_for_v(tag: &str, v: u64) {
 	// Search only the lower 8 KiB (the ctor frame region) to stay lightweight.
 	let lo = kstack_lo;
 	let hi = core::cmp::min(kstack_hi, kstack_lo + 0x2000).saturating_sub(8);
-	let mut found: u64 = 0;
+	let mut _found: u64 = 0;
 	let mut found_off: u64 = 0;
 	let mut hits = 0usize;
 	let mut cur = lo;
 	while cur + 8 <= hi {
 		// SAFETY: cur is within the validated kernel-stack window.
-		let w = unsafe { core::ptr::read_volatile(cur as *const u64) };
+		let w = unsafe { ptr::read_volatile(cur as *const u64) };
 		if w == v {
 			if hits == 0 {
-				found = cur;
+				_found = cur;
 				found_off = cur - kstack_lo;
 			}
 			hits += 1;
@@ -187,8 +187,8 @@ fn alloc_trace(tag: &str, size: usize, align: usize, ptr: *mut u8) {
 	let mut depth = 0;
 	while depth < 12 && fp >= kstack_lo && fp + 16 <= kstack_hi && (fp & 0xf) == 0 {
 		// SAFETY: fp is within the validated kernel-stack window and aligned.
-		let saved_fp = unsafe { core::ptr::read_volatile(fp as *const u64) };
-		let saved_lr = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+		let saved_fp = unsafe { ptr::read_volatile(fp as *const u64) };
+		let saved_lr = unsafe { ptr::read_volatile((fp + 8) as *const u64) };
 		// Flag any saved-LR that points into the stack (a return address should
 		// point into .text ~0x406xxxxx..0x413xxxxx, never into the stack).
 		let lr_in_stack = saved_lr >= kstack_lo && saved_lr < kstack_hi;
