@@ -136,8 +136,8 @@ const _: () = assert!(
 	"State.x30 must be at offset 0x118 (x0@40 + 30*8 = 280; frame size 288)"
 );
 const _: () = assert!(
-	core::mem::size_of::<State>() == 288,
-	"State must be exactly 288 bytes (18 ldp pairs in trap_exit; asm hardcodes #288)"
+size_of::<State>() == 288,
+"State must be exactly 288 bytes (18 ldp pairs in trap_exit; asm hardcodes #288)"
 );
 
 pub struct BootStack {

@@ -797,7 +797,7 @@ impl PerCoreScheduler {
 			// never land on a compute core's path. On a single-core (non-SMP)
 			// build core 0 is the only core, so this is behavior-preserving.
 			// INV-R8.1: executor::run() is drained ONLY on the I/O core.
-			if crate::core_id() == 0 {
+			if core_id() == 0 {
 				debug_assert!(
 					core_id() == 0,
 					"executor::run() drained off the I/O core violates M8.4 INV-R8.1"

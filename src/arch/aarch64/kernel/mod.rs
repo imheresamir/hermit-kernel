@@ -137,14 +137,12 @@ pub(crate) fn protect_stack_guards() {
 			flags.normal().writable().execute_disable();
 			// SAFETY: `start`/`end` are linker-provided section bounds; mapping
 			// this VA range identity is what the loader should have done.
-			unsafe {
-				map::<BasePageSize>(
-					VirtAddr::new(start as u64),
-					PhysAddr::new(start as u64),
-					pages,
-					flags,
-				);
-			}
+			map::<BasePageSize>(
+				VirtAddr::new(start as u64),
+				PhysAddr::new(start as u64),
+				pages,
+				flags,
+			);
 			info!(
 				"protect_stack_guards: mapped .exception_slots [{start:#x}, {end:#x}) = {pages} pages"
 			);
@@ -261,7 +259,7 @@ fn linker_supported_cores() -> usize {
 		static __start_exception_stacks: u8;
 		static __end_exception_stacks: u8;
 	}
-	let size = {
+	let size = unsafe {
 		(&__end_exception_stacks as *const u8 as usize)
 			- (&__start_exception_stacks as *const u8 as usize)
 	};

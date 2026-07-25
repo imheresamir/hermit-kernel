@@ -16,7 +16,6 @@
 //! storage, and reuses the slot. The claim flag (`FrameLocation::BeingEvicted`)
 //! serializes the eviction copy with the cross-core wake path.
 
-use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use memory_addresses::VirtAddr;
