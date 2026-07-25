@@ -288,6 +288,22 @@ fn max_bootable_cores() -> usize {
 	1
 }
 
+/// Number of cores this kernel will actually bring up this boot — i.e. the
+/// count `boot_next_processor` PSCI-wakes (and the count `synch_all_cores`
+/// must wait for). Equals `max_bootable_cores()`: the FDT core count clamped
+/// to the linker-stack-supported count. This is the SINGLE source of truth
+/// for "how many cores boot", shared by both the wake path and the barrier so
+/// they can never disagree (a disagreement is exactly the `-smp N` hang:
+/// the barrier waits for N physical cores while only the clamped subset booted).
+#[cfg(feature = "smp")]
+pub fn boot_core_count() -> u32 {
+	max_bootable_cores() as u32
+}
+#[cfg(not(feature = "smp"))]
+pub fn boot_core_count() -> u32 {
+	1
+}
+
 #[cfg(target_os = "none")]
 global_asm!(include_str!("start.s"));
 

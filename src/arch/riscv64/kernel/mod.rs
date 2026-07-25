@@ -55,6 +55,19 @@ pub fn get_processor_count() -> u32 {
 	1
 }
 
+/// Number of cores this kernel will actually bring up this boot. On riscv64
+/// there is no linker-stack clamp, so every detected hart boots; this equals
+/// `get_possible_cpus()`. Shared with `synch_all_cores` so the wake path and
+/// the barrier agree on how many cores to expect.
+#[cfg(feature = "smp")]
+pub fn boot_core_count() -> u32 {
+	get_possible_cpus()
+}
+#[cfg(not(feature = "smp"))]
+pub fn boot_core_count() -> u32 {
+	1
+}
+
 pub fn get_hart_mask() -> u64 {
 	HART_MASK.load(Ordering::Relaxed)
 }

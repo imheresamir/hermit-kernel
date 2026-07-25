@@ -324,12 +324,15 @@ extern "C" fn initd(_arg: usize) {
 fn synch_all_cores() {
 	static CORE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-	CORE_COUNTER.fetch_add(1, Ordering::SeqCst);
-
-	let possible_cpus = kernel::get_possible_cpus();
-	while CORE_COUNTER.load(Ordering::SeqCst) != possible_cpus {
+	let n = CORE_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+	let boot_cores = kernel::boot_core_count();
+	warn!(
+		"[TRACE-SMP] synch_all_cores: core entered n={n} boot_cores={boot_cores} (waiting for all booted cores)"
+	);
+	while CORE_COUNTER.load(Ordering::SeqCst) != boot_cores {
 		spin_loop();
 	}
+	warn!("[TRACE-SMP] synch_all_cores: barrier released (all {boot_cores} booted cores present)");
 }
 
 /// Entry Point of Hermit for the Boot Processor
