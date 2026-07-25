@@ -215,6 +215,15 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		// we want to use sp_el1!
 		"msr spsel, #1",
 
+		// Set exception vector base early (mirrors _start) so any fault in the
+		// AP bring-up below goes to the kernel vector table (start.s) and prints
+		// ESR/FAR/ELR instead of taking the low 0x000 vectors (unmapped) and
+		// dying silently. This is the only way to see WHY a secondary core dies.
+		"adrp x9, {vt}",
+		"add  x9, x9, #:lo12:{vt}",
+		"msr  vbar_el1, x9",
+		"isb",
+
 		// reset thread id registers
 		"msr tpidr_el0, xzr",
 		"msr tpidr_el1, xzr",
@@ -322,6 +331,7 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		exc_start = sym __start_exception_stacks,
 		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (128KiB + GUARD per design §1.1)
 		ap_trace_entry = sym ap_trace_entry,
+		vt = sym hermit_vector_table,
 	)
 }
 
