@@ -107,9 +107,16 @@ impl CoreLocal {
 		// handler work runs on the task's own kernel stack, not here. Sizing is via
 		// link.x + start.rs + core_local.rs + protect_stack_guards (all 128KiB), kept
 		// consistent; do NOT widen one without the other (see OPEN-2 re: measuring depth).
-		// NOTE: the `.exception_stacks` linker section (crates/rs6/link.x) is sized for
-		// MAX_CORES=4 at link time, so `core*stride` stays in-bounds for cores 0..4
-		// WITHOUT any LIEF post-link growth step. The boot path must not depend on LIEF.
+		// NOTE: the `.exception_stacks` linker section (crates/rs6/link.x) is
+		// sized for ONE core by default; the supported core count is DERIVED
+		// at runtime from the section size (mod.rs `linker_supported_cores`)
+		// and clamped against the device tree via `max_bootable_cores()` =
+		// min(dt_cpus, linker_supported_cores). There is NO MAX_CORES
+		// constant anywhere — if the build grows the per-core sections, the
+		// kernel observes the larger size and supports more cores. The boot
+		// path must not depend on LIEF. Cores beyond the supported count are
+		// never PSCI-woken, so their out-of-bounds SP_EL1 is never
+		// dereferenced.
 		let e_top = {
 			let base = &raw const __start_exception_stacks as usize;
 			let stride = DEFAULT_STACK_SIZE + BasePageSize::SIZE as usize;

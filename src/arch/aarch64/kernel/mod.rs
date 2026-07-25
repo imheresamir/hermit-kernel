@@ -179,7 +179,7 @@ pub(crate) fn protect_stack_guards() {
 		crate::config::EXCEPTION_SLOT_SIZE, // per-task scratch slot
 	];
 
-	let n = detected_cores();
+	let n = max_bootable_cores();
 	let guard = BasePageSize::SIZE as u64;
 	info!("protect_stack_guards: n={n} guard_page={guard:#x}");
 
@@ -240,6 +240,56 @@ fn detected_cores() -> usize {
 }
 #[cfg(not(feature = "smp"))]
 fn detected_cores() -> usize {
+	1
+}
+
+/// Maximum number of cores this kernel will actually bring up.
+///
+/// Number of cores the LINKER LAYOUT actually supports for the per-core stack
+/// regions. There is deliberately NO `MAX_CORES` constant anywhere: the linker
+/// lays out exactly one core's worth of stacks by default, and if a build
+/// configures the layout for more cores (growing the `.exception_stacks` /
+/// `.X_stacks` sections), the kernel OBSERVES that larger size here and
+/// automatically supports more cores. We derive the supported count from the
+/// *actual size* of the `.exception_stacks` section divided by the per-core
+/// stride the boot path uses (start.rs `smp_start` SP_EL1 setup, core_local.rs
+/// `e_top`): `DEFAULT_STACK_SIZE + GUARD`. This is the
+/// "num_cpu_cores_supported_by_stacks_configured_by_linker" half of the rule.
+///
+/// SAFETY: `__start_exception_stacks` / `__end_exception_stacks` are absolute
+/// symbols defined by link.x (INSERT AFTER .tbss). They bracket one contiguous
+/// region; reading them as addresses is sound.
+fn linker_supported_cores() -> usize {
+	extern "C" {
+		static __start_exception_stacks: u8;
+		static __end_exception_stacks: u8;
+	}
+	let size = unsafe {
+		(&__end_exception_stacks as *const u8 as usize)
+			- (&__start_exception_stacks as *const u8 as usize)
+	};
+	// Per-core stride in start.rs `smp_start`: DEFAULT_STACK_SIZE (0x20000) + GUARD (0x1000).
+	const PER_CORE_STRIDE: usize = 0x20000 + 0x1000;
+	// Guard against a zero/garbage layout: always at least 1 core.
+	size / PER_CORE_STRIDE.max(1)
+}
+
+/// Boot core count = `min(num_cpu_cores_available_from_fdt,
+/// num_cpu_cores_supported_by_stacks_configured_by_linker)` — i.e. the number
+/// of physical cores the device tree reports, clamped to the number of cores
+/// the stack layout (linker) was configured to support. This is the
+/// `min(available, supported_by_stacks_configured_by_linker)` rule: an
+/// over-provisioned box (more physical cores than the link config sized for)
+/// boots the supported subset; under-provisioned hardware boots every core it
+/// has. Cores beyond the supported count are never PSCI-woken, so their
+/// per-core SP_EL1 (which would index past the stack sections) is never
+/// dereferenced — no crash.
+#[cfg(feature = "smp")]
+fn max_bootable_cores() -> usize {
+	core::cmp::min(get_possible_cpus() as usize, linker_supported_cores()).max(1)
+}
+#[cfg(not(feature = "smp"))]
+fn max_bootable_cores() -> usize {
 	1
 }
 
@@ -350,7 +400,7 @@ pub fn boot_next_processor() {
 	}
 
 	#[cfg(all(target_os = "none", feature = "smp"))]
-	if get_possible_cpus() > 1 {
+	if max_bootable_cores() > 1 {
 		use core::arch::asm;
 		use core::hint::spin_loop;
 
@@ -385,7 +435,14 @@ pub fn boot_next_processor() {
 			let ttbr0_ptr = ptr::with_exposed_provenance_mut(ttbr0_addr.try_into().unwrap());
 			TTBR0.store(ttbr0_ptr, Ordering::Relaxed);
 
-			for cpu_id in 1..get_possible_cpus() {
+			let max_cores = max_bootable_cores();
+			warn!(
+				"[TRACE-SMP] max_bootable_cores={} (dt={}, linker_supported={})",
+				max_cores,
+				get_possible_cpus(),
+				linker_supported_cores()
+			);
+			for cpu_id in 1..max_cores {
 				warn!("[TRACE-SMP] Try to wake-up core {cpu_id} via method={method}");
 
 				if method == "hvc" {
@@ -408,7 +465,7 @@ pub fn boot_next_processor() {
 					cpu_id + 1
 				);
 				// wait for next core
-				while CPU_ONLINE.0.load(Ordering::Relaxed) < cpu_id + 1 {
+				while CPU_ONLINE.0.load(Ordering::Relaxed) < (cpu_id as u32) + 1 {
 					spin_loop();
 				}
 				warn!("[TRACE-SMP] core {cpu_id} online (CPU_ONLINE={})", CPU_ONLINE.0.load(Ordering::Relaxed));
