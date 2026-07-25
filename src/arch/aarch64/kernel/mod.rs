@@ -302,8 +302,11 @@ pub fn boot_processor_init() {
 /// Application Processor initialization
 #[allow(dead_code)]
 pub fn application_processor_init() {
+	warn!("[TRACE-SMP] AP application_processor_init: CoreLocal::install");
 	CoreLocal::install();
+	warn!("[TRACE-SMP] AP application_processor_init: interrupts::init_cpu");
 	interrupts::init_cpu();
+	warn!("[TRACE-SMP] AP application_processor_init: finish_processor_init");
 	finish_processor_init();
 }
 
@@ -330,10 +333,15 @@ fn finish_processor_init() {
 }
 
 pub fn boot_next_processor() {
+	warn!(
+		"[TRACE-SMP] boot_next_processor entered, get_possible_cpus={}",
+		get_possible_cpus()
+	);
 	// This triggers to wake up the next processor (bare-metal/QEMU) or uhyve
 	// to initialize the next processor.
 	#[allow(unused_variables)]
 	let cpu_online = CPU_ONLINE.0.fetch_add(1, Ordering::Release);
+	warn!("[TRACE-SMP] CPU_ONLINE now={}", CPU_ONLINE.0.load(Ordering::Relaxed));
 
 	#[allow(clippy::needless_return)]
 	#[cfg(feature = "uhyve")]
@@ -378,7 +386,7 @@ pub fn boot_next_processor() {
 			TTBR0.store(ttbr0_ptr, Ordering::Relaxed);
 
 			for cpu_id in 1..get_possible_cpus() {
-				debug!("Try to wake-up core {cpu_id}");
+				warn!("[TRACE-SMP] Try to wake-up core {cpu_id} via method={method}");
 
 				if method == "hvc" {
 					// call hypervisor to wakeup next core
@@ -395,10 +403,15 @@ pub fn boot_next_processor() {
 					return;
 				}
 
+				warn!(
+					"[TRACE-SMP] core {cpu_id} wakeup sent, spinning for CPU_ONLINE>={}",
+					cpu_id + 1
+				);
 				// wait for next core
 				while CPU_ONLINE.0.load(Ordering::Relaxed) < cpu_id + 1 {
 					spin_loop();
 				}
+				warn!("[TRACE-SMP] core {cpu_id} online (CPU_ONLINE={})", CPU_ONLINE.0.load(Ordering::Relaxed));
 			}
 		}
 	}

@@ -166,6 +166,16 @@ const fn mair(attr: u64, mt: u64) -> u64 {
 #[cfg(feature = "smp")]
 pub(crate) static TTBR0: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 
+#[cfg(all(target_os = "none", feature = "smp"))]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn ap_trace_entry() {
+	// Called from smp_start (assembly) right before jumping to pre_init,
+	// to confirm the AP survived MMU/paging setup. cpu_id from MPIDR.
+	use aarch64_cpu::registers::{Readable, MPIDR_EL1};
+	let cpu_id = MPIDR_EL1.get() & 0xff;
+	warn!("[TRACE-SMP] AP {cpu_id} smp_start setup done, entering pre_init");
+}
+
 #[cfg(feature = "smp")]
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn smp_start() -> ! {
@@ -299,6 +309,7 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		"and x1, x1, #0xff",
 
 		// Jump to Rust code
+		"bl {ap_trace_entry}",
 		"b {pre_init}",
 
 		mair_el1 = const mair(0x00, MT_DEVICE_nGnRnE) | mair(0x04, MT_DEVICE_nGnRE) | mair(0x0c, MT_DEVICE_GRE) | mair(0x44, MT_NORMAL_NC) | mair(0xff, MT_NORMAL),
@@ -310,6 +321,7 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 		pre_init = sym pre_init,
 		exc_start = sym __start_exception_stacks,
 		exception_stack_size = const DEFAULT_STACK_SIZE,  // SP_EL1=E scratch stack (128KiB + GUARD per design §1.1)
+		ap_trace_entry = sym ap_trace_entry,
 	)
 }
 

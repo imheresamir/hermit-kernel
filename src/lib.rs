@@ -390,9 +390,12 @@ fn boot_processor_main() -> ! {
 
 	#[cfg(not(target_arch = "riscv64"))]
 	scheduler::add_current_core();
+	warn!("[TRACE-SMP] add_current_core done, core_id={}", crate::core_id());
 	interrupts::enable();
+	warn!("[TRACE-SMP] IRQs enabled, calling boot_next_processor");
 
 	kernel::boot_next_processor();
+	warn!("[TRACE-SMP] boot_next_processor returned");
 
 	#[cfg(feature = "smp")]
 	synch_all_cores();
@@ -410,13 +413,16 @@ fn boot_processor_main() -> ! {
 /// Entry Point of Hermit for an Application Processor
 #[cfg(all(target_os = "none", feature = "smp"))]
 fn application_processor_main() -> ! {
+	warn!("[TRACE-SMP] AP entering application_processor_main, cpu_id={}", crate::core_id());
 	kernel::application_processor_init();
+	warn!("[TRACE-SMP] AP application_processor_init done, cpu_id={}", crate::core_id());
 	#[cfg(not(target_arch = "riscv64"))]
 	scheduler::add_current_core();
+	warn!("[TRACE-SMP] AP add_current_core done, cpu_id={}", crate::core_id());
 	interrupts::enable();
+	warn!("[TRACE-SMP] AP IRQs enabled, calling boot_next_processor, cpu_id={}", crate::core_id());
 	kernel::boot_next_processor();
-
-	debug!("Entering idle loop for application processor");
+	warn!("[TRACE-SMP] AP boot_next_processor returned, cpu_id={}", crate::core_id());
 
 	synch_all_cores();
 	executor::init();
