@@ -427,7 +427,14 @@ impl PerCoreScheduler {
 	#[inline]
 	pub fn handle_waiting_tasks(&mut self) {
 		without_interrupts(|| {
-			crate::executor::run();
+			// M8.4 INV-R8.1: the executor drain is the I/O core's (core 0)
+			// reactor job. Compute cores must NOT drain here — that is
+			// decoupled by M8.2 (migrate_waiting_tasks). Until M8.2 lands,
+			// gate the drain to the I/O core so the reactor remains the
+			// sole drainer.
+			if crate::core_id() == 0 {
+				crate::executor::run();
+			}
 			self.blocked_tasks
 				.handle_waiting_tasks(&mut self.ready_queue);
 		});
@@ -783,8 +790,21 @@ impl PerCoreScheduler {
 			let core_scheduler = core_scheduler();
 			interrupts::disable();
 
-			// run async tasks
-			crate::executor::run();
+			// M8.4 (reactor, irq-handling-architecture.md "Core-role model"):
+			// ONLY the I/O core (core 0) drains the async executor. Compute
+			// cores defer all executor work to core 0's reactor loop (the
+			// "defer, don't relocate" contract) so tens of KB of async frames
+			// never land on a compute core's path. On a single-core (non-SMP)
+			// build core 0 is the only core, so this is behavior-preserving.
+			// INV-R8.1: executor::run() is drained ONLY on the I/O core.
+			if crate::core_id() == 0 {
+				debug_assert!(
+					crate::core_id() == 0,
+					"executor::run() drained off the I/O core violates M8.4 INV-R8.1"
+				);
+				// run async tasks
+				crate::executor::run();
+			}
 
 			// do housekeeping
 			#[cfg(feature = "smp")]
@@ -955,7 +975,13 @@ impl PerCoreScheduler {
 	/// stack E path — Part B defers executor work to the reactor).
 	pub fn scheduler(&mut self, drain_exec: bool) -> Option<*mut usize> {
 		// run background tasks (deferred off E by the IRQ path)
-		if drain_exec {
+		// M8.4 INV-R8.1: only the I/O core (core 0) drains the executor;
+		// on compute cores drop drain_exec to honor the reactor contract.
+		if drain_exec && crate::core_id() == 0 {
+			debug_assert!(
+				crate::core_id() == 0,
+				"scheduler(drain_exec=true) off the I/O core violates M8.4 INV-R8.1"
+			);
 			crate::executor::run();
 		}
 
