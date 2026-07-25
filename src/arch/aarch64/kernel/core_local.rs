@@ -245,6 +245,16 @@ pub(crate) fn core_scheduler() -> &'static mut PerCoreScheduler {
 	unsafe { CoreLocal::get().scheduler.get().as_mut().unwrap() }
 }
 
+/// Non-panicking variant of [`core_scheduler`] for exception / diagnostic
+/// paths that can legitimately run BEFORE the per-core scheduler is installed
+/// (early boot). `core_scheduler()`'s unwrap turns any pre-scheduler fault
+/// into a recursive panic loop (panic -> re-fault -> panic) that destroys the
+/// original diagnostics; fault handlers must use this and degrade gracefully.
+#[inline]
+pub(crate) fn try_core_scheduler() -> Option<&'static mut PerCoreScheduler> {
+	unsafe { CoreLocal::get().scheduler.get().as_mut() }
+}
+
 pub(crate) fn ex() -> &'static StaticLocalExecutor<RawSpinMutex, RawRwSpinLock> {
 	&CoreLocal::get().ex
 }

@@ -14,7 +14,7 @@ use hashbrown::HashMap;
 use hermit_sync::{InterruptSpinMutex, InterruptTicketMutex, OnceCell, SpinMutex};
 use memory_addresses::{PhysAddr, VirtAddr};
 
-use crate::arch::aarch64::kernel::core_local::{core_id, core_scheduler, increment_irq_counter, CoreLocal};
+use crate::arch::aarch64::kernel::core_local::{core_id, core_scheduler, increment_irq_counter, try_core_scheduler, CoreLocal};
 use crate::arch::aarch64::kernel::scheduler::State;
 use crate::scheduler::task::FrameLocation;
 use crate::arch::aarch64::kernel::serial::handle_uart_interrupt;
@@ -40,7 +40,11 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 	// Only capture task 1's frames (the faulting app task). The first
 	// exceptions during boot belong to the idle task and would exhaust the
 	// limit before task 1 runs.
-	let tid = core_scheduler().get_current_task_id();
+	// Diagnostic path: may run pre-scheduler (early boot). Bail instead of
+	// panicking via core_scheduler()'s unwrap.
+	let Some(tid) = try_core_scheduler().map(|s| s.get_current_task_id()) else {
+		return;
+	};
 	// Only capture task 1's frames (the faulting app task, "thread 'main' (1)").
 	// `TaskId`'s inner field is private, so compare via its Display form.
 	if format!("{}", tid) != "1" {
@@ -140,7 +144,11 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 /// finds 0x60000207 in an x-slot, so it cannot flood the log.
 #[allow(dead_code)]
 unsafe fn check_resume_x0(state: &State) {
-	let tid = core_scheduler().get_current_task_id();
+	// Diagnostic path: may run pre-scheduler (early boot). Bail instead of
+	// panicking via core_scheduler()'s unwrap.
+	let Some(tid) = try_core_scheduler().map(|s| s.get_current_task_id()) else {
+		return;
+	};
 	if format!("{}", tid) != "1" {
 		return;
 	}
@@ -817,11 +825,17 @@ const _: () = {
 };
 
 #[unsafe(no_mangle)]
-pub(crate) extern "C" fn do_double_fault(state: &State, bad_sp: u64, flavor: u64) -> ! {
+pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u64) -> ! {
 	let esr = ESR_EL1.get();
 	let far = FAR_EL1.get();
 	let elr = ELR_EL1.get();
-	let tid = core_scheduler().get_current_task_id();
+	// DEFENSIVE: a double fault can fire before the per-core scheduler is
+	// installed (early boot). `core_scheduler()` unwraps and would panic
+	// BEFORE any diagnostics print — losing the entire dump. Use the
+	// non-panicking accessor and degrade to task=None instead. (Found via the
+	// Phase 5 injection harness: the boot-time udf injection panicked at
+	// core_local.rs:245 with zero [DOUBLE-FAULT] output.)
+	let tid = try_core_scheduler().map(|s| s.get_current_task_id());
 	error!("============================================================");
 	error!("[DOUBLE-FAULT] task={tid:?} flavor={flavor}");
 	error!("  bad SP_EL1    = {bad_sp:#x}");

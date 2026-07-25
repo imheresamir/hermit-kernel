@@ -1134,7 +1134,17 @@ fn get_tid() -> TaskId {
 
 #[inline]
 pub(crate) fn abort() -> ! {
-	core_scheduler().exit(-1)
+	// Fail-stop must actually STOP. Pre-scheduler (early boot) there is no
+	// task to exit: core_scheduler()'s unwrap would panic, and the panic
+	// path re-faults without a scheduler -> infinite panic loop that drowns
+	// the original diagnostics (observed via the Phase 5 double-fault
+	// injection harness). Degrade to a hard CPU halt instead.
+	match try_core_scheduler() {
+		Some(s) => s.exit(-1),
+		None => loop {
+			crate::arch::kernel::processor::halt();
+		},
+	}
 }
 
 /// Add a per-core scheduler for the current core.

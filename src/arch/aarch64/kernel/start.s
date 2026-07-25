@@ -183,7 +183,10 @@ b       do_bad_mode
 	mov  x0, sp
 	// a0 = state (frame). The bad SP_EL1 was stored into the frame's x1 slot
 	// by trap_entry; reload it as a1 (x1). flavor is a2 (x2).
-	ldr  x1, [x0, #0x8]              // a1 = bad SP_EL1 (frame x1 slot)
+	// Frame layout (trap_entry): +0 spsel, +8 elr, +16 spsr, +24 sp_el0,
+	// +32 tpidr, +40 x0, +48 x1, +56 x2, ... — x1 slot is +0x30.
+	// (R5.1: was 0x8, which is the ELR slot — harness caught the mislabel.)
+	ldr  x1, [x0, #0x30]             // a1 = bad SP_EL1 (frame x1 slot)
 	mov  x2, #\flavor                // a2 = flavor
 	bl   do_double_fault             // -> ! (never returns)
 .endm
@@ -220,6 +223,36 @@ b       do_bad_mode
  */
 .align 6
 el1_sync:
+	// Phase 5 injection harness (feature "double-fault-injection"): redirect
+	// SP_EL1 to INSIDE the current slot's danger window so the REAL
+	// df_check_el1h predicate below trips and routes to do_double_fault. This
+	// exercises the genuine NEW-4 path (not a synthetic bl), proving the EL1h
+	// danger-window detection actually fires on a real exception. The redirect
+	// lands SP_EL1 at slot_top - 0xF000, inside df_check_el1h's window
+	// [slot_top - 0x11000, slot_top - 0xD000) (delta = 0x2000, caught by the
+	// `delta < 0x4000` check). It must run BEFORE df_check_el1h, which reads
+	// SP_EL1. This block is compiled ONLY with the `double-fault-injection`
+	// feature (DF_INJECT_ON is `.set` in the global_asm! concat in mod.rs).
+	//
+	// ONE-SHOT BY EXCEPTION IDENTITY: only the injected `udf #0` (ESR EC==0x00,
+	// "unknown instruction") is redirected. Any other exception — including a
+	// re-fault from do_double_fault's own logging — is left untouched, so the
+	// harness cannot recurse. (We cannot use a cross-language Rust flag here:
+	// the asm `adrp`/GOT access to a `static` read 0 at EL1; gating on the
+	// uniquely-identifiable udf ESR is the robust, side-effect-free alternative.)
+	.if DF_INJECT_ON
+	mrs  x9, esr_el1
+	ubfx x9, x9, #26, #6            // extract ESR EC[31:26]
+	// 0x00 = unknown instruction (our injected `udf #0`). Any other EC
+	// (e.g. the re-fault from logging) is NOT redirected.
+	cmp  x9, #0x00
+	b.ne 1f
+	mrs  x11, tpidr_el1           // &CoreLocal
+	ldr  x11, [x11, #24]          // scratch_slot (slot top)
+	sub  x11, x11, #0xF, lsl #12  // slot_top - 0xF000 (inside danger window)
+	mov  sp, x11                  // SP_EL1 now in the slot danger window
+1:
+	.endif
 	// Phase 4: double-fault check FIRST (before trap_entry pushes 288 B onto
 	// a possibly-bad stack). EL1h source: danger-window predicate.
 	df_check_el1h 0

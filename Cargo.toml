@@ -52,6 +52,17 @@ default = [
 	"virtio-vsock",
 ]
 
+## Phase 5 overflow-injection harness (option-d-per-task-slot-rebased.md §6.1).
+##
+## Arms DF_INJECT_ARMED at boot and triggers a REAL sync exception so the
+## genuine NEW-4 `df_check_el1h` danger-window predicate trips and routes to
+## `do_double_fault` (fail-stop with diagnostics). This is the standing M2/M3/M4
+## regression test — it PROVES the double-fault detection actually fires on a
+## real exception, not just that the asm links. The asm redirect in start.s is
+## always compiled but INERT unless this flag is set, so production kernels
+## (without this feature) never trigger it. Keep this feature-flagged, do NOT
+## delete — it is the regression harness for the slot-safety milestones.
+double-fault-injection = []
 #! ### Syscall Features
 
 ## Enables multiple address spaces.

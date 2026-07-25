@@ -307,7 +307,12 @@ pub fn boot_core_count() -> u32 {
 }
 
 #[cfg(target_os = "none")]
-global_asm!(include_str!("start.s"));
+#[cfg(feature = "double-fault-injection")]
+global_asm!(concat!(".set DF_INJECT_ON, 1\n", include_str!("start.s")));
+
+#[cfg(target_os = "none")]
+#[cfg(not(feature = "double-fault-injection"))]
+global_asm!(concat!(".set DF_INJECT_ON, 0\n", include_str!("start.s")));
 
 #[cfg(feature = "smp")]
 pub fn get_possible_cpus() -> u32 {
@@ -360,6 +365,33 @@ pub fn boot_processor_init() {
 	EARLY_SMP_RELEASE.0.store(1, Ordering::Release);
 	// Wake cores parked in `wfe`.
 	unsafe { core::arch::asm!("sev", options(nostack, nomem)) };
+
+	// Phase 5 overflow-injection self-test (feature "double-fault-injection",
+	// option-d-per-task-slot-rebased.md §6.1 / M3). Emits a `udf #0`
+	// (permanent undefined instruction) to take a genuine sync abort into
+	// el1_sync. Under the feature, the asm redirect (gated by DF_INJECT_ON in
+	// start.s) has already forced SP_EL1 into the current slot's danger
+	// window, so the genuine NEW-4 df_check_el1h predicate trips and routes to
+	// do_double_fault (fail-stop with diagnostics). This is the standing
+	// M2/M3/M4 regression harness — it proves the double-fault detection fires
+	// on a REAL exception, not just that the asm links. If wired correctly the
+	// kernel prints "[DOUBLE-FAULT]" and aborts; a missing/broken redirect
+	// would instead fall through to do_sync's normal undefined-instruction
+	// handling (which panics at core_local.rs:245 because the scheduler is not
+	// yet fully installed at this early boot point — that panic is the
+	// regression FAILURE signal).
+	#[cfg(feature = "double-fault-injection")]
+	{
+		info!("[DF-INJECT] triggering double-fault injection harness");
+		// REAL sync exception into el1_sync with SP_EL1 in the danger window.
+		unsafe {
+			core::arch::asm!("udf #0", options(nomem, nostack));
+		}
+		// Unreachable: do_double_fault -> scheduler::abort() -> ! .
+		// If we return here, the harness did NOT trip (regression failure).
+		error!("[DF-INJECT] FATAL: double-fault harness did NOT fire — NEW-4 broken");
+		crate::scheduler::abort()
+	}
 }
 
 /// Application Processor initialization
