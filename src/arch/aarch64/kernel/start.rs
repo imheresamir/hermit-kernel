@@ -209,6 +209,13 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 	const SCTLR_EL1: u64 = 0b111_0000_0101_1101_0000_0001_1101;
 
 	naked_asm!(
+		// [TRACE-SMP] RAW UART probe 'Z': AP entered smp_start. No stack/MMU
+		// needed (PSCI secondary entry = MMU off, identity-mapped). If this
+		// char appears, the AP reached smp_start at all.
+		"mov x20, #0x1000",
+		"movz w21, #0x5a",   // 'Z'
+		"str w21, [x20]",
+
 		// disable interrupts
 		"msr daifset, #0b111",
 
@@ -311,6 +318,13 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 
 		"ldr x0, ={sctlr_el1}",
 		"msr sctlr_el1, x0",
+
+		// [TRACE-SMP] RAW UART probe 'Y': AP survived MMU off/on + SP_EL1
+		// setup, about to call ap_trace_entry (the first Rust/VA call). If 'Z'
+		// printed but 'Y' didn't, the AP died in the MMU/stack window above.
+		"mov x20, #0x1000",
+		"movz w21, #0x59",   // 'Y'
+		"str w21, [x20]",
 
 		// initialize argument for pre_init
 		"mov x0, xzr",
