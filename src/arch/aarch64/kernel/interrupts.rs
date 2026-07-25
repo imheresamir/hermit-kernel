@@ -773,6 +773,67 @@ pub(crate) extern "C" fn do_error(_state: &State, sp_el1: u64) -> ! {
 	scheduler::abort()
 }
 
+/// Phase 4 double-fault handler (option-d-per-task-slot-rebased.md §5 / NEW-4).
+///
+/// Called from the vector-entry prologue (`df_fatal` in start.s) when the
+/// double-fault predicate trips BEFORE `trap_entry` pushes a frame — i.e. the
+/// interrupted context was already on the wrong/overflowing stack and pushing
+/// 288 bytes there would corrupt it. The prologue has already:
+///   - switched `sp` to the single `.overflow_stacks` rescue block (top),
+///   - stored the original task `x0` in TPIDRRO_EL0 (restored into the frame),
+///   - run `trap_entry`, so `state` is a normal trap frame on the rescue stack
+///     (with `state.sp` = the ORIGINAL bad SP_EL1, captured as x1),
+///   - set `x2 = flavor` (0=el1h_sync, 1=el1h_error, 2=el1t_sync, 3=el1t_error).
+///
+/// We print ESR/FAR/ELR + the bad SP + flavor, then fail-stop (spin/reset).
+/// We do NOT attempt recovery — a nested/overflowing handler cannot be safely
+/// unwound (avoids a recursive fault storm).
+///
+/// Compile-time cross-check: the immediates the asm depends on must match
+/// config.rs. If someone changes a stack size without updating start.s, this
+/// const-block fails at compile time (R4.4 — the corollary of NEW-4).
+const _: () = {
+	use crate::config::{EXCEPTION_SLOT_SIZE, EXCEPTION_SLOT_GUARD, KERNEL_STACK_SIZE};
+	// df_check_el1h: slot_top - (EXCEPTION_SLOT_SIZE + EXCEPTION_SLOT_GUARD) = guard base
+	assert!(
+		(EXCEPTION_SLOT_SIZE + EXCEPTION_SLOT_GUARD) == 0x11000,
+		"start.s df_check_el1h expects slot stride 0x11000"
+	);
+	// df_check_el1h danger window: GUARD + MARGIN (0x1000 + 0x3000 = 0x4000)
+	assert!(
+		(EXCEPTION_SLOT_GUARD + 0x3000) == 0x4000,
+		"start.s df_check_el1h expects danger window 0x4000"
+	);
+	// df_fatal: .overflow_stacks stride == KERNEL_STACK_SIZE + GUARD(0x1000)
+	assert!(
+		(KERNEL_STACK_SIZE + 0x1000) == 0x9000,
+		"start.s df_fatal expects .overflow_stacks stride 0x9000"
+	);
+	// df_fatal: rescue top offset == KERNEL_STACK_SIZE
+	assert!(
+		KERNEL_STACK_SIZE == 0x8000,
+		"start.s df_fatal expects .overflow_stacks top at KERNEL_STACK_SIZE"
+	);
+};
+
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn do_double_fault(state: &State, bad_sp: u64, flavor: u64) -> ! {
+	let esr = ESR_EL1.get();
+	let far = FAR_EL1.get();
+	let elr = ELR_EL1.get();
+	let tid = core_scheduler().get_current_task_id();
+	error!("============================================================");
+	error!("[DOUBLE-FAULT] task={tid:?} flavor={flavor}");
+	error!("  bad SP_EL1    = {bad_sp:#x}");
+	error!("  ESR_EL1       = {esr:#x}");
+	error!("  FAR_EL1       = {far:#x}");
+	error!("  ELR_EL1       = {elr:#x}");
+	error!("  slot top      = {:#x}", CoreLocal::get().scratch_slot());
+	error!("  (exception taken while already on a slot / slot overflow)");
+	error!("============================================================");
+	scheduler::abort()
+}
+
 /// Send a Software Generated Interrupt to a specific core.
 ///
 /// Bypasses the arm-gic crate's `GicCpuInterface::send_sgi()` which has an ABI bug:

@@ -131,10 +131,98 @@ b       do_bad_mode
 .endm
 
 /*
+ * Phase 4 double-fault detection (option-d-per-task-slot-rebased.md §5 / NEW-4).
+ *
+ * Runs at vector entry BEFORE trap_entry, so a bad/overflowing stack is caught
+ * BEFORE we push 288 bytes onto it. The two vector families need DIFFERENT
+ * predicates (R4.1 lesson — vector selection encodes the interrupted stack):
+ *
+ *   - el1_sp0_* (exception from EL1t; interrupted context on SP_EL0): the D4
+ *     tail staged SP_EL1 = the current task's scratch slot, so SP_EL1 MUST
+ *     equal CoreLocal.scratch_slot exactly. Mismatch = D4 tail bypassed or
+ *     nested during the tail itself -> fatal (df_check_el1t).
+ *
+ *   - el1_sync/el1_error (exception from EL1h; interrupted context ON SP_EL1):
+ *     sp is a live kernel/handler stack; equality with scratch_slot is the
+ *     WRONG predicate. The fatal signal is sp inside the CURRENT SLOT's danger
+ *     window [slot_bottom - GUARD, slot_bottom + MARGIN): a handler running on
+ *     the slot has overflowed (sp in the guard) or is about to (the next
+ *     handler chain won't fit) (df_check_el1h). Kernel stacks live in other
+ *     sections and can never land in this window.
+ *
+ * Scratch discipline: every GPR is live pre-trap_entry. x0 is stashed in
+ * TPIDRRO_EL0 (unused by kernel & newlib TLS — they use tpidr_el0/tpidr_el1).
+ * The check touches memory exactly once (ldr from CoreLocal, always mapped),
+ * so the prologue itself cannot fault. DAIF is masked at entry.
+ *
+ * Immediates are cross-checked at compile time in interrupts.rs (DF_* consts):
+ *   0x11000 = EXCEPTION_SLOT_SIZE + EXCEPTION_SLOT_GUARD (slot-top -> guard base)
+ *   0x4000  = EXCEPTION_SLOT_GUARD + DF_SLOT_MARGIN danger window
+ *   0x9000  = KERNEL_STACK_SIZE + guard  (.overflow_stacks per-core stride)
+ *   0x8000  = KERNEL_STACK_SIZE          (.overflow_stacks top offset)
+ *
+ * Fatal landing (df_fatal): switch sp to this core's .overflow_stacks tier
+ * (MPIDR Aff0-indexed — a runaway task cannot consume its own rescue stack),
+ * rebuild a normal trap frame there, and call do_double_fault (-> !).
+ * ORIGINAL x1 IS SACRIFICED in the fatal path to carry the bad SP_EL1 into
+ * the frame/handler (x2's original value IS preserved in the frame; the
+ * diagnosis lives in ESR/FAR/ELR + the bad SP, not in x1).
+ */
+.macro df_fatal spsel, flavor
+	// __start_overflow_stacks is a SINGLE (one-core) rescue block in link.x
+	// (== KERNEL_STACK_SIZE + GUARD = 0x9000). Land at its top. No core
+	// indexing: this is a halt path, so there is no "own stack" to avoid
+	// (and indexing would walk past the 1-core section on core>=1).
+	adrp x0, __start_overflow_stacks
+	add  x0, x0, #:lo12:__start_overflow_stacks
+	add  x0, x0, #0x8, lsl #12       // + KERNEL_STACK_SIZE = rescue top
+	mov  x1, sp                      // x1 = the BAD SP_EL1 (for diagnostics)
+	mov  sp, x0                      // land on the rescue stack
+	mrs  x0, tpidrro_el0             // restore the task's original x0
+	trap_entry \spsel                // frame on rescue stack (x1 slot = bad sp)
+	mov  x0, sp
+	// a0 = state (frame). The bad SP_EL1 was stored into the frame's x1 slot
+	// by trap_entry; reload it as a1 (x1). flavor is a2 (x2).
+	ldr  x1, [x0, #0x8]              // a1 = bad SP_EL1 (frame x1 slot)
+	mov  x2, #\flavor                // a2 = flavor
+	bl   do_double_fault             // -> ! (never returns)
+.endm
+
+.macro df_check_el1t flavor
+	msr  tpidrro_el0, x0
+	mrs  x0, tpidr_el1               // &CoreLocal
+	ldr  x0, [x0, #24]               // scratch_slot (slot top; offset 24 = E1)
+	cmp  sp, x0                      // EL1t source: SP_EL1 MUST == slot top
+	b.ne 9f
+	mrs  x0, tpidrro_el0             // ok: restore and fall through
+	b    8f
+9:	df_fatal 0, \flavor
+8:
+.endm
+
+.macro df_check_el1h flavor
+	msr  tpidrro_el0, x0
+	mrs  x0, tpidr_el1               // &CoreLocal
+	ldr  x0, [x0, #24]               // scratch_slot (slot top)
+	sub  x0, x0, #0x11, lsl #12      // slot_bottom - GUARD (top - 0x11000)
+	sub  x0, sp, x0                  // delta = sp - guard_base (unsigned)
+	cmp  x0, #0x4, lsl #12           // delta < 0x4000 (GUARD 0x1000 + MARGIN 0x3000)?
+	b.lo 9f                          // -> sp in guard or about to blow the slot
+	mrs  x0, tpidrro_el0             // ok: restore and fall through
+	b    8f
+9:	df_fatal 1, \flavor
+8:
+.endm
+
+
+/*
  * SYNC exception handler.
  */
 .align 6
 el1_sync:
+	// Phase 4: double-fault check FIRST (before trap_entry pushes 288 B onto
+	// a possibly-bad stack). EL1h source: danger-window predicate.
+	df_check_el1h 0
 	// No pool-select block: trap_entry builds the 288-byte frame on the
 	// task's scratch_slot (staged by the D4 tail), identical to el1_irq/fiq.
 	// Capture entry SP_EL1 for the NEW-1 assert WITHOUT clobbering any task
@@ -237,6 +325,8 @@ el1_fiq:
 
 .align 6
 el1_error:
+	// Phase 4: double-fault check FIRST (EL1h source: danger-window predicate).
+	df_check_el1h 1
 	// No pool-select; trap_entry builds the frame on the task's scratch_slot.
 	// Capture entry SP_EL1 as frame_base+288 AFTER trap_entry (do NOT clobber
 	// task x1 before trap_entry; `mrs sp_el1` UNDEFINED at EL1). See el1_sync.
@@ -259,6 +349,8 @@ el1_error:
 .align 6
 el1_sp0_sync:
       msr spsel, #1            // select SP_EL1 (staged = task's scratch_slot by D4 tail)
+      // Phase 4: EL1t source — SP_EL1 must EQUAL the task's scratch slot.
+      df_check_el1t 2
       trap_entry 0
       mov     x0, sp
       add     x1, sp, #288     // NEW-1: entry SP_EL1 = frame_base + 288 (see el1_sync)
@@ -347,6 +439,8 @@ el1_sp0_fiq:
 .align 6
 el1_sp0_error:
       msr spsel, #1            // select SP_EL1 (staged = task's scratch_slot by D4 tail)
+      // Phase 4: EL1t source — SP_EL1 must EQUAL the task's scratch slot.
+      df_check_el1t 3
       trap_entry 0
       mov     x0, sp
       add     x1, sp, #288     // NEW-1: entry SP_EL1 = frame_base + 288 (see el1_sync)
