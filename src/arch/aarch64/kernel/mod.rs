@@ -227,27 +227,48 @@ fn detected_cores() -> usize {
 /// configures the layout for more cores (growing the `.exception_stacks` /
 /// `.X_stacks` sections), the kernel OBSERVES that larger size here and
 /// automatically supports more cores. We derive the supported count from the
-/// *actual size* of the `.exception_stacks` section divided by the per-core
-/// stride the boot path uses (start.rs `smp_start` SP_EL1 setup, core_local.rs
-/// `e_top`): `DEFAULT_STACK_SIZE + GUARD`. This is the
-/// "num_cpu_cores_supported_by_stacks_configured_by_linker" half of the rule.
+/// *actual size* of the `.exception_slots` section — the section the per-task
+/// slot pool actually indexes (slot_pool.rs `slot_top`) — divided by the
+/// per-core stride `SLOTS_PER_CORE * (EXCEPTION_SLOT_SIZE +
+/// EXCEPTION_SLOT_GUARD)`, all from config.rs (single source of truth; §7.2(b)).
+/// Growing `.exception_slots` in the LIEF patcher is then the ONLY change needed
+/// for more cores: the derivation, the slot pool, and protect_stack_guards all
+/// read the same section with the same config stride.
+/// This is the "num_cpu_cores_supported_by_stacks_configured_by_linker" half of
+/// the min() rule.
 ///
-/// SAFETY: `__start_exception_stacks` / `__end_exception_stacks` are absolute
+/// SAFETY: `__start_exception_slots` / `__end_exception_slots` are absolute
 /// symbols defined by link.x (INSERT AFTER .tbss). They bracket one contiguous
 /// region; reading them as addresses is sound.
 fn linker_supported_cores() -> usize {
 	unsafe extern "C" {
-		static __start_exception_stacks: u8;
-		static __end_exception_stacks: u8;
+		static __start_exception_slots: u8;
+		static __end_exception_slots: u8;
 	}
 	let size = unsafe {
-		(&__end_exception_stacks as *const u8 as usize)
-			- (&__start_exception_stacks as *const u8 as usize)
+		(&__end_exception_slots as *const u8 as usize)
+			- (&__start_exception_slots as *const u8 as usize)
 	};
-	// Per-core stride in start.rs `smp_start`: DEFAULT_STACK_SIZE (0x20000) + GUARD (0x1000).
-	const PER_CORE_STRIDE: usize = 0x20000 + 0x1000;
+	// NEW-2 (compile-time): the per-core stride is derived ONLY from config
+	// consts. The guard tail must be exactly the one page protect_stack_guards
+	// unmaps per slot element — a drift here silently shifts every slot top.
+	const SLOT_STRIDE: usize = EXCEPTION_SLOT_SIZE + EXCEPTION_SLOT_GUARD;
+	const PER_CORE_STRIDE: usize = SLOTS_PER_CORE * SLOT_STRIDE;
+	const _: () = assert!(
+		EXCEPTION_SLOT_GUARD == BasePageSize::SIZE as usize,
+		"EXCEPTION_SLOT_GUARD must equal one base page: protect_stack_guards unmaps exactly one page per slot element"
+	);
+	let cores = size / PER_CORE_STRIDE;
+	// NEW-3 (runtime): the section must be an EXACT multiple of the per-core
+	// stride. A remainder means link.x (or the LIEF patcher) grew the section
+	// with a different slot size/count than config.rs — the slot pool would
+	// index past the section or leave dead tail bytes that LOOK like a core.
+	assert!(
+		size % PER_CORE_STRIDE == 0,
+		".exception_slots size {size:#x} is not a multiple of the per-core stride {PER_CORE_STRIDE:#x} (SLOTS_PER_CORE * (EXCEPTION_SLOT_SIZE + GUARD)) — link.x/LIEF layout disagrees with config.rs"
+	);
 	// Guard against a zero/garbage layout: always at least 1 core.
-	size / PER_CORE_STRIDE.max(1)
+	cores.max(1)
 }
 
 /// Boot core count = `min(num_cpu_cores_available_from_fdt,
