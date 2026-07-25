@@ -50,25 +50,6 @@ pub(crate) static CURRENT_STACK_ADDRESS: AtomicPtr<u8> = AtomicPtr::new(ptr::nul
 #[unsafe(link_section = ".early_data")]
 pub(crate) static EARLY_SMP_RELEASE: AlignedAtomicU32 = AlignedAtomicU32(AtomicU32::new(0));
 
-/// Emergency exception stack pool used very early on aarch64.
-///
-/// Design:
-/// - **Early boot** uses a small fixed pool of stacks in `.early_data` that is
-///   guaranteed mapped. This avoids recursive exception storms if `sp` is invalid.
-/// - **Later boot** should switch to real per-core exception stacks stored in
-///   core-local state once the allocator/paging are fully initialized.
-///
-/// For now we keep only the early pool (64 stacks). This keeps `.early_data`
-/// bounded and avoids scaling the image size linearly with core count.
-pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_SIZE: usize = 64 * 1024;
-pub(crate) const HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE: usize = 64;
-
-#[unsafe(link_section = ".early_data")]
-#[unsafe(no_mangle)]
-pub(crate) static mut HERMIT_EARLY_EXCEPTION_STACK_POOL: [u8;
-	HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE] =
-	[0; HERMIT_EARLY_EXCEPTION_STACK_POOL_SIZE * HERMIT_EARLY_EXCEPTION_STACK_SIZE];
-
 /// Unmap the per-core stack guard pages so a stack overflow faults (translation
 /// fault → el1_sync prints ESR/FAR/ELR) instead of silently corrupting the
 /// adjacent stack section.

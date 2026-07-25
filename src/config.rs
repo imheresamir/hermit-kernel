@@ -22,8 +22,7 @@ pub(crate) const ARCH_STATE_SIZE: usize = 288;
 /// core_scheduler + a possible nested switch). A debug-build `do_sync` prologue
 /// alone reserves ~0x25a0 B (stack-clash probed), which blew the old 0x2000
 /// slot straight through the lower guard (data abort at slot_base-0x2010).
-/// Size it like the old shared per-core E / HERMIT_EARLY_EXCEPTION_STACK_POOL:
-/// 64 KiB.
+/// Size it like the old shared per-core exception stack (E): 64 KiB.
 pub const EXCEPTION_SLOT_SIZE: usize = 0x10000;
 // Invariant guards (R3/R4): these catch (a) the page-aliasing bug (body page ==
 // guard page) and (b) an UNDERSIZED slot that cannot hold the exception-handler

@@ -14,8 +14,9 @@ use hashbrown::HashMap;
 use hermit_sync::{InterruptSpinMutex, InterruptTicketMutex, OnceCell, SpinMutex};
 use memory_addresses::{PhysAddr, VirtAddr};
 
-use crate::arch::aarch64::kernel::core_local::{core_id, core_scheduler, increment_irq_counter};
+use crate::arch::aarch64::kernel::core_local::{core_id, core_scheduler, increment_irq_counter, CoreLocal};
 use crate::arch::aarch64::kernel::scheduler::State;
+use crate::scheduler::task::FrameLocation;
 use crate::arch::aarch64::kernel::serial::handle_uart_interrupt;
 use crate::arch::aarch64::mm::paging::{self, BasePageSize, PageSize, PageTableEntryFlags};
 use crate::drivers::InterruptHandlerMap;
@@ -334,7 +335,37 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 }
 
 #[unsafe(no_mangle)]
-pub(crate) extern "C" fn do_sync(state: &State) {
+pub(crate) extern "C" fn do_sync(state: &State, sp_el1: u64) {
+	// NEW-1 (option-d-per-task-slot-rebased.md §10): for exceptions taken from
+	// EL0t/EL1t (the interrupted context ran on SP_EL0), the D4 tail staged
+	// SP_EL1 = the current task's scratch slot, so the trap frame must land there.
+	// For exceptions taken from EL1h (the interrupted context ran ON SP_EL1 — a
+	// kernel/handler stack, e.g. the C-runtime .init_array ctor walk), SP_EL1 is
+	// the live kernel stack by design (same rule as the D4 tail's `tst x20,#1`
+	// gate and el1_irq/el1_fiq). The slot invariant does NOT apply there.
+	//   Gate on SPSR_EL1.M[0] (SPSEL bit): 0 => EL0t/EL1t, 1 => EL1h.
+	// When the invariant applies, check BOTH:
+	//   (a) ground truth — entry SP_EL1 (captured by `mov x1, sp` in el1_sync
+	//       before trap_entry) equals the task's scratch_slot. If not, the frame
+	//       landed on a shared/foreign stack (pool-select re-added? D4 tail
+	//       bypassed?). This is the check that actually matters.
+	//   (b) metadata — current task's frame_location == InSlot. Can lie under the
+	//       ensure_slot pool-exhaustion fallback (§1.5): a task whose slot was NOT
+	//       acquired keeps the default InSlot from Task::new() while its frame sits
+	//       on the kernel stack. (a) catches that; (b) is consistency only.
+	let from_el1h = (SPSR_EL1.get() & 1) == 1;
+	if !from_el1h {
+		let scratch = CoreLocal::get().scratch_slot();
+		assert_eq!(
+			sp_el1, scratch,
+			"do_sync: entry SP_EL1 ({sp_el1:#x}) != CoreLocal.scratch_slot ({scratch:#x}) — frame not on task's slot (pool-select re-added? D4 tail bypassed?)"
+		);
+		assert_eq!(
+			core_scheduler().get_current_task_frame_location(),
+			FrameLocation::InSlot,
+			"do_sync: current task frame_location must be InSlot"
+		);
+	}
 	unsafe { dump_frame_once("do_sync", state as *const State) };
 	let esr = ESR_EL1.get();
 	let ec_raw = ESR_EL1.read(ESR_EL1::EC);
@@ -721,7 +752,22 @@ pub(crate) extern "C" fn do_bad_mode(_state: &State, reason: u32) -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub(crate) extern "C" fn do_error(_state: &State) -> ! {
+pub(crate) extern "C" fn do_error(_state: &State, sp_el1: u64) -> ! {
+	// NEW-1 (option-d-per-task-slot-rebased.md §10): see do_sync. Only assert the
+	// slot invariant for EL0t/EL1t-sourced exceptions; for EL1h SP_EL1 is the
+	// live kernel stack by design (D4 tail SPSEL gate).
+	if (SPSR_EL1.get() & 1) == 0 {
+		let scratch = CoreLocal::get().scratch_slot();
+		assert_eq!(
+			sp_el1, scratch,
+			"do_error: entry SP_EL1 ({sp_el1:#x}) != CoreLocal.scratch_slot ({scratch:#x}) — frame not on task's slot"
+		);
+		assert_eq!(
+			core_scheduler().get_current_task_frame_location(),
+			FrameLocation::InSlot,
+			"do_error: current task frame_location must be InSlot"
+		);
+	}
 	error!("Receive error interrupt");
 
 	scheduler::abort()

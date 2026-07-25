@@ -6,7 +6,6 @@
 .extern do_error
 .extern D4_TRACE
 	.extern get_last_stack_pointer
-	.extern HERMIT_EARLY_EXCEPTION_STACK_POOL
 
 .macro trap_entry spsel
      stp x29, x30, [sp, #-16]!
@@ -136,43 +135,34 @@ b       do_bad_mode
  */
 .align 6
 el1_sync:
-
-		// Switch to an early emergency exception stack from a bounded pool.
-		//
-		// slot = (MPIDR_EL1 & 0xff) & (POOL_SIZE-1)
-		// sp = &HERMIT_EARLY_EXCEPTION_STACK_POOL + slot*64KiB + 64KiB
-		mrs     x24, mpidr_el1
-		and     x24, x24, #0xff
-		and     x24, x24, #0x3f
-		adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-		add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-		mov     x26, #65536
-		mul     x24, x24, x26
-		add     x24, x25, x24
-		add     x24, x24, x26
-		mov     sp, x24
-		trap_entry 1
-      mov     x0, sp
-      bl      do_sync
-      trap_exit
-      eret
-      // speculation barrier after the ERET to prevent the CPU
-      // from speculating past the exception return.
-      dsb     nsh
-      isb
+	// No pool-select block: trap_entry builds the 288-byte frame on the
+	// task's scratch_slot (staged by the D4 tail), identical to el1_irq/fiq.
+	// Capture entry SP_EL1 for the NEW-1 assert WITHOUT clobbering any task
+	// register: after trap_entry, sp = frame_base = (entry SP_EL1) - 288, so
+	// `add x1, sp, #288` reconstructs the entry SP_EL1. Do NOT `mov x1, sp`
+	// BEFORE trap_entry — trap_entry's first insn (`stp x1,x2`) would then save
+	// a corrupted task x1 into the frame. `mrs sp_el1` is UNDEFINED at EL1.
+	trap_entry 1
+	mov	x0, sp
+	add	x1, sp, #288
+	bl	do_sync
+	trap_exit
+	eret
+	// speculation barrier after the ERET to prevent the CPU
+	// from speculating past the exception return.
+	dsb	nsh
+	isb
 .size el1_sync, .-el1_sync
 .type el1_sync, @function
 
 /*
  * IRQ handler.
  *
- * IMPORTANT: We do NOT switch to the emergency stack here. The trap_entry
- * frame must live on the task's own kernel stack so that it survives across
- * context switches. If we used the emergency stack, a subsequent exception
- * on the same core would reset SP to the top of the emergency stack and the
- * new trap_entry would overwrite the previously saved State, corrupting the
- * task's registers (x30/LR, elr_el1, etc.). This was the root cause of
- * crashes with PC=0x0 / x30=0x0 after the executor parks.
+ * The trap_entry frame lives on the task's OWN scratch slot (SP_EL1 ==
+ * CoreLocal.scratch_slot, staged by the D4 tail on the preceding exception
+ * return). The slot is per-task, so it survives across context switches with no
+ * D3 copy. (Pre-1b′ comment about "the task's kernel stack" is obsolete: the
+ * frame is on the per-task exception slot, not the kernel stack.)
  */
 .align 6
 el1_irq:
@@ -209,8 +199,9 @@ el1_irq:
 /*
  * FIQ handler.
  *
- * Same rationale as el1_irq: use the task's kernel stack directly to
- * avoid emergency stack corruption across context switches.
+ * Same as el1_irq: the trap_entry frame lives on the task's OWN scratch slot
+ * (SP_EL1 == CoreLocal.scratch_slot, staged by the D4 tail), not the kernel
+ * stack. Per-task slot survives context switches with no D3 copy.
  */
 .align 6
 el1_fiq:
@@ -246,18 +237,12 @@ el1_fiq:
 
 .align 6
 el1_error:
-	mrs     x24, mpidr_el1
-	and     x24, x24, #0xff
-	and     x24, x24, #0x3f
-	adrp    x25, HERMIT_EARLY_EXCEPTION_STACK_POOL
-	add     x25, x25, #:lo12:HERMIT_EARLY_EXCEPTION_STACK_POOL
-	mov     x26, #65536
-	mul     x24, x24, x26
-	add     x24, x25, x24
-	add     x24, x24, x26
-	mov     sp, x24
+	// No pool-select; trap_entry builds the frame on the task's scratch_slot.
+	// Capture entry SP_EL1 as frame_base+288 AFTER trap_entry (do NOT clobber
+	// task x1 before trap_entry; `mrs sp_el1` UNDEFINED at EL1). See el1_sync.
 	trap_entry 1
       mov     x0, sp
+      add     x1, sp, #288
       bl      do_error
       trap_exit
       eret
@@ -273,9 +258,10 @@ el1_error:
  */
 .align 6
 el1_sp0_sync:
-      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
+      msr spsel, #1            // select SP_EL1 (staged = task's scratch_slot by D4 tail)
       trap_entry 0
       mov     x0, sp
+      add     x1, sp, #288     // NEW-1: entry SP_EL1 = frame_base + 288 (see el1_sync)
       bl      do_sync
       trap_exit
       eret
@@ -360,9 +346,10 @@ el1_sp0_fiq:
 
 .align 6
 el1_sp0_error:
-      msr spsel, #1            // select SP_EL1 (=E, set at boot + trap_exit tail)
+      msr spsel, #1            // select SP_EL1 (staged = task's scratch_slot by D4 tail)
       trap_entry 0
       mov     x0, sp
+      add     x1, sp, #288     // NEW-1: entry SP_EL1 = frame_base + 288 (see el1_sync)
       bl      do_error
       trap_exit
       eret

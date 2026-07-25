@@ -511,6 +511,14 @@ impl PerCoreScheduler {
 		without_interrupts(|| self.current_task.borrow().id)
 	}
 
+	/// NEW-1 (option-d-per-task-slot-rebased.md §10): the per-task exception
+	/// slot design's frame_location of the current task. Used by do_sync/do_error
+	/// to assert the frame landed on the task's own scratch slot (InSlot), not a
+	/// shared/foreign stack.
+	pub fn get_current_task_frame_location(&self) -> FrameLocation {
+		without_interrupts(|| self.current_task.borrow().frame_location)
+	}
+
 	/// EL1t diagnostic helper: the current task's kernel_stack_top
 	/// (= base + size), i.e. the address SP_EL0 is set to on EL1t return.
 	/// Used only by the data-abort fault dumper to confirm whether a fault

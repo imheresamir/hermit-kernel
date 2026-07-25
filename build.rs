@@ -10,6 +10,23 @@ use llvm_tools::LlvmTools;
 fn main() -> Result<()> {
 	built::write_built_file().unwrap();
 
+	// Assembly embedded via `global_asm!(include_str!("..."))` lives inside the
+	// including module's codegen unit. Incremental compilation does NOT reliably
+	// invalidate that unit when ONLY the .s file changes (the .rs file is
+	// unchanged), so edits to these files can silently link STALE assembly.
+	// Declaring them here makes cargo rebuild the crate whenever they change.
+	match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+		"aarch64" => {
+			// global_asm!(include_str!("start.s")) in src/arch/aarch64/kernel/mod.rs
+			println!("cargo:rerun-if-changed=src/arch/aarch64/kernel/start.s");
+		}
+		"riscv64" => {
+			// global_asm!(include_str!("switch.s")) in src/arch/riscv64/kernel/switch.rs
+			println!("cargo:rerun-if-changed=src/arch/riscv64/kernel/switch.s");
+		}
+		_ => {}
+	}
+
 	if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "x86_64"
 		&& env::var_os("CARGO_FEATURE_SMP").is_some()
 	{

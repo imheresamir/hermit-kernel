@@ -191,6 +191,15 @@ impl CoreLocal {
 		unsafe { &*ptr }
 	}
 
+	/// NEW-1 (option-d-per-task-slot-rebased.md §10): the current task's scratch
+	/// slot TOP (SP_EL1 the D4 tail stages on EL1t returns). Read-only accessor —
+	/// `scratch_slot` stays private so its pinned @24 offset (start.s D4 tail /
+	/// switch vectors) can't be widened accidentally.
+	#[inline]
+	pub fn scratch_slot(&self) -> u64 {
+		self.scratch_slot
+	}
+
 	/// §4D: Update kernel_sp for the incoming task. Called from the scheduler
 	/// BEFORE the asm switch path (start.s). The asm publishes scratch_slot
 	/// (@24) but NOT kernel_sp (@16); call_with_kernel_stack reads kernel_sp
