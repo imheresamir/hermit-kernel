@@ -169,6 +169,16 @@ pub(crate) static TTBR0: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 #[cfg(all(target_os = "none", feature = "smp"))]
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn ap_trace_entry() {
+	// [TRACE-SMP] RAW UART probe 'W': entered ap_trace_entry (the bl from
+	// smp_start was taken). If 'Y' printed but not 'W', the bl itself failed.
+	unsafe {
+		core::arch::asm!(
+			"mov x20, #0x1000",
+			"movz w21, #0x57",   // 'W'
+			"str w21, [x20]",
+			options(nostack)
+		);
+	}
 	// Called from smp_start (assembly) right before jumping to pre_init,
 	// to confirm the AP survived MMU/paging setup. cpu_id from MPIDR.
 	use aarch64_cpu::registers::{Readable, MPIDR_EL1};
@@ -352,6 +362,16 @@ pub(crate) unsafe extern "C" fn smp_start() -> ! {
 #[inline(never)]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn pre_init(boot_info: Option<&'static RawBootInfo>, cpu_id: u32) -> ! {
+	// [TRACE-SMP] RAW UART probe 'V': reached pre_init on this core. If 'W'
+	// printed but 'V' didn't, the bl pre_init from ap_trace_entry failed.
+	unsafe {
+		core::arch::asm!(
+			"mov x20, #0x1000",
+			"movz w21, #0x56",   // 'V'
+			"str w21, [x20]",
+			options(nostack)
+		);
+	}
 	let sp: u64;
 	unsafe {
 		core::arch::asm!("mov {0}, sp", out(reg) sp, options(nostack));
