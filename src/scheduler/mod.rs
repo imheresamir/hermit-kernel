@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::time::Duration;
 
 use ahash::RandomState;
 use crossbeam_utils::Backoff;
@@ -226,6 +227,19 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 			);
 			current_task_borrowed.status = TaskStatus::Finished;
 			NO_TASKS.fetch_sub(1, Ordering::SeqCst);
+
+			// R7.1 (2026-07-25): release the slot back to the pool so the
+			// exiting task does not permanently occupy it. Without this,
+			// every task exit reduces pool capacity by 1 (with
+			// SLOTS_PER_CORE=3, three exits exhaust the pool on a core and
+			// all later tasks fall back to the kernel-stack frame). This is
+			// a prerequisite for Phase 7 (kill+resume would otherwise leak
+			// a slot per kill). release_slot asserts frame_location==InSlot
+			// and slot>=0; only release when actually slot-resident (the
+			// kernel-stack-fallback path is not InSlot and must skip this).
+			if current_task_borrowed.frame_location == FrameLocation::InSlot {
+				crate::arch::kernel::slot_pool::release_slot(&current_task_borrowed);
+			}
 
 			let current_id = current_task_borrowed.id;
 			drop(current_task_borrowed);
@@ -843,7 +857,7 @@ impl PerCoreScheduler {
 
 	/// Per-task exception slot design (per-task-exception-slot-design.md):
 	/// ensure `task` has a scratch slot before it is dispatched. On first
-	/// dispatch the frame lives on the kernel stack (slot == -1); we acquire a
+	/// dispatch the frame lives on the kernel stack (slot == None); we acquire a
 	/// slot and copy the frame into it, updating `last_stack_pointer` to the
 	/// slot frame base so the switch path (start.s) publishes the correct
 	/// `scratch_slot`. If the pool is exhausted, evict a stale blocked task
@@ -857,13 +871,13 @@ impl PerCoreScheduler {
 		// write per context switch; zero asm changes — R1.3).
 		{
 			let mut b = task.borrow_mut();
-			b.last_touch = kernel::processor::get_timer_ticks();
+			b.last_touch = Duration::from_micros(kernel::processor::get_timer_ticks());
 		}
 
 		// Step 1: already resident in a slot? (or EL1h in-place via spsel gate)
 		{
 			let b = task.borrow();
-			if b.slot >= 0 && b.frame_location == FrameLocation::InSlot {
+			if b.slot.is_some() && b.frame_location == FrameLocation::InSlot {
 				return;
 			}
 
@@ -925,7 +939,9 @@ impl PerCoreScheduler {
 		let mut evictions = 0usize;
 		loop {
 			if let Some(v) = self.blocked_tasks.select_eviction_victim(self_id) {
-				let slot_idx = v.borrow().slot as usize;
+				let Some(slot_idx) = v.borrow().slot else {
+					continue; // invariant: select_eviction_victim only returns InSlot+Some; defensive
+				};
 				// T4: evict_victim returns whether a wake was deferred.
 				let woken = slot_pool::evict_victim(&mut v.borrow_mut(), slot_idx);
 				if woken {

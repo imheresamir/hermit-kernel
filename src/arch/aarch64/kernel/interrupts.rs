@@ -74,7 +74,7 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 	let spsr = unsafe { core::ptr::addr_of!(*slot.add(2)).read_volatile() };
 	let sp_el0 = unsafe { core::ptr::addr_of!(*slot.add(3)).read_volatile() };
 	let tpidr = unsafe { core::ptr::addr_of!(*slot.add(4)).read_volatile() };
-	error!(
+	trace!(
 		"[FRAME-DUMP #{c}] {tag} task={tid:?} frame_base={base:#x} | spsel={spsel:#x} elr={elr:#x} spsr={spsr:#x} sp_el0={sp_el0:#x} tpidr={tpidr:#x}"
 	);
 	// Dump all GPRs (x0..x30 = slots 5..35) inline.
@@ -84,14 +84,14 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 		if v == 0x60000207 {
 			hit_x = true;
 		}
-		error!(
+		trace!(
 			"[FRAME-DUMP] x{}={:#x}{}",
 			i - 5,
 			v,
 			if v == 0x60000207 { "  <<< MATCH" } else { "" }
 		);
 	}
-	error!("[FRAME-DUMP] kernel_leak? x_slot={hit_x} (any x-slot == 0x60000207)",);
+	trace!("[FRAME-DUMP] kernel_leak? x_slot={hit_x} (any x-slot == 0x60000207)",);
 	// R4-FU2: kernel restore path is clean (no x-slot == 0x60000207), so the
 	// bad value must live in task 1's USERSPACE memory. `0x60000207` is
 	// SPSR-shaped (same family as task 1's saved SPSRs 0x60000204/0x60000205),
@@ -111,9 +111,9 @@ unsafe fn dump_frame_once(tag: &str, frame: *const State) {
 			}
 		}
 		if found != 0 {
-			error!("[FRAME-DUMP] SCAN[{name}] {found_val:#x} found at {found:#x}");
+			trace!("[FRAME-DUMP] SCAN[{name}] {found_val:#x} found at {found:#x}");
 		} else {
-			error!("[FRAME-DUMP] SCAN[{name}] neither target found in [{lo:#x}..{hi:#x})");
+			trace!("[FRAME-DUMP] SCAN[{name}] neither target found in [{lo:#x}..{hi:#x})");
 		}
 	};
 	// SAFE regions only (read_volatile faults on unmapped pages and halts):
@@ -781,6 +781,47 @@ pub(crate) extern "C" fn do_error(_state: &State, sp_el1: u64) -> ! {
 	scheduler::abort()
 }
 
+/// Double-fault source discriminator passed by `df_check_*` in start.s
+/// (via `x2 = flavor`). `#[repr(u64)]` discriminants MUST match the immediates
+/// emitted by the `df_check_el1h`/`df_check_el1t` macros:
+///   0 = el1_sync      (EL1h, kernel context)
+///   1 = el1_error     (EL1h, kernel context)
+///   2 = el1_sp0_sync  (EL1t, task context)
+///   3 = el1_sp0_error (EL1t, task context)
+/// Decoded from the raw `u64` at the asm boundary (see `do_double_fault`); this
+/// keeps the magic numbers in exactly one place instead of scattered `0/1/2/3`
+/// compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub(crate) enum DfFlavor {
+	El1hSync = 0,
+	El1hError = 1,
+	El1tSync = 2,
+	El1tError = 3,
+}
+
+impl DfFlavor {
+	/// Decode the raw `u64` from start.s. Unknown values are mapped to
+	/// `El1hSync` (kernel context) so a corrupted/garbled flavor defaults to
+	/// the conservative RCB-class halt policy rather than a risky kill.
+	fn from_u64(v: u64) -> DfFlavor {
+		match v {
+			0 => DfFlavor::El1hSync,
+			1 => DfFlavor::El1hError,
+			2 => DfFlavor::El1tSync,
+			3 => DfFlavor::El1tError,
+			_ => DfFlavor::El1hSync,
+		}
+	}
+
+	/// True if the fault was taken from EL1t (task context) — the recoverable
+	/// class for Phase 7 (kill+resume). False for EL1h (kernel context) —
+	/// RCB-class, must halt. This is the I3 source-branch predicate.
+	fn is_el1t(self) -> bool {
+		matches!(self, DfFlavor::El1tSync | DfFlavor::El1tError)
+	}
+}
+
 /// Phase 4 double-fault handler (option-d-per-task-slot-rebased.md §5 / NEW-4).
 ///
 /// Called from the vector-entry prologue (`df_fatal` in start.s) when the
@@ -791,11 +832,13 @@ pub(crate) extern "C" fn do_error(_state: &State, sp_el1: u64) -> ! {
 ///   - stored the original task `x0` in TPIDRRO_EL0 (restored into the frame),
 ///   - run `trap_entry`, so `state` is a normal trap frame on the rescue stack
 ///     (with `state.sp` = the ORIGINAL bad SP_EL1, captured as x1),
-///   - set `x2 = flavor` (0=el1h_sync, 1=el1h_error, 2=el1t_sync, 3=el1t_error).
+///   - set `x2 = flavor` (raw u64; decoded to `DfFlavor` below).
 ///
 /// We print ESR/FAR/ELR + the bad SP + flavor, then fail-stop (spin/reset).
 /// We do NOT attempt recovery — a nested/overflowing handler cannot be safely
-/// unwound (avoids a recursive fault storm).
+/// unwound (avoids a recursive fault storm). The EL1t/EL1h distinction is the
+/// Phase 7 I3 source branch (EL1t = recoverable kill+resume; EL1h = RCB halt);
+/// until Phase 7 lands, both classes fail-stop here.
 ///
 /// Compile-time cross-check: the immediates the asm depends on must match
 /// config.rs. If someone changes a stack size without updating start.s, this
@@ -826,6 +869,7 @@ const _: () = {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u64) -> ! {
+	let flavor = DfFlavor::from_u64(flavor);
 	let esr = ESR_EL1.get();
 	let far = FAR_EL1.get();
 	let elr = ELR_EL1.get();
@@ -837,7 +881,7 @@ pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u6
 	// core_local.rs:245 with zero [DOUBLE-FAULT] output.)
 	let tid = try_core_scheduler().map(|s| s.get_current_task_id());
 	error!("============================================================");
-	error!("[DOUBLE-FAULT] task={tid:?} flavor={flavor}");
+	error!("[DOUBLE-FAULT] task={tid:?} flavor={flavor:?} (el1t={})", flavor.is_el1t());
 	error!("  bad SP_EL1    = {bad_sp:#x}");
 	error!("  ESR_EL1       = {esr:#x}");
 	error!("  FAR_EL1       = {far:#x}");
@@ -845,6 +889,10 @@ pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u6
 	error!("  slot top      = {:#x}", CoreLocal::get().scratch_slot());
 	error!("  (exception taken while already on a slot / slot overflow)");
 	error!("============================================================");
+	// I3 source branch (Phase 7): EL1h (kernel context) => RCB-class halt
+	// (current behavior); EL1t (task context) => recoverable kill+resume
+	// (NOT implemented yet — fail-stop until Phase 7 lands). For now both
+	// classes converge on scheduler::abort().
 	scheduler::abort()
 }
 

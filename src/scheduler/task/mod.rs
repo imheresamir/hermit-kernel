@@ -10,6 +10,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
 use core::{cmp, fmt};
 
 use ahash::RandomState;
@@ -484,18 +485,22 @@ pub(crate) struct Task {
 	/// claim is held mid-copy (serializes with the wake path, design §4.4).
 	pub frame_location: FrameLocation,
 	/// Index of this task's assigned scratch slot within the current core's
-	/// pool (-1 = none). Valid only while `frame_location == IN_SLOT`.
-	pub slot: i32,
+	/// pool (`None` = none). Valid only while `frame_location == IN_SLOT`.
+	pub slot: Option<usize>,
 	/// Eviction/wake protocol (slot-eviction-wake-protocol.md §4.4 INV-S3):
 	/// set by the wake path (`mark_ready`) when it observes `BeingEvicted`,
 	/// signalling the eviction copy is in flight; the eviction completion
 	/// (`evict_victim` in slot_pool.rs) reads it and completes the wake.
 	/// Owned by the owning core (single-core ownership), no atomics needed.
 	pub wake_pending: bool,
-	/// Staleness signal for victim selection (§4.1): monotonic ticks of the
-	/// last dispatch of this task. Updated once per `ensure_slot` call
-	/// (T2). Default 0 (very old -> most evictable) until first dispatch.
-	pub last_touch: u64,
+	/// Staleness signal for victim selection (§4.1): time of the last
+	/// dispatch of this task, as a `Duration` since boot. Typed as
+	/// `Duration` (R4.5 / 2026-07-25) so the unit is carried in the type —
+	/// `get_timer_ticks()` returns MICROSECONDS, and a bare `u64` threshold
+	/// invited a 1000x ms/us mismatch (the old `LAST_TOUCH_THRESHOLD_MS=10`
+	/// was compared against µs ticks, so it skipped nothing). Default 0
+	/// (Duration::ZERO, very old -> most evictable) until first dispatch.
+	pub last_touch: Duration,
 	/// Mapping between file descriptor and the referenced IO interface
 	pub object_map: Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
 	/// Task Thread-Local-Storage (TLS)
@@ -532,9 +537,9 @@ impl Task {
 			core_id,
 			stacks,
 			frame_location: FrameLocation::InSlot,
-			slot: -1,
+			slot: None,
 			wake_pending: false,
-			last_touch: 0,
+			last_touch: Duration::ZERO,
 			object_map,
 			#[cfg(not(feature = "common-os"))]
 			tls: None,
@@ -617,9 +622,9 @@ impl Task {
 			// no slot; the first dispatch allocates one and sets
 			// `last_stack_pointer` to the slot frame base.
 			frame_location: FrameLocation::InSlot,
-			slot: -1,
+			slot: None,
 			wake_pending: false,
-			last_touch: 0,
+			last_touch: Duration::ZERO,
 			object_map: OBJECT_MAP.get().unwrap().clone(),
 			#[cfg(not(feature = "common-os"))]
 			tls,
@@ -794,8 +799,14 @@ impl BlockedTaskQueue {
 		exclude_id: TaskId,
 	) -> Option<Rc<RefCell<Task>>> {
 		// TUNABLE (L2): deliberate build-time knob, not a hardcoded literal.
-		const LAST_TOUCH_THRESHOLD_MS: u64 = 10;
-		let now = processor::get_timer_ticks();
+		// R4.5 (2026-07-25): typed as Duration so the unit is enforced by the
+		// compiler. get_timer_ticks() returns MICROSECONDS; 10ms of staleness
+		// tolerance = from_millis(10). (The old LAST_TOUCH_THRESHOLD_MS=10 was
+		// compared against µs ticks -> 1000x too small, effectively "skip
+		// nothing".) A candidate touched within this window is too fresh
+		// (about to wake) -> returns None -> graceful degradation.
+		const LAST_TOUCH_THRESHOLD: Duration = Duration::from_millis(10);
+		let now = Duration::from_micros(processor::get_timer_ticks());
 
 		let mut candidates: Vec<(Rc<RefCell<Task>>, u64)> = Vec::new();
 		for node in self.list.iter() {
@@ -808,7 +819,7 @@ impl BlockedTaskQueue {
 				"select_eviction_victim: self-eviction attempt for task {} (INV-S4)",
 				b.id
 			);
-			if b.frame_location != FrameLocation::InSlot || b.slot < 0 {
+			if b.frame_location != FrameLocation::InSlot || b.slot.is_none() {
 				continue; // not a slot resident
 			}
 			if b.status != TaskStatus::Blocked {
@@ -829,7 +840,7 @@ impl BlockedTaskQueue {
 		// Skip too-fresh candidates (about to wake) -> graceful degradation.
 		let chosen = candidates
 			.into_iter()
-			.find(|(t, _)| now.saturating_sub(t.borrow().last_touch) >= LAST_TOUCH_THRESHOLD_MS)
+			.find(|(t, _)| now.saturating_sub(t.borrow().last_touch) >= LAST_TOUCH_THRESHOLD)
 			.map(|(t, _)| t);
 		// T9-V-RW3: victim-selection discriminator (§8.2). Confirms the
 		// staleness policy (NOT first-fit) drove the choice. STRIP in T10.

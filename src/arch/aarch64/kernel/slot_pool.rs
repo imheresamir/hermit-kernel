@@ -126,7 +126,7 @@ pub fn dispatch_acquire_slot(task: &mut Task) -> bool {
 		}
 	}
 	task.last_stack_pointer = VirtAddr::new(frame_base);
-	task.slot = idx as i32;
+	task.slot = Some(idx);
 	task.frame_location = FrameLocation::InSlot;
 	// T7/R1.5: clear any stale deferred-wake flag on (re)acquiring a slot.
 	// A prior BeingEvicted deferral belongs to a previous eviction cycle.
@@ -149,14 +149,16 @@ pub fn dispatch_acquire_slot(task: &mut Task) -> bool {
 
 /// Release the task's slot back to the pool (on task exit).
 pub fn release_slot(task: &Task) {
-	if task.slot < 0 {
-		return;
-	}
+	let Some(slot) = task.slot else {
+		return; // no slot owned (already released / never acquired)
+	};
 	// §3H: precondition — task must own a valid slot in InSlot state.
+	// `assert!` (not `debug_assert!`): slot indexes into owners_for_core and an
+	// out-of-range value would corrupt the pool in release builds, so this
+	// safety-relevant precondition must stay live in both profiles.
 	assert!(
-		task.slot >= 0 && (task.slot as usize) < SLOTS_PER_CORE,
-		"release_slot: invalid slot {} for task {}",
-		task.slot,
+		slot < SLOTS_PER_CORE,
+		"release_slot: slot {slot} out of range for task {}",
 		task.id
 	);
 	assert_eq!(
@@ -165,7 +167,7 @@ pub fn release_slot(task: &Task) {
 		"release_slot: frame_location must be InSlot to release"
 	);
 	let core = core_id() as usize;
-	owners_for_core(core).release(task.slot as usize);
+	owners_for_core(core).release(slot);
 }
 
 /// Evict `victim` (frame resident in slot `slot_idx`): claim, copy the frame
@@ -195,8 +197,8 @@ pub fn evict_victim(victim: &mut Task, slot_idx: usize) -> bool {
 		victim.frame_location
 	);
 	assert!(
-		victim.slot >= 0,
-		"evict_victim: victim.slot must be >= 0, got {}",
+		victim.slot.is_some(),
+		"evict_victim: victim.slot must be Some, got {:?}",
 		victim.slot
 	);
 	// Claim phase: mark BEING_EVICTED so the wake path defers.
@@ -219,7 +221,7 @@ pub fn evict_victim(victim: &mut Task, slot_idx: usize) -> bool {
 	);
 	// Publish EVICTED, then free the slot.
 	victim.frame_location = FrameLocation::Evicted;
-	victim.slot = -1;
+	victim.slot = None;
 	owners_for_core(core_id() as usize).release(slot_idx);
 	// R1.1/R1.5: hand off any deferred wake to the caller. Clear the flag
 	// here so a future eviction on this task can't replay a stale wake.
@@ -269,7 +271,7 @@ pub fn resume_from_evicted(task: &mut Task) -> bool {
 		"resume_from_evicted: frame base {frame_base:#x} + STATE_SIZE != slot_top {top:#x} (core {core} slot {idx})"
 	);
 	task.last_stack_pointer = VirtAddr::new(frame_base);
-	task.slot = idx as i32;
+	task.slot = Some(idx);
 	task.frame_location = FrameLocation::InSlot;
 	// T7/R1.5: clear any stale deferred-wake flag on resuming into a slot.
 	task.wake_pending = false;
