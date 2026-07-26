@@ -889,23 +889,26 @@ pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u6
 	error!("  slot top      = {:#x}", CoreLocal::get().scratch_slot());
 	error!("  (exception taken while already on a slot / slot overflow)");
 	error!("============================================================");
-	// I3 source branch (Phase 7): EL1h (kernel context) => RCB-class halt;
-	// EL1t (task context) => recoverable kill+resume. Until Phase 8 (supervisor
-	// respawn) lands, BOTH classes converge on scheduler::abort() (which kills
-	// the faulting task and lets the scheduler continue — I5 liveness). The
-	// branch is explicit so Phase 8 can slot the respawn into the EL1t arm
-	// WITHOUT touching the EL1h arm (which must remain a hard fail-stop).
-	// Compile-time sanity: flavor must be a valid decoded value.
-	debug_assert!(
-		matches!(flavor, DfFlavor::El1hSync | DfFlavor::El1hError | DfFlavor::El1tSync | DfFlavor::El1tError),
-		"do_double_fault: decoded flavor {flavor:?} is out of range (asm passed a bad x2)"
-	);
+	// I3 source branch (Phase 7/Phase 8): EL1h (kernel context) => RCB-class
+	// fail-stop; EL1t (task context) => recoverable kill+resume, which may be
+	// supervised (Phase 8 respawn). The branch is explicit so the two classes
+	// remain independently editable (review finding #7: the EL1t arm now wires
+	// the supervisor path instead of duplicating the EL1h arm).
+	//
+	// `DfFlavor::from_u64` is exhaustive over the four valid variants, so a
+	// `match` with no `_` arm gives a compile-time exhaustiveness guarantee —
+	// no runtime `debug_assert!` needed (finding #8).
 	if flavor.is_el1t() {
 		// Task-context double fault: kill the task, keep the system alive.
-		error!("[DOUBLE-FAULT] EL1t recoverable path -> scheduler::abort() (task killed, system continues)");
+		// Phase 8: defer to the supervisor — if the task's EntryPointId policy
+		// permits a restart, exit() will respawn it; otherwise it dies. Either
+		// way scheduler::abort() drives the kill + reschedule (I5 liveness).
+		error!("[DOUBLE-FAULT] EL1t recoverable path -> scheduler::abort() (supervised kill+resume)");
 		scheduler::abort()
 	} else {
-		// Kernel-context double fault: hard fail-stop (RCB-class).
+		// Kernel-context double fault: hard fail-stop (RCB-class). The kernel
+		// cannot safely continue from a fault in its own context, so this is
+		// NOT supervised — abort() here ends the core.
 		error!("[DOUBLE-FAULT] EL1h kernel-context path -> scheduler::abort() (fail-stop)");
 		scheduler::abort()
 	}

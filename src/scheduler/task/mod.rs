@@ -27,7 +27,7 @@ use crate::arch::kernel::processor::{self, FPUState};
 use crate::arch::kernel::scheduler::TaskStacks;
 use crate::fd::{Fd, RawFd, stdio};
 use crate::scheduler::CoreId;
-use crate::scheduler::supervisor::{EntryPointId, RestartPolicy};
+use crate::scheduler::supervisor::EntryPointId;
 
 // ---------------------------------------------------------------------------
 // Bitmap pool: static bump allocator for cache-padded priority bitmaps.
@@ -509,15 +509,16 @@ pub(crate) struct Task {
 	/// when its `EntryPointId`'s policy permits (BEAM-style). Reusing the bare
 	/// `extern "C" fn` code pointer (not a closure) — see R9.7, the current
 	/// spawn ABI takes `func: extern "C" fn(usize)`, trivially "cloneable".
-	pub entry: unsafe extern "C" fn(usize),
+	/// These are `pub(crate)` (review finding #14): only the scheduler needs
+	/// to read them for a respawn; external code has no business overwriting
+	/// a running task's entry point.
+	pub(crate) entry: unsafe extern "C" fn(usize),
 	/// Original entry argument (passed back to a respawn).
-	pub entry_arg: usize,
+	pub(crate) entry_arg: usize,
 	/// Stable entry-point index this task was spawned from (NOT a fn pointer;
 	/// PIE/rebase-safe — see supervisor.rs). Keys the per-entry-point restart
 	/// policy + counter table.
-	pub entry_point_id: EntryPointId,
-	/// Restart policy for this task's entry point (static spawn-time param).
-	pub restart_policy: RestartPolicy,
+	pub(crate) entry_point_id: EntryPointId,
 	/// Task Thread-Local-Storage (TLS)
 	#[cfg(not(feature = "common-os"))]
 	pub tls: Option<Tls>,
@@ -575,7 +576,6 @@ impl Task {
 			entry: default_placeholder_entry,
 			entry_arg: 0,
 			entry_point_id: EntryPointId::Idle,
-			restart_policy: RestartPolicy::None,
 			#[cfg(not(feature = "common-os"))]
 			tls: None,
 			#[cfg(all(target_arch = "x86_64", feature = "common-os"))]
@@ -666,7 +666,6 @@ impl Task {
 			entry: idle_entry,
 			entry_arg: 0,
 			entry_point_id: EntryPointId::Idle,
-			restart_policy: RestartPolicy::None,
 			#[cfg(not(feature = "common-os"))]
 			tls,
 			#[cfg(all(target_arch = "x86_64", feature = "common-os"))]

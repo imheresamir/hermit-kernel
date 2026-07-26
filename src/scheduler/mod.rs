@@ -31,7 +31,7 @@ use crate::errno::Errno;
 use crate::fd::{Fd, RawFd};
 use crate::io;
 use crate::scheduler::task::*;
-use crate::scheduler::supervisor::{EntryPointId, RestartPolicy};
+use crate::scheduler::supervisor::EntryPointId;
 
 pub mod supervisor;
 pub mod task;
@@ -263,32 +263,55 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 		// permits (and the BEAM-style MaxN window allows), respawn THIS entry
 		// point on the SAME core (enqueued on this core's ready_queue;
 		// reschedule() dispatches it within one scheduler cycle — invisible to
-		// other cores). `self.current_task` is still the just-finished task
-		// here (reschedule() swaps it), so read its entry point now. Default
-		// policy is `None` (verified: the rs6 REPL simply dies on /fault).
+		// other cores).
+		//
+		// (review finding #10: `self.current_task` is still the just-finished
+		// task here — `reschedule()` only swaps it below. Read the entry point
+		// + original priority NOW, before that swap.)
+		//
+		// (review finding #13: this hook fires on EVERY task exit — normal
+		// `sys_exit` AND fault-driven `abort()` — not just faults. That is
+		// intentional: `RestartPolicy` is the contract ("restart on death"),
+		// whatever the exit cause. Tasks default to `None`, so normal exits
+		// are unaffected.)
 		{
 			let finished = self.current_task.borrow();
 			let ep_id = finished.entry_point_id;
 			let entry = finished.entry;
 			let entry_arg = finished.entry_arg;
+			let prio = finished.prio; // (finding #12) inherit the original priority
 			drop(finished);
-			let now = crate::arch::kernel::processor::get_timer_ticks();
-			if supervisor::should_restart(ep_id, now) {
-				debug!(
-					"[SUPERVISOR] restarting entry-point {:?} (policy permitted)",
-					ep_id
-				);
-				// Respawn on the same core. `spawn` clones the parent's
-				// object_map (Arc) — the new task starts with shared FDs,
-				// exactly like a fresh fork. `ensure_slot` assigns its slot.
-				unsafe {
-					PerCoreScheduler::spawn(
-						entry,
-						entry_arg,
-						Priority::from(2),
-						crate::arch::kernel::core_local::core_id(),
-						crate::config::DEFAULT_STACK_SIZE,
+			if supervisor::should_restart(ep_id) {
+				// (finding #11) The entry pointer comes from the dead task's
+				// struct and the very fault we just handled may have corrupted
+				// it. Before jumping into an arbitrary code pointer, reject the
+				// two most likely garbage values (null and the sentinel
+				// `usize::MAX`). A respawn onto a bad entry would be a
+				// secondary fault with no diagnostics — fail closed instead.
+				let entry_addr = entry as usize;
+				if entry_addr == 0 || entry_addr == usize::MAX {
+					warn!(
+						"[SUPERVISOR] refusing respawn of {:?}: entry pointer \
+						 corrupted ({entry_addr:#x}) — not restarting",
+						ep_id
 					);
+				} else {
+					debug!(
+						"[SUPERVISOR] restarting entry-point {:?} (policy permitted)",
+						ep_id
+					);
+					// Respawn on the same core. `spawn` clones the parent's
+					// object_map (Arc) — the new task starts with shared FDs,
+					// exactly like a fresh fork. `ensure_slot` assigns its slot.
+					unsafe {
+						PerCoreScheduler::spawn(
+							entry,
+							entry_arg,
+							prio,
+							crate::arch::kernel::core_local::core_id(),
+							crate::config::DEFAULT_STACK_SIZE,
+						);
+					}
 				}
 			}
 		}
@@ -328,7 +351,6 @@ impl From<NewTask> for Task {
 		task.entry = func;
 		task.entry_arg = arg;
 		task.entry_point_id = EntryPointId::AppTask;
-		task.restart_policy = RestartPolicy::None;
 		task
 	}
 }
@@ -850,6 +872,16 @@ impl PerCoreScheduler {
 		// INVARIANT (I8 / Fork C): only FINISHED tasks are reaped here. A
 		// RUNNING task must never be in `finished_tasks` — reaping it would
 		// drop the live current task's resources out from under it.
+		// R9.8 guard: set THIS core's per-core `abort_zone` around the drop
+		// loop with SeqCst. The matching load in the panic handler
+		// (lib.rs:450) uses Relaxed — safe because the store is STRICTLY
+		// sequenced-before any panic that could observe it (the panic happens
+		// inside this loop, after the store(true) and before the store(false)),
+		// so there is no concurrent writer to order against (review finding #5).
+		// It is ALSO intentionally NOT cleared if the loop panics: a panic in
+		// the abort zone must halt (I4), not fall through to a half-cleared
+		// state and continue (findings #6 / #18). The store(false) below is
+		// reached only on the happy path.
 		cl.abort_zone.store(true, Ordering::SeqCst);
 		while let Some(finished_task) = self.finished_tasks.pop_front() {
 			debug_assert!(

@@ -43,13 +43,18 @@ pub enum RestartPolicy {
 
 /// One entry-point's policy + private restart counter (R9.2: counter lives
 /// HERE, keyed by `EntryPointId`, NOT on the Task).
+///
+/// Fields are non-`pub` (review finding #1): the table is reached only through
+/// `RESTART_TABLE` + `should_restart`, so callers cannot mutate `policy`,
+/// `restart_count`, or `window_start` directly and bypass the rate-limit logic.
+/// `policy()` exposes read access without handing out a mutable handle.
 pub struct RestartEntry {
 	/// Static policy.
-	pub policy: RestartPolicy,
+	policy: RestartPolicy,
 	/// Private runtime history: how many times this entry point has restarted.
-	pub restart_count: u32,
+	restart_count: u32,
 	/// Private runtime history: start of the current restart window (µs ticks).
-	pub window_start: u64,
+	window_start: u64,
 }
 
 impl RestartEntry {
@@ -59,6 +64,11 @@ impl RestartEntry {
 			restart_count: 0,
 			window_start: 0,
 		}
+	}
+
+	/// Read-only access to the policy (review finding #1).
+	pub fn policy(&self) -> RestartPolicy {
+		self.policy
 	}
 
 	/// Decide whether THIS death may be restarted, mutating the private
@@ -74,7 +84,10 @@ impl RestartEntry {
 			RestartPolicy::MaxN { count, window } => {
 				let window_us = window.as_micros() as u64;
 				// Slide the window if we've left it.
-				if window_us != 0 && self.window_start != 0 && now.saturating_sub(self.window_start) >= window_us {
+				if window_us != 0
+					&& self.window_start != 0
+					&& now.saturating_sub(self.window_start) >= window_us
+				{
 					self.restart_count = 0;
 					self.window_start = now;
 				} else if self.window_start == 0 {
@@ -102,18 +115,35 @@ pub static RESTART_TABLE: InterruptTicketMutex<[RestartEntry; 2]> =
 	]);
 
 /// Compile-time sanity: the table is indexed by `EntryPointId` discriminant
-/// order. If `EntryPointId` gains a variant, this assert forces the table to
-/// be resized — keeping the two in lock-step.
+/// order. If `EntryPointId` gains a variant, this assert forces the table to be
+/// resized — keeping the two in lock-step. (review finding #2: the message is
+/// actionable — it tells you WHICH file to touch next.)
 const _: () = assert!(
 	EntryPointId::Idle as usize == 0 && EntryPointId::AppTask as usize == 1,
-	"EntryPointId discriminants must be 0=Idle, 1=AppTask to index RESTART_TABLE"
+	"EntryPointId gained a variant: add a matching entry to RESTART_TABLE in \
+	 kernel/src/scheduler/supervisor.rs (it is indexed by discriminant order)"
 );
 
 /// Consult the policy for `id` and, if a restart is permitted, record it.
 /// Returns `true` if `exit()` should respawn the entry point.
-pub fn should_restart(id: EntryPointId, now: u64) -> bool {
+///
+/// (review finding #3: `now` is obtained internally via `get_timer_ticks()` —
+/// the only caller (`exit()`) would otherwise have to thread it through, a
+/// needless surface for mistakes. `get_timer_ticks()` is always safe to call
+/// once the timer is up, which it is by the time any task can `exit()`.)
+///
+/// (review finding #4: uses `assert!`, NOT `debug_assert!`. An out-of-range
+/// `idx` would index a static array out of bounds = UB; this must hold in
+/// release builds too. The compile-time `const _` assert above catches *new
+/// variants*; this runtime check defends against a *corrupted* `EntryPointId`
+/// reaching here from a memory bug.)
+pub fn should_restart(id: EntryPointId) -> bool {
 	let idx = id as usize;
-	debug_assert!(idx < 2, "EntryPointId discriminant out of RESTART_TABLE range");
+	assert!(
+		idx < RESTART_TABLE.lock().len(),
+		"EntryPointId discriminant {idx} out of RESTART_TABLE range (corrupted id?)"
+	);
+	let now = crate::arch::kernel::processor::get_timer_ticks();
 	let mut table = RESTART_TABLE.lock();
 	table[idx].may_restart(now)
 }

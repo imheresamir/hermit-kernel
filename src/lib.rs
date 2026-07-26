@@ -448,6 +448,11 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 	// another core to halt too. The flag is only ever SET post-scheduler, so
 	// reading CoreLocal here is safe (it is installed by then).
 	if CoreLocal::get().abort_zone.load(Ordering::Relaxed) {
+		// Relaxed is sufficient here (review finding #5): the flag is only
+		// ever SET under scheduler control, strictly before any panic that
+		// could read it (see cleanup_tasks R9.8 note), and there is no other
+		// concurrent writer on this core at panic time, so no acquire/release
+		// ordering is needed — we just need the latest value this core wrote.
 		panic_println!(
 			"[{core_id}][PANIC] in abort zone -> hard halt (recovery path)"
 		);

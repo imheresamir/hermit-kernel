@@ -114,6 +114,12 @@ pub extern "C" fn sys_abort() -> ! {
 /// spins forever on an "Unknown exception" (interrupts.rs). So the harness uses this
 /// explicit syscall (the same kill path `sys_abort` takes) rather than a synthetic fault.
 /// The rs6 REPL `/fault` command invokes it. Returns `!` (it never returns).
+///
+/// (review finding #16: gated behind `debug_assertions`. In a release build this symbol
+/// does not exist, so a production userspace task cannot invoke a self-kill test hook;
+/// the dev kernel + dev-built rs6 both keep it for the harness. No cross-crate feature
+/// wiring needed — both sides are governed by the same cargo profile.)
+#[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_test_fault() -> ! {
 	// INVARIANT: only a real, running task can call a syscall, so
