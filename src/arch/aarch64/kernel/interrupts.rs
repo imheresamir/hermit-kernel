@@ -889,11 +889,26 @@ pub(crate) extern "C" fn do_double_fault(_state: &State, bad_sp: u64, flavor: u6
 	error!("  slot top      = {:#x}", CoreLocal::get().scratch_slot());
 	error!("  (exception taken while already on a slot / slot overflow)");
 	error!("============================================================");
-	// I3 source branch (Phase 7): EL1h (kernel context) => RCB-class halt
-	// (current behavior); EL1t (task context) => recoverable kill+resume
-	// (NOT implemented yet — fail-stop until Phase 7 lands). For now both
-	// classes converge on scheduler::abort().
-	scheduler::abort()
+	// I3 source branch (Phase 7): EL1h (kernel context) => RCB-class halt;
+	// EL1t (task context) => recoverable kill+resume. Until Phase 8 (supervisor
+	// respawn) lands, BOTH classes converge on scheduler::abort() (which kills
+	// the faulting task and lets the scheduler continue — I5 liveness). The
+	// branch is explicit so Phase 8 can slot the respawn into the EL1t arm
+	// WITHOUT touching the EL1h arm (which must remain a hard fail-stop).
+	// Compile-time sanity: flavor must be a valid decoded value.
+	debug_assert!(
+		matches!(flavor, DfFlavor::El1hSync | DfFlavor::El1hError | DfFlavor::El1tSync | DfFlavor::El1tError),
+		"do_double_fault: decoded flavor {flavor:?} is out of range (asm passed a bad x2)"
+	);
+	if flavor.is_el1t() {
+		// Task-context double fault: kill the task, keep the system alive.
+		error!("[DOUBLE-FAULT] EL1t recoverable path -> scheduler::abort() (task killed, system continues)");
+		scheduler::abort()
+	} else {
+		// Kernel-context double fault: hard fail-stop (RCB-class).
+		error!("[DOUBLE-FAULT] EL1h kernel-context path -> scheduler::abort() (fail-stop)");
+		scheduler::abort()
+	}
 }
 
 /// Send a Software Generated Interrupt to a specific core.

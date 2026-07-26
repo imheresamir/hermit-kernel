@@ -104,6 +104,25 @@ pub extern "C" fn sys_abort() -> ! {
 	exit(-1)
 }
 
+/// Phase 7 Stage 0 live-task injection harness (option-d-per-task-slot-rebased.md §6.2).
+/// A dedicated, NUMERIC test-fault syscall (`SYS_TEST_FAULT = 0xBEEF`) that drives a
+/// genuine task KILL through the real recovery path: `scheduler::abort()` -> `exit(-1)`
+/// -> the task becomes `Finished` -> `reschedule()` keeps the rest of the system alive
+/// (I5 liveness). This is the controlled, demonstrable kill+resume the harness needs.
+///
+/// NOTE on mechanism: a raw `udf #0` from userspace does NOT reach `panic!()` — `do_sync`
+/// spins forever on an "Unknown exception" (interrupts.rs). So the harness uses this
+/// explicit syscall (the same kill path `sys_abort` takes) rather than a synthetic fault.
+/// The rs6 REPL `/fault` command invokes it. Returns `!` (it never returns).
+#[unsafe(no_mangle)]
+pub extern "C" fn sys_test_fault() -> ! {
+	// INVARIANT: only a real, running task can call a syscall, so
+	// core_scheduler() is always installed here — no pre-scheduler guard needed.
+	let tid = core_scheduler().get_current_task_id();
+	info!("[STAGE0-FAULT] SYS_TEST_FAULT invoked by task {tid:?} -> scheduler::abort() (kill+resume harness)");
+	crate::scheduler::abort()
+}
+
 pub(super) fn usleep(usecs: u64) {
 	if usecs >= 10_000 {
 		// Enough time to set a wakeup timer and block the current task.

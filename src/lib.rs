@@ -95,7 +95,7 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use self::arch::kernel;
-use self::arch::kernel::core_local::{core_id, core_scheduler};
+use self::arch::kernel::core_local::{core_id, core_scheduler, CoreLocal};
 use self::arch::kernel::interrupts;
 use crate::alloc::string::ToString;
 use crate::scheduler::{PerCoreScheduler, PerCoreSchedulerExt};
@@ -440,6 +440,21 @@ fn application_processor_main() -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 	let core_id = core_id();
+	// I4(b) (R7.8 / R9.4): if recovery code on THIS core set the per-core
+	// abort-zone flag before entering the recovery / abort path, a panic here
+	// must HALT IMMEDIATELY instead of calling scheduler::shutdown(1) (which
+	// walks corrupted state and brings down the whole system). Per-core (not
+	// a global): a global flag would wrongly force an unrelated panic on
+	// another core to halt too. The flag is only ever SET post-scheduler, so
+	// reading CoreLocal here is safe (it is installed by then).
+	if CoreLocal::get().abort_zone.load(Ordering::Relaxed) {
+		panic_println!(
+			"[{core_id}][PANIC] in abort zone -> hard halt (recovery path)"
+		);
+		loop {
+			crate::arch::kernel::processor::halt();
+		}
+	}
 	panic_println!("[{core_id}][PANIC] {info}\n");
 
 	// DISCRIMINATOR (per-task-exception-slot-design.md R4-FU2): a userspace

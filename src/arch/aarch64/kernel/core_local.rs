@@ -1,7 +1,7 @@
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::ptr;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use aarch64_cpu::registers::{Readable, TPIDR_EL1, Writeable};
 use async_executor::StaticLocalExecutor;
@@ -93,6 +93,17 @@ pub(crate) struct CoreLocal {
 	/// Queues to handle incoming requests from the other cores
 	#[cfg(feature = "smp")]
 	pub scheduler_input: InterruptTicketMutex<SchedulerInput>,
+	/// Per-core abort-zone flag (Phase 7 I4(b) / R7.8 / R9.4). When set by
+	/// recovery code on THIS core, a `panic!()` raised inside the recovery /
+	/// abort path halts immediately (processor::halt loop) instead of calling
+	/// `scheduler::shutdown(1)` (which would touch corrupted state and bring
+	/// down the whole system). Per-core (NOT a global `static`): a global flag
+	/// would wrongly force an unrelated panic on Core 1 to halt too. This
+	/// kernel has no MAX_CORES const, so per-core CoreLocal storage is the
+	/// correct shape. Added AFTER the asm-critical fields (offsets 0/8/16/24:
+	/// exception_sp/this/kernel_sp/scratch_slot) so it does NOT shift the
+	/// hardcoded asm offsets.
+	pub abort_zone: AtomicBool,
 }
 
 impl CoreLocal {
@@ -168,6 +179,7 @@ impl CoreLocal {
 			ex: StaticLocalExecutor::new(),
 			#[cfg(feature = "smp")]
 			scheduler_input: InterruptTicketMutex::new(SchedulerInput::new()),
+			abort_zone: AtomicBool::new(false),
 		};
 		let this = if core_id == 0 {
 			take_static::take_static! {

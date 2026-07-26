@@ -31,7 +31,9 @@ use crate::errno::Errno;
 use crate::fd::{Fd, RawFd};
 use crate::io;
 use crate::scheduler::task::*;
+use crate::scheduler::supervisor::{EntryPointId, RestartPolicy};
 
+pub mod supervisor;
 pub mod task;
 pub mod timer_interrupts;
 
@@ -254,6 +256,43 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 			TASKS.lock().remove(&current_id);
 		});
 
+		// Phase 8 supervisor hook (option-d §9 / R8.6 / R9.2 / R9.6 / R9.7):
+		// AFTER the Fork C FD cleanup (inside reschedule -> cleanup_tasks) the
+		// exiting task is reaped. BEFORE reschedule() dispatches the next task,
+		// consult the per-entry-point restart policy table. If the policy
+		// permits (and the BEAM-style MaxN window allows), respawn THIS entry
+		// point on the SAME core (enqueued on this core's ready_queue;
+		// reschedule() dispatches it within one scheduler cycle — invisible to
+		// other cores). `self.current_task` is still the just-finished task
+		// here (reschedule() swaps it), so read its entry point now. Default
+		// policy is `None` (verified: the rs6 REPL simply dies on /fault).
+		{
+			let finished = self.current_task.borrow();
+			let ep_id = finished.entry_point_id;
+			let entry = finished.entry;
+			let entry_arg = finished.entry_arg;
+			drop(finished);
+			let now = crate::arch::kernel::processor::get_timer_ticks();
+			if supervisor::should_restart(ep_id, now) {
+				debug!(
+					"[SUPERVISOR] restarting entry-point {:?} (policy permitted)",
+					ep_id
+				);
+				// Respawn on the same core. `spawn` clones the parent's
+				// object_map (Arc) — the new task starts with shared FDs,
+				// exactly like a fresh fork. `ensure_slot` assigns its slot.
+				unsafe {
+					PerCoreScheduler::spawn(
+						entry,
+						entry_arg,
+						Priority::from(2),
+						crate::arch::kernel::core_local::core_id(),
+						crate::config::DEFAULT_STACK_SIZE,
+					);
+				}
+			}
+		}
+
 		self.reschedule();
 		unreachable!()
 	}
@@ -282,6 +321,14 @@ impl From<NewTask> for Task {
 		} = value;
 		let mut task = Self::new(tid, core_id, TaskStatus::Ready, prio, stacks, object_map);
 		task.create_stack_frame(func, arg);
+		// Phase 8: retain the original entry point + arg and tag it with the
+		// stable AppTask entry-point index so `exit()` can respawn it when the
+		// policy (default None) permits. R9.7: `func` is a bare `extern "C" fn`
+		// code pointer, trivially re-spawnable.
+		task.entry = func;
+		task.entry_arg = arg;
+		task.entry_point_id = EntryPointId::AppTask;
+		task.restart_policy = RestartPolicy::None;
 		task
 	}
 }
@@ -775,11 +822,52 @@ impl PerCoreScheduler {
 	}
 
 	/// Check if a finished task could be deleted.
+	///
+	/// Stage 3 (Fork C, option-d-per-task-slot-rebased.md §6.2 / R9.1 / R9.8):
+	/// Dropping the finished `Task` (via the `Rc<RefCell<Task>>` refcount
+	/// hitting 0 here) drops its `object_map` OUTER `Arc`. That drops each
+	/// entry's INNER `Arc<RwLock<Fd>>`. Because the inner `Arc` is the unit of
+	/// ownership, inner refcount==1 (task-PRIVATE FD) drops the `Fd` and runs
+	/// `Socket::drop` -> `block_on(self.close())` (tcp.rs:473 / udp.rs:256);
+	/// inner refcount>1 (shared FD, dup'd or inherited from parent) is only
+	/// decremented and survives until the LAST holder exits (I8). So Fork C's
+	/// "reclaim task-private FDs, leave shared FDs alone" is achieved for FREE
+	/// by the existing `Task::drop` — NO explicit walk is needed, and doing
+	/// one inside `exit()`'s `without_interrupts` block would be UNSAFE
+	/// (R9.1: `block_on` re-enters the executor under without_interrupts).
+	///
+	/// R9.8 guard: `Socket::drop`'s `block_on` runs the async executor and can
+	/// PANIC (an executor task it wakes faults). We set THIS core's per-core
+	/// `abort_zone` around the drop so any such panic halts via I4
+	/// (processor::halt) instead of calling `scheduler::shutdown(1)` on a
+	/// half-torn-down task. `cleanup_tasks` runs from `scheduler()`, which is
+	/// called by `reschedule()` AFTER `exit()`'s `without_interrupts` block has
+	/// ended and `current_task_borrowed` is dropped (mod.rs:245/257) — so the
+	/// context is safe for the executor re-entry.
 	fn cleanup_tasks(&mut self) {
-		// Pop the first finished task and remove it from the TASKS list, which implicitly deallocates all associated memory.
+		use core::sync::atomic::Ordering;
+		let cl = CoreLocal::get();
+		// INVARIANT (I8 / Fork C): only FINISHED tasks are reaped here. A
+		// RUNNING task must never be in `finished_tasks` — reaping it would
+		// drop the live current task's resources out from under it.
+		cl.abort_zone.store(true, Ordering::SeqCst);
 		while let Some(finished_task) = self.finished_tasks.pop_front() {
-			debug!("Cleaning up task {}", finished_task.borrow().id);
+			debug_assert!(
+				matches!(
+					finished_task.borrow().status,
+					TaskStatus::Finished | TaskStatus::Invalid
+				),
+				"cleanup_tasks: reaping a non-finished task (status={:?})",
+				finished_task.borrow().status
+			);
+			debug!(
+				"Cleaning up task {} (Fork C: task-private FDs reclaimed via Task::drop; shared FDs survive)",
+				finished_task.borrow().id
+			);
+			// `finished_task` dropped here -> Task::drop -> object_map outer Arc
+			// drop -> inner-Arc==1 FDs close (I8 satisfied).
 		}
+		cl.abort_zone.store(false, Ordering::SeqCst);
 	}
 
 	#[cfg(feature = "smp")]

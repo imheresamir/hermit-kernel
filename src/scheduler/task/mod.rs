@@ -27,6 +27,7 @@ use crate::arch::kernel::processor::{self, FPUState};
 use crate::arch::kernel::scheduler::TaskStacks;
 use crate::fd::{Fd, RawFd, stdio};
 use crate::scheduler::CoreId;
+use crate::scheduler::supervisor::{EntryPointId, RestartPolicy};
 
 // ---------------------------------------------------------------------------
 // Bitmap pool: static bump allocator for cache-padded priority bitmaps.
@@ -503,6 +504,20 @@ pub(crate) struct Task {
 	pub last_touch: Duration,
 	/// Mapping between file descriptor and the referenced IO interface
 	pub object_map: Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
+	/// Phase 8 (supervisor / restart, option-d §9 / R8.6 / R9.2): the task's
+	/// ORIGINAL entry point + argument, retained so `exit()` can respawn it
+	/// when its `EntryPointId`'s policy permits (BEAM-style). Reusing the bare
+	/// `extern "C" fn` code pointer (not a closure) — see R9.7, the current
+	/// spawn ABI takes `func: extern "C" fn(usize)`, trivially "cloneable".
+	pub entry: unsafe extern "C" fn(usize),
+	/// Original entry argument (passed back to a respawn).
+	pub entry_arg: usize,
+	/// Stable entry-point index this task was spawned from (NOT a fn pointer;
+	/// PIE/rebase-safe — see supervisor.rs). Keys the per-entry-point restart
+	/// policy + counter table.
+	pub entry_point_id: EntryPointId,
+	/// Restart policy for this task's entry point (static spawn-time param).
+	pub restart_policy: RestartPolicy,
 	/// Task Thread-Local-Storage (TLS)
 	#[cfg(not(feature = "common-os"))]
 	pub tls: Option<Tls>,
@@ -514,6 +529,16 @@ pub(crate) struct Task {
 pub(crate) trait TaskFrame {
 	/// Create the initial stack frame for a new task
 	fn create_stack_frame(&mut self, func: unsafe extern "C" fn(usize), arg: usize);
+}
+
+/// Phase 8 placeholder entry point for tasks built via `Task::new` directly
+/// (the idle task and the base of spawned tasks). Never actually invoked: the
+/// idle task runs via its own `new_idle` frame, and spawned tasks have `entry`
+/// overwritten by `into_task`. Present only so the `entry` field has a valid
+/// non-null `extern "C" fn(usize)` default. If a restart ever dispatches this,
+/// halting is the safe, loud failure.
+extern "C" fn default_placeholder_entry(_arg: usize) {
+	panic!("default_placeholder_entry invoked — a task with an unset entry was restarted");
 }
 
 impl Task {
@@ -541,6 +566,16 @@ impl Task {
 			wake_pending: false,
 			last_touch: Duration::ZERO,
 			object_map,
+			// Phase 8 defaults: placeholder entry, Idle index, no restart.
+			// `into_task` (spawn) overwrites these for real application tasks.
+			// `Task::new` is used both for the idle task (which sets its own
+			// entry via new_idle's frame) and as the base for spawned tasks;
+			// this placeholder is never invoked unless a restart policy is set
+			// on a task that was built via `new()` directly (none are).
+			entry: default_placeholder_entry,
+			entry_arg: 0,
+			entry_point_id: EntryPointId::Idle,
+			restart_policy: RestartPolicy::None,
 			#[cfg(not(feature = "common-os"))]
 			tls: None,
 			#[cfg(all(target_arch = "x86_64", feature = "common-os"))]
@@ -626,6 +661,12 @@ impl Task {
 			wake_pending: false,
 			last_touch: Duration::ZERO,
 			object_map: OBJECT_MAP.get().unwrap().clone(),
+			// Phase 8: the idle task's entry is idle_entry; it is never
+			// restarted (policy None, EntryPointId::Idle).
+			entry: idle_entry,
+			entry_arg: 0,
+			entry_point_id: EntryPointId::Idle,
+			restart_policy: RestartPolicy::None,
 			#[cfg(not(feature = "common-os"))]
 			tls,
 			#[cfg(all(target_arch = "x86_64", feature = "common-os"))]
