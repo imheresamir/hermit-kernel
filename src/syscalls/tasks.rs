@@ -130,7 +130,7 @@ pub extern "C" fn sys_test_fault() -> ! {
 	// core_scheduler() is always installed here — no pre-scheduler guard needed.
 	let tid = core_scheduler().get_current_task_id();
 	info!("[STAGE0-FAULT] SYS_TEST_FAULT invoked by task {tid:?} -> scheduler::abort() (kill+resume harness)");
-	crate::scheduler::abort()
+	scheduler::abort()
 }
 
 pub(super) fn usleep(usecs: u64) {

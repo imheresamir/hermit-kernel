@@ -458,7 +458,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 			"[{core_id}][PANIC] in abort zone -> hard halt (recovery path)"
 		);
 		loop {
-			crate::arch::kernel::processor::halt();
+			kernel::processor::halt();
 		}
 	}
 	panic_println!("[{core_id}][PANIC] {info}\n");
@@ -480,7 +480,7 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 		);
 		if lsp != 0 {
 			let (hit_any, hit_x) =
-				crate::diagnostics::dump_frame_magic(lsp, "panic");
+				diagnostics::dump_frame_magic(lsp, "panic");
 			error!(
 				"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
 			);

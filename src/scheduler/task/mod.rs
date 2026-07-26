@@ -16,7 +16,7 @@ use core::{cmp, fmt};
 use ahash::RandomState;
 use crossbeam_utils::CachePadded;
 use hashbrown::HashMap;
-use hermit_sync::{OnceCell, RwSpinLock};
+use hermit_sync::RwSpinLock;
 use memory_addresses::VirtAddr;
 
 #[cfg(not(feature = "common-os"))]
@@ -25,7 +25,7 @@ use super::timer_interrupts::{Source, create_timer_abs};
 use crate::arch::kernel::core_local::*;
 use crate::arch::kernel::processor::{self, FPUState};
 use crate::arch::kernel::scheduler::TaskStacks;
-use crate::fd::{Fd, RawFd, stdio};
+use crate::fd::{Fd, RawFd};
 use crate::scheduler::CoreId;
 use crate::scheduler::supervisor::EntryPointId;
 
@@ -551,13 +551,32 @@ extern "C" fn default_placeholder_entry(_arg: usize) {
 }
 
 impl Task {
+	/// Build a fresh per-task file-descriptor map, seeded with the standard
+	/// streams (stdin/stdout/stderr). Every task owns its OWN `object_map` Arc
+	/// (Fork C / option-d §6.2 + I6 NO-LEAK GATE): when the task is reaped,
+	/// dropping this map drops each `Arc<Fd>`, which runs the fd's `Drop` (e.g.
+	/// `Socket::drop` queues a TCP FIN) so the peer gets a clean close instead
+	/// of an orphaned, frozen connection. This replaces the old single global
+	/// `OBJECT_MAP` `OnceCell`, whose shared map meant a killed task's fds were
+	/// never reclaimed (the `/fault` client-freeze bug).
+	fn new_object_map(
+	) -> Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>> {
+		use crate::fd::stdio;
+		let map = Arc::new(RwSpinLock::new(HashMap::<
+			RawFd,
+			Arc<async_lock::RwLock<Fd>>,
+			RandomState,
+		>::with_hasher(RandomState::with_seeds(0, 0, 0, 0))));
+		stdio::setup(&mut map.write());
+		map
+	}
+
 	pub fn new(
 		tid: TaskId,
 		core_id: CoreId,
 		task_status: TaskStatus,
 		task_prio: Priority,
 		stacks: TaskStacks,
-		object_map: Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
 	) -> Task {
 		debug!("Creating new task {tid} on core {core_id}");
 
@@ -574,7 +593,7 @@ impl Task {
 			slot: None,
 			wake_pending: false,
 			last_touch: Duration::ZERO,
-			object_map,
+			object_map: Self::new_object_map(),
 			// Phase 8 defaults: placeholder entry, Idle index, no restart.
 			// `into_task` (spawn) overwrites these for real application tasks.
 			// `Task::new` is used both for the idle task (which sets its own
@@ -594,44 +613,9 @@ impl Task {
 	pub fn new_idle(tid: TaskId, core_id: CoreId) -> Task {
 		debug!("Creating idle task {tid}");
 
-		/// Idle-task resume entry (aarch64 / Option D EL1t model).
-		///
-		/// The idle/boot task has no `SP_EL0` body stack and never re-enters
-		/// via `task_start` the way spawned tasks do (option-d doc §2.3 / D6).
-		/// Its `State` is built once at creation (see the `create_stack_frame`
-		/// call below) with `elr = task_start` and `x0 = idle_entry`, so when
-		/// the scheduler switches to the idle task, `trap_exit` restores this
-		/// frame and `task_start(idle_entry, 0)` runs `idle_entry` -> `run()`.
-		/// `run()` is the scheduler loop: it drains the executor, and when the
-		/// ready queue is empty it calls `enable_and_wait()` (wfi); the IRQ
-		/// handler (`do_irq`) then switches to a ready task. On the next park
-		/// the scheduler switches back to idle and `run()` resumes from the
-		/// wfi — i.e. the idle task re-enters `run()` by RESUME, not by fresh
-		/// call, so the boot stack is not consumed per idle cycle.
 		#[cfg(target_arch = "aarch64")]
 		unsafe extern "C" fn idle_entry(_arg: usize) -> () {
 			crate::scheduler::PerCoreScheduler::run();
-		}
-
-		/// All cores use the same mapping between file descriptor and the referenced object
-		static OBJECT_MAP: OnceCell<
-			Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>>,
-		> = OnceCell::new();
-
-		if core_id == 0 {
-			OBJECT_MAP
-				.set(Arc::new(RwSpinLock::new(HashMap::<
-					RawFd,
-					Arc<async_lock::RwLock<Fd>>,
-					RandomState,
-				>::with_hasher(
-					RandomState::with_seeds(0, 0, 0, 0),
-				))))
-				// This function is called once per core and thus only once on core 0.
-				// Thus, this is the only place where we set OBJECT_MAP.
-				.unwrap_or_else(|_| unreachable!());
-			let objmap = OBJECT_MAP.get().unwrap().clone();
-			stdio::setup(&mut objmap.write());
 		}
 
 		#[cfg(not(feature = "common-os"))]
@@ -668,7 +652,7 @@ impl Task {
 			slot: None,
 			wake_pending: false,
 			last_touch: Duration::ZERO,
-			object_map: OBJECT_MAP.get().unwrap().clone(),
+			object_map: Self::new_object_map(),
 			// Phase 8: the idle task's entry is idle_entry; it is never
 			// restarted (policy None, EntryPointId::Idle).
 			entry: idle_entry,
@@ -692,11 +676,28 @@ impl Task {
 	}
 }
 
-/*impl Drop for Task {
+impl Drop for Task {
 	fn drop(&mut self) {
+		// Fork C (option-d §6.2 + I6): dropping the `Task` drops its owned
+		// `object_map` Arc. When the last reference to the map goes away, the
+		// inner `HashMap` is dropped, which drops each `Arc<Fd>`; the fd's
+		// `Drop` (e.g. `Socket::drop`) then runs — closing sockets and
+		// queuing a TCP FIN so the peer gets a clean close. This is the
+		// task-scope resource reclamation that makes kill+resume leak-free.
+		// Run inside `cleanup_tasks`' `abort_zone` guard so any panic in an
+		// fd `Drop` halts (I4) instead of re-faulting (R9.8).
 		debug!("Drop task {}", self.id);
+		// When `self` (the `Task`, held in `Rc<RefCell<Task>>`) is freed by
+		// `cleanup_tasks`, `self.object_map` is dropped. Dropping the per-task
+		// map's last Arc reference releases the inner `HashMap`, which drops
+		// each `Arc<Fd>`; the fd's `Drop` (e.g. `Socket::drop`) then runs —
+		// queuing a TCP FIN so the peer gets a clean close. This is the
+		// task-scope resource reclamation that makes kill+resume leak-free
+		// (Fork C / option-d §6.2 + I6). The drop runs inside
+		// `cleanup_tasks`' `abort_zone` guard so any panic in an fd `Drop`
+		// halts (I4) instead of re-faulting (R9.8).
 	}
-}*/
+}
 
 struct BlockedTask {
 	task: Rc<RefCell<Task>>,

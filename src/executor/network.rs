@@ -243,6 +243,31 @@ pub(crate) fn wake_network_waker() {
 	NETWORK_WAKER.lock().wake();
 }
 
+/// Synchronously flush queued socket state by polling the NIC directly.
+///
+/// Called from `Socket::drop` (fd/socket/{tcp,udp}.rs) so a queued TCP FIN is
+/// transmitted even when the network task is dead (e.g. the async executor's
+/// driving task — the REPL — was just killed, stalling the executor, so the
+/// network task will never poll on its own). `try_lock` never blocks: if the
+/// NIC is held by a live network task we return and let it transmit.
+pub(crate) fn flush_nic() {
+	if let Some(mut guard) = NIC.try_lock() {
+		let now = now();
+		if let NetworkState::Initialized(nic) = &mut *guard {
+			nic.poll_common(now);
+			#[cfg(feature = "tcp")]
+			nic.reap_closed_sockets();
+		}
+	} else {
+		// NIC is held by a live network task: wake it so it transmits the
+		// queued FIN on its next poll (the FIN was already queued by
+		// `close()`). The network task outlives a killed REPL task, so this
+		// path covers the common case; the direct-poll branch above covers
+		// the case where the executor/network task is genuinely dead.
+		wake_network_waker();
+	}
+}
+
 async fn network_run() {
 	future::poll_fn(|cx| {
 		let Some(mut guard) = NIC.try_lock() else {
@@ -260,6 +285,8 @@ async fn network_run() {
 
 		if nic.poll_common(now) == PollResult::SocketStateChanged || cfg!(feature = "idle-poll") {
 			// Progress was made or we want to poll when idle.
+			#[cfg(feature = "tcp")]
+			nic.reap_closed_sockets();
 			cx.waker().wake_by_ref();
 		} else {
 			// Very likely no progress can be made, so set up a timer interrupt to wake the waker
@@ -374,6 +401,35 @@ impl<'a> NetworkInterface<'a> {
 	pub(crate) fn destroy_socket(&mut self, handle: Handle) {
 		// This deallocates the socket's buffers
 		self.sockets.remove(handle);
+	}
+
+	/// Reap sockets that have reached the terminal `Closed` state.
+	///
+	/// Since `Socket::drop` (fd/socket/{tcp,udp}.rs) no longer calls
+	/// `destroy_socket` directly — it only queues teardown (FIN) so the peer
+	/// gets a clean close even when the drop runs inside the task-reaping
+	/// path — the socket handle would otherwise linger in the NIC SocketSet
+	/// forever. This pass, run by the network task right after `poll_common`,
+	/// removes any socket smoltcp has driven to `Closed`. `TimeWait` is
+	/// managed internally by smoltcp and transitions to `Closed` on its own
+	/// timer, so reaping `Closed` only is safe (no in-flight retransmit is
+	/// discarded).
+	#[cfg(feature = "tcp")]
+	pub(crate) fn reap_closed_sockets(&mut self) {
+		let to_reap: Vec<SocketHandle> = self
+			.sockets
+			.iter()
+			.filter(|(_handle, socket)| {
+				// smoltcp 0.13 removed `Socket::as_tcp()`; downcast via the
+				// `AnySocket` trait instead (non-TCP sockets downcast to None).
+				tcp::Socket::downcast(socket)
+					.map_or(false, |t| t.state() == tcp::State::Closed)
+			})
+			.map(|(handle, _socket)| handle)
+			.collect();
+		for handle in to_reap {
+			self.sockets.remove(handle);
+		}
 	}
 
 	#[cfg(feature = "dns")]

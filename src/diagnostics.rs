@@ -18,7 +18,7 @@
 pub const MAGIC_SLOT_CORRUPTION: u64 = 0x60000207;
 
 /// Number of `u64` words in a saved `State` trap frame (ARCH_STATE_SIZE / 8).
-pub const STATE_WORDS: usize = crate::config::ARCH_STATE_SIZE / core::mem::size_of::<u64>();
+pub const STATE_WORDS: usize = crate::config::ARCH_STATE_SIZE / size_of::<u64>();
 
 /// Scan the saved trap frame at `frame_base` and report any word equal to
 /// [`MAGIC_SLOT_CORRUPTION`]. `label` is printed in each hit line so callers

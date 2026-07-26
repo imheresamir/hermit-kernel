@@ -221,7 +221,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 			// and slot>=0; only release when actually slot-resident (the
 			// kernel-stack-fallback path is not InSlot and must skip this).
 			if current_task_borrowed.frame_location == FrameLocation::InSlot {
-				crate::arch::kernel::slot_pool::release_slot(&current_task_borrowed);
+				kernel::slot_pool::release_slot(&current_task_borrowed);
 			}
 
 			let current_id = current_task_borrowed.id;
@@ -297,7 +297,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 							entry,
 							entry_arg,
 							prio,
-							crate::arch::kernel::core_local::core_id(),
+							core_id(),
 							crate::config::DEFAULT_STACK_SIZE,
 						);
 					}
@@ -331,7 +331,11 @@ impl From<NewTask> for Task {
 			stacks,
 			object_map,
 		} = value;
-		let mut task = Self::new(tid, core_id, TaskStatus::Ready, prio, stacks, object_map);
+		let mut task = Self::new(tid, core_id, TaskStatus::Ready, prio, stacks);
+		// Inherit the parent task's fd map (object_map) rather than the
+		// fresh one `Task::new` allocates — otherwise spawned tasks lose
+		// their inherited file descriptors.
+		task.object_map = object_map;
 		task.create_stack_frame(func, arg);
 		// Phase 8: retain the original entry point + arg and tag it with the
 		// stable AppTask entry-point index so `exit()` can respawn it when the
@@ -363,7 +367,9 @@ impl PerCoreScheduler {
 			prio,
 			core_id,
 			stacks,
-			object_map: core_scheduler().get_current_task_object_map(),
+			// Per-task fd table (D1): DEEP-COPY the parent's table so the child
+			// owns its own outer Arc. See clone_current_task_object_map / F2.
+			object_map: core_scheduler().clone_current_task_object_map(),
 		};
 		// Add it to the task lists.
 		let wakeup = {
@@ -439,7 +445,32 @@ impl PerCoreScheduler {
 			prio: current_task_borrowed.prio,
 			core_id,
 			stacks: TaskStacks::new(current_task_borrowed.stacks.get_user_stack_size()),
-			object_map: current_task_borrowed.object_map.clone(),
+			// Per-task fd table (D1): DEEP-COPY, don't share the outer Arc (F2).
+			// `current_task_borrowed` is already held, so build the copy inline
+			// rather than calling clone_current_task_object_map (which would
+			// re-borrow current_task).
+			object_map: {
+				let src = current_task_borrowed.object_map.read();
+				let mut map =
+					HashMap::<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>::with_hasher(
+						RandomState::with_seeds(0, 0, 0, 0),
+					);
+				for (fd, obj) in src.iter() {
+					map.insert(*fd, obj.clone());
+				}
+				debug_assert_eq!(
+					map.len(),
+					src.len(),
+					"INV-2: clone_task fd-table deep copy dropped an fd"
+				);
+				let new_object_map = Arc::new(RwSpinLock::new(map));
+				debug_assert_eq!(
+					Arc::strong_count(&new_object_map),
+					1,
+					"INV-1: clone_task fd-table outer Arc must be unique"
+				);
+				new_object_map
+			},
 		};
 
 		// Add it to the task lists.
@@ -614,11 +645,47 @@ impl PerCoreScheduler {
 		})
 	}
 
-	#[inline]
-	pub fn get_current_task_object_map(
+	/// Deep-copy the current task's fd table into a FRESH per-task table for a
+	/// child (POSIX fork semantics; fd-ownership-and-task-teardown.md §2/D1).
+	///
+	/// The OUTER `Arc` is NEW (strong_count 1), so the child owns its table and
+	/// `Task::drop` can reclaim it (fixes finding F2 — the old
+	/// `object_map.clone()` shared the outer Arc, so a dead task's `Task::drop`
+	/// only decremented it and never reached the inner map). Each VALUE
+	/// (`Arc<Fd>`) is Arc-cloned, so the underlying open descriptions ARE shared
+	/// with the parent and refcounted (I8 enforced structurally). Iterates the
+	/// FULL table (contrast `recreate_objmap`, which copies only fds 0-2).
+	pub fn clone_current_task_object_map(
 		&self,
 	) -> Arc<RwSpinLock<HashMap<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>>> {
-		without_interrupts(|| self.current_task.borrow().object_map.clone())
+		without_interrupts(|| {
+			let current_task = self.current_task.borrow();
+			let src = current_task.object_map.read();
+			let mut map = HashMap::<RawFd, Arc<async_lock::RwLock<Fd>>, RandomState>::with_hasher(
+				RandomState::with_seeds(0, 0, 0, 0),
+			);
+			for (fd, obj) in src.iter() {
+				map.insert(*fd, obj.clone());
+			}
+			// INV-2 (fd-ownership-and-task-teardown.md §7): the deep copy must
+			// preserve every fd VALUE handle of the source table.
+			debug_assert_eq!(
+				map.len(),
+				src.len(),
+				"INV-2: fd-table deep copy dropped an fd (copied {} of {})",
+				map.len(),
+				src.len()
+			);
+			let new_object_map = Arc::new(RwSpinLock::new(map));
+			// INV-1 (fd-ownership-and-task-teardown.md §7): the spawned child's
+			// fd-table OUTER Arc must be unique (per-task table, not shared).
+			debug_assert_eq!(
+				Arc::strong_count(&new_object_map),
+				1,
+				"INV-1: spawned task's fd-table outer Arc must be unique"
+			);
+			new_object_map
+		})
 	}
 
 	/// Map a file descriptor to their IO interface and returns
@@ -834,30 +901,46 @@ impl PerCoreScheduler {
 
 	/// Check if a finished task could be deleted.
 	///
-	/// Stage 3 (Fork C, option-d-per-task-slot-rebased.md §6.2 / R9.1 / R9.8):
+	/// Stage 3 (Fork C, option-d-per-task-slot-rebased.md §6.2 / R9.1 / R9.8;
+	/// AMENDED by fd-ownership-and-task-teardown.md — see caveats below):
 	/// Dropping the finished `Task` (via the `Rc<RefCell<Task>>` refcount
 	/// hitting 0 here) drops its `object_map` OUTER `Arc`. That drops each
 	/// entry's INNER `Arc<RwLock<Fd>>`. Because the inner `Arc` is the unit of
 	/// ownership, inner refcount==1 (task-PRIVATE FD) drops the `Fd` and runs
-	/// `Socket::drop` -> `block_on(self.close())` (tcp.rs:473 / udp.rs:256);
+	/// `Socket::drop`, which does NON-BLOCKING teardown: smoltcp `close()`
+	/// (queues the FIN) + `executor::network::flush_nic()` to transmit it
+	/// (tcp.rs / udp.rs). It does NOT call `block_on` — that model was removed
+	/// (R9.1 re-entrancy); see fd-ownership-and-task-teardown.md §5 (D2/D3).
 	/// inner refcount>1 (shared FD, dup'd or inherited from parent) is only
-	/// decremented and survives until the LAST holder exits (I8). So Fork C's
-	/// "reclaim task-private FDs, leave shared FDs alone" is achieved for FREE
-	/// by the existing `Task::drop` — NO explicit walk is needed, and doing
-	/// one inside `exit()`'s `without_interrupts` block would be UNSAFE
-	/// (R9.1: `block_on` re-enters the executor under without_interrupts).
+	/// decremented and survives until the LAST holder exits (I8).
 	///
-	/// R9.8 guard: `Socket::drop`'s `block_on` runs the async executor and can
-	/// PANIC (an executor task it wakes faults). We set THIS core's per-core
-	/// `abort_zone` around the drop so any such panic halts via I4
-	/// (processor::halt) instead of calling `scheduler::shutdown(1)` on a
+	/// IMPLEMENTED (fd-ownership-and-task-teardown.md, F1/F2/F5 — Stages A–C):
+	/// (1) F1: the refcount only reaches 0 because `scheduler()` resets
+	///     `fpu_owner` off the dying task (line ~1173); without that the task
+	///     is pinned and this drop NEVER runs. Guarded by INV-3(a)/(b).
+	/// (2) F2 (FIXED, Stage B): `spawn`/`clone_task` now DEEP-COPY the fd table
+	///     (`clone_current_task_object_map`, line ~658), so each task owns its
+	///     outer Arc (strong_count 1) and this drop DOES reach the inner map —
+	///     task-private FDs are reclaimed. Guarded by INV-1/INV-2.
+	/// (3) F5/D4: transmission of a queued FIN is guaranteed by the reap-path
+	///     `flush_nic()` poke after this fn returns (D4, INV-6/INV-7); the
+	///     `Socket::drop`-side poke is belt-and-suspenders.
+	///
+	/// R9.8 guard: `Socket::drop`'s teardown (`flush_nic()` → NIC `poll_common`)
+	/// runs the network poll and can PANIC (corrupted NIC state). We set THIS
+	/// core's per-core `abort_zone` around the drop so any such panic halts via
+	/// I4 (processor::halt) instead of calling `scheduler::shutdown(1)` on a
 	/// half-torn-down task. `cleanup_tasks` runs from `scheduler()`, which is
 	/// called by `reschedule()` AFTER `exit()`'s `without_interrupts` block has
 	/// ended and `current_task_borrowed` is dropped (mod.rs:245/257) — so the
-	/// context is safe for the executor re-entry.
-	fn cleanup_tasks(&mut self) {
-		use core::sync::atomic::Ordering;
+	/// context is safe.
+	/// Returns the number of tasks reaped (D4): the caller uses this to poke the
+	/// reactor (`flush_nic()`) exactly once after a non-empty reap, guaranteeing
+	/// a queued FIN is transmitted even if the system would otherwise go
+	/// straight to idle (fd-ownership-and-task-teardown.md §5.4).
+	fn cleanup_tasks(&mut self) -> usize {
 		let cl = CoreLocal::get();
+		let mut reaped: usize = 0;
 		// INVARIANT (I8 / Fork C): only FINISHED tasks are reaped here. A
 		// RUNNING task must never be in `finished_tasks` — reaping it would
 		// drop the live current task's resources out from under it.
@@ -871,6 +954,21 @@ impl PerCoreScheduler {
 		// the abort zone must halt (I4), not fall through to a half-cleared
 		// state and continue (findings #6 / #18). The store(false) below is
 		// reached only on the happy path.
+		// INV-3(b) (fd-ownership-and-task-teardown.md §7): before entering the
+		// abort zone, verify no task queued for reaping is still pinned by
+		// `fpu_owner` (finding F1). A pinned task would have `Task::drop`
+		// suppressed and its sockets would leak. Checked HERE, outside the
+		// abort zone, because a debug_assert panic inside the zone would halt
+		// the core (§7 rule: no assertions on abort-zone paths). INV-3(a) at
+		// the `Finished` branch is the primary guard; this is defense in depth.
+		#[cfg(debug_assertions)]
+		for finished_task in &self.finished_tasks {
+			debug_assert!(
+				!Rc::ptr_eq(&self.fpu_owner, finished_task),
+				"INV-3: reaping task {} still pinned by fpu_owner",
+				finished_task.borrow().id
+			);
+		}
 		cl.abort_zone.store(true, Ordering::SeqCst);
 		while let Some(finished_task) = self.finished_tasks.pop_front() {
 			debug_assert!(
@@ -887,8 +985,11 @@ impl PerCoreScheduler {
 			);
 			// `finished_task` dropped here -> Task::drop -> object_map outer Arc
 			// drop -> inner-Arc==1 FDs close (I8 satisfied).
+			drop(finished_task);
+			reaped += 1;
 		}
 		cl.abort_zone.store(false, Ordering::SeqCst);
+		reaped
 	}
 
 	#[cfg(feature = "smp")]
@@ -936,7 +1037,16 @@ impl PerCoreScheduler {
 			// do housekeeping
 			#[cfg(feature = "smp")]
 			core_scheduler.check_input();
-			core_scheduler.cleanup_tasks();
+			let reaped = core_scheduler.cleanup_tasks();
+			// D4 (fd-ownership-and-task-teardown.md §5.4): poke the reactor after
+			// a non-empty reap so a queued FIN is transmitted. Only meaningful on
+			// the I/O core (core 0), where the executor/NIC live.
+			#[cfg(feature = "net")]
+			if reaped > 0 && core_id() == 0 {
+				crate::executor::network::flush_nic();
+			}
+			#[cfg(not(feature = "net"))]
+			let _ = reaped;
 
 			if core_scheduler.ready_queue.is_empty() {
 				if backoff.is_completed() {
@@ -1123,7 +1233,22 @@ impl PerCoreScheduler {
 
 		// Someone wants to give up the CPU
 		// => we have time to cleanup the system
-		self.cleanup_tasks();
+		let reaped = self.cleanup_tasks();
+		// D4 (fd-ownership-and-task-teardown.md §5.4): if we reaped a task, poke
+		// the reactor ONCE so any FIN its `Socket::drop` queued is transmitted
+		// even if the system goes straight to idle. Runs here — after
+		// `cleanup_tasks` cleared the abort_zone and BEFORE the current_task
+		// borrow below (R9.1 clean-context rule). INV-6/INV-7.
+		if reaped > 0 && core_id() == 0 {
+			debug_assert!(
+				!CoreLocal::get().abort_zone.load(Ordering::Relaxed),
+				"INV-7: D4 reactor poke must run outside the abort zone"
+			);
+			#[cfg(feature = "net")]
+			crate::executor::network::flush_nic();
+		}
+		#[cfg(not(feature = "net"))]
+		let _ = reaped;
 
 		// Get information about the current task.
 		let (id, last_stack_pointer, prio, status) = {
@@ -1147,6 +1272,26 @@ impl PerCoreScheduler {
 		} else {
 			if status == TaskStatus::Finished {
 				// Mark the finished task as invalid and add it to the finished tasks for a later cleanup.
+				//
+				// If the dying task is the current FPU owner, release that reference:
+				// `fpu_owner` holds an `Rc` clone of the task (set in `switch_to_fpu_owner`
+				// whenever a task first touches the FPU). That clone would otherwise keep
+				// the dead task's `Rc` alive forever, so `Task::drop` (which reclaims the
+				// task's `object_map` and closes its sockets — Fork C / option-d §6) would
+				// never run and accepted TCP connections would leak with no FIN sent to the
+				// peer. Reset it to `idle_task`, the natural FPU owner while no app task runs.
+				if Rc::ptr_eq(&self.fpu_owner, &self.current_task) {
+					self.fpu_owner = self.idle_task.clone();
+				}
+				// INV-3(a) (fd-ownership-and-task-teardown.md §7): after the reset,
+				// `fpu_owner` must NOT alias the finishing task, or its `Rc` clone
+				// would pin the task and `Task::drop` (fd reclamation) would never
+				// run (finding F1). This is the guarantee behind D2.
+				debug_assert!(
+					!Rc::ptr_eq(&self.fpu_owner, &self.current_task),
+					"INV-3: fpu_owner still aliases the just-finished task {}",
+					self.current_task.borrow().id
+				);
 				self.current_task.borrow_mut().status = TaskStatus::Invalid;
 				self.finished_tasks.push_back(self.current_task.clone());
 			}
@@ -1270,7 +1415,7 @@ pub(crate) fn abort() -> ! {
 	match try_core_scheduler() {
 		Some(s) => s.exit(-1),
 		None => loop {
-			crate::arch::kernel::processor::halt();
+			kernel::processor::halt();
 		},
 	}
 }

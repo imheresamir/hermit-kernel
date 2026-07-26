@@ -7,7 +7,6 @@ use smoltcp::socket::udp::UdpMetadata;
 use smoltcp::wire::{IpEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::errno::Errno;
-use crate::executor::block_on;
 use crate::executor::network::{Handle, NIC, wake_network_waker};
 use crate::fd::{self, Endpoint, ListenEndpoint, ObjectInterface, PollEvent, SocketOption};
 use crate::io;
@@ -254,7 +253,22 @@ impl ObjectInterface for Socket {
 
 impl Drop for Socket {
 	fn drop(&mut self) {
-		let _ = block_on(self.close(), None);
-		NIC.lock().as_nic_mut().unwrap().destroy_socket(self.handle);
+		// Fork C / option-d (client-clean-disconnect fix): deactivate the
+		// UDP socket synchronously (queue teardown) WITHOUT `block_on`, so
+		// `Socket::drop` is safe inside the task-reaping path
+		// (`cleanup_tasks` → `scheduler()` under `without_interrupts`) where
+		// re-entering the executor (R9.1) would panic/halt under `abort_zone`.
+		// We do NOT `destroy_socket` here: that would discard the socket
+		// before the network task has drained it. The network task reaps
+		// closed sockets (`reap_closed_sockets`).
+		//
+		// Best-effort synchronous flush: `flush_nic()` polls the NIC only if
+		// it is free (releasing the socket's buffers promptly avoids a
+		// dangling handle in the NIC SocketSet); otherwise it relies on the
+		// (live) network task.
+		self.with(|socket| {
+			socket.close();
+		});
+		crate::executor::network::flush_nic();
 	}
 }

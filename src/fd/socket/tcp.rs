@@ -12,7 +12,6 @@ use smoltcp::wire::{IpEndpoint, Ipv4Address, Ipv6Address};
 
 use crate::config::DEFAULT_KEEP_ALIVE_INTERVAL;
 use crate::errno::Errno;
-use crate::executor::block_on;
 use crate::executor::network::{Handle, NIC, wake_network_waker};
 use crate::fd::{self, Endpoint, Fd, ListenEndpoint, ObjectInterface, PollEvent, SocketOption};
 use crate::io;
@@ -472,11 +471,31 @@ impl ObjectInterface for Socket {
 
 impl Drop for Socket {
 	fn drop(&mut self) {
-		let _ = block_on(self.close(), None);
-
-		let mut guard = NIC.lock();
-		for h in self.handle.iter() {
-			guard.as_nic_mut().unwrap().destroy_socket(*h);
-		}
+		// Fork C / option-d (client-clean-disconnect fix): when this task is
+		// reaped, queue a FIN so the peer gets a clean close — WITHOUT
+		// `block_on(self.close())`.
+		//
+		// Why not `block_on`: `Socket::drop` runs inside the task-reaping
+		// path (`cleanup_tasks` -> `scheduler()` under `without_interrupts`),
+		// where `block_on` would re-enter the executor (`run()`) to flush the
+		// FIN — that is the R9.1 panic/halt hazard, and the `abort_zone`
+		// guard would convert it to a core halt. Instead we queue the FIN
+		// here (smoltcp `tcp::Socket::close()` enqueues FIN + transitions to
+		// FinWait1).
+		//
+		// We then flush the queued FIN SYNCHRONOUSLY via `flush_nic()`, which
+		// polls the NIC directly. This is required because the network task
+		// may be dead (e.g. the async executor's driving task — the REPL —
+		// was just killed, stalling the executor): relying on
+		// `wake_network_waker()` alone would leave the FIN sitting in the
+		// send buffer forever, freezing the peer (the original /fault bug).
+		self.with(|socket| {
+			if socket.is_active() {
+				socket.close();
+			}
+		});
+		// `flush_nic()` tries to lock the NIC and poll directly; if the NIC
+		// is held by a live network task it falls back to `wake_network_waker()`.
+		crate::executor::network::flush_nic();
 	}
 }
