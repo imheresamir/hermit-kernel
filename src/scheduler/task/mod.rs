@@ -70,9 +70,17 @@ fn alloc_bitmap_id() -> usize {
 ///
 /// # Safety
 ///
-/// `id` must be a value previously returned by `alloc_bitmap_id()`.
+/// `id` must be a value previously returned by `alloc_bitmap_id()`. The pool is
+/// only ever touched during scheduler bring-up (single-threaded, before any
+/// task runs), and `NEXT_BITMAP_ID` is monotonically increasing and guarded by
+/// `alloc_bitmap_id`'s `assert!`, so `id` is always in range and the slot is
+/// never accessed after the one-time init. This is the documented boot-time-only
+/// invariant (review B11) — `static mut` here is acceptable only because of that
+/// single-threaded, one-time access pattern.
 #[inline]
 unsafe fn bitmap_ptr(id: usize) -> *mut CachePadded<u64> {
+	// SAFETY: `id < MAX_BITMAP_POOL` (enforced by alloc_bitmap_id); the pool is
+	// only written during single-threaded boot, so no data race on the slot.
 	unsafe { core::ptr::addr_of_mut!(BITMAP_POOL[id].bitmap) }
 }
 

@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,7 +71,16 @@ pub(crate) struct CoreLocal {
 	/// Offset 16 (= 2×8): u64, 8-byte aligned. Updated on EVERY switch (D1/D3)
 	/// before `trap_exit` runs, because a freshly-switched task body may call a
 	/// `kernel_function` on its first instruction.
-	pub(crate) kernel_sp: u64,
+	///
+	/// Wrapped in `UnsafeCell<u64>` (review B3): the only writer is
+	/// `set_kernel_sp` (the scheduler on THIS core, between `ensure_slot` and
+	/// the asm switch, with interrupts disabled — no concurrent writer and no
+	/// concurrent Rust reader; the asm reads it by fixed offset 16, which is
+	/// layout-compatible with `UnsafeCell<u64>` since it is `#[repr(transparent)]`).
+	/// The previous code wrote through a raw pointer derived from `&self`, which
+	/// is unsound in the abstract; `UnsafeCell` makes the interior-mutability
+	/// explicit and removes the cast.
+	pub(crate) kernel_sp: UnsafeCell<u64>,
 	/// Current task's **scratch-slot TOP** (per-task exception slot design).
 	/// This is the top of the task's private exception scratch slot; the D4
 	/// tail (start.s `trap_exit`) loads it into SP_EL1 on every EL1t return so
@@ -159,7 +168,7 @@ impl CoreLocal {
 			exception_sp: e_top,
 			this: ptr::null_mut(),
 			core_id,
-			kernel_sp: e_top, // D1/D6: boot/idle default = E (per-core exception stack).
+			kernel_sp: UnsafeCell::new(e_top), // D1/D6: boot/idle default = E (per-core exception stack).
 			// Updated to the incoming task's kernel-stack top on every
 			// switch (start.s switch path).
 			// Per-task exception slot design: `scratch_slot` holds the TOP of
@@ -170,9 +179,6 @@ impl CoreLocal {
 			// (per-task-exception-slot-design.md Step 1). Initializing to
 			// e_top keeps boot correct; the switch path republishes the real
 			// per-task slot top on the first dispatch.
-			// TODO(slot-pool): once .exception_slots is allocated, set this
-			// to `slot_pool_base(core_id) + SLOT_STRIDE * 0 + SLOT_SIZE`
-			// (core 0's slot 0 top = idle task's slot) per doc V-D5.
 			scratch_slot: e_top,
 			scheduler: Cell::new(ptr::null_mut()),
 			irq_statistics,
@@ -216,24 +222,38 @@ impl CoreLocal {
 	/// BEFORE the asm switch path (start.s). The asm publishes scratch_slot
 	/// (@24) but NOT kernel_sp (@16); call_with_kernel_stack reads kernel_sp
 	/// to set SP_EL1 for deep handler work. This must be set per-task-switch.
+	/// §4D: Update kernel_sp for the incoming task. Called from the scheduler
+	/// (this core only, between `ensure_slot` and the asm switch, with
+	/// interrupts disabled) — see the field's SAFETY note for the
+	/// single-writer invariant. The asm reads this value by fixed offset 16
+	/// (`ldr x9,[x9,#16]` / `str x1,[x2,#16]` in start.s) after the
+	/// `get_last_stack_pointer` `bl` (a compiler barrier), so the store is
+	/// ordered before the switch.
 	///
-	/// SAFETY: the caller must ensure `sp` is a valid kernel-stack top for the
-	/// task about to be dispatched. A stale value causes call_with_kernel_stack
-	/// to run deep work on the wrong stack → overflow → silent corruption.
+	/// SAFETY (interior mutability): `kernel_sp` is an `UnsafeCell`. This is
+	/// the only writer and there is no concurrent reader (the asm read happens
+	/// after this returns, on the same core, with the barrier above). Reading
+	/// via `get()` and writing via `set()` is therefore race-free here.
 	pub fn set_kernel_sp(&self, sp: u64) {
-		// kernel_sp is not behind a Cell (unlike scheduler/scheduler_input),
-		// so we write through a volatile raw pointer. This is safe because:
-		//  (a) only the scheduler on this core calls this, between ensure_slot
-		//      and the asm switch — no concurrent writer,
-		//  (b) the asm reads this AFTER the `bl get_last_stack_pointer` return,
-		//      which is a compiler barrier (bl implies memory clobber).
+		// SAFETY (interior mutability): `kernel_sp` is an `UnsafeCell`. This is
+		// the only writer and there is no concurrent reader (the asm read happens
+		// after this returns, on the same core, with the `bl` barrier). We obtain
+		// a `*mut u64` via `UnsafeCell::get()` and write through it directly
+		// (avoiding `write_volatile`, which is unnecessary here — the store is
+		// ordered before the asm switch by the `bl` compiler barrier).
 		unsafe {
-			let ptr = (self as *const Self as *mut Self)
-				.cast::<u8>()
-				.add(core::mem::offset_of!(Self, kernel_sp))
-				.cast::<u64>();
-			ptr.write_volatile(sp);
+			*self.kernel_sp.get() = sp;
 		}
+	}
+
+	/// Read the current `kernel_sp` (see field + `set_kernel_sp` SAFETY notes).
+	/// Used by `call_with_kernel_stack` to assert the scheduler updated it
+	/// before deep handler work.
+	#[inline]
+	pub fn get_kernel_sp(&self) -> u64 {
+		// SAFETY: the field is only ever written here on this core; reading the
+		// current value via `UnsafeCell::get()` is race-free in that context.
+		unsafe { *self.kernel_sp.get() }
 	}
 
 	pub fn add_irq_counter(&self) {

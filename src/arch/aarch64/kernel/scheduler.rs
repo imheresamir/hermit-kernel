@@ -552,6 +552,15 @@ impl TaskFrame for Task {
 
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn get_last_stack_pointer() -> u64 {
+	// LEAF-FUNCTION INVARIANT (review A4): this function is called from the
+	// aarch64 switch path (`bl get_last_stack_pointer` in start.s, right after
+	// `str x1,[x0]` saves the OLD frame base). The `bl` clobbers x30 (LR) and
+	// AAPCS64 allows x0-x18 to be clobbered across the call. Correctness of the
+	// switch depends on this staying a LEAF (no nested calls that disturb x1/x2
+	// — the old frame base / slot pointer the macro still needs after the bl).
+	// trap_exit restores x30 from the frame, and we return the result in x0.
+	// DO NOT turn this into a non-leaf (e.g. call another function) without
+	// re-auditing the switch-path clobber set.
 	// Trap next FPU instruction so we can lazily restore FPU state
 	CPACR_EL1.modify(CPACR_EL1::FPEN::TrapEl0El1);
 	isb(SY);

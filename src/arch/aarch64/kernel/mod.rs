@@ -141,10 +141,12 @@ pub(crate) fn protect_stack_guards() {
 			&__start_exception_slots as *const u8 as usize,
 		]
 	};
-	// Per-slot stack size from config.rs, parallel to `section_bases` above.
-	// The exception stack is DEFAULT_STACK_SIZE (128KiB) -- a scratch stack for
-	// trap_entry + dispatch (§1.1); deep handler work runs on the task's kernel
-	// stack. All four sources (link.x, start.rs, core_local.rs, here) are 128KiB.
+	// Per-slot stack size from config.rs. PARALLEL to `section_bases` above:
+	// index `i` here is the stack size for section `i` in `section_bases` (same
+	// 7-element order: exception, irq, overflow, task, reactor, idle,
+	// exception_slots). Keep the two arrays element-for-element in sync — adding
+	// a new section requires updating BOTH, or guard unmapping for the new
+	// section is silently skipped (review C6).
 	let stacks: [usize; 7] = [
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,

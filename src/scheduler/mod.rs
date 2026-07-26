@@ -187,27 +187,8 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 				"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} exit_code={exit_code} (0x60000207 = SPSR-shaped panic index)"
 			);
 			if lsp != 0 {
-				let slot = lsp as *const u64;
-				let mut hit_any = false;
-				let mut hit_x = false;
-				for i in 0..36u64 {
-					let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
-					let is_x = i >= 5 && i <= 35;
-					if v == 0x60000207 {
-						hit_any = true;
-						if is_x {
-							hit_x = true;
-						}
-						error!(
-							"[ABORT-DUMP] slot[{i}] @+{:#x} = 0x60000207  <<< MATCH (is_x={is_x})",
-							8 * i
-						);
-					} else if i == 2 {
-						error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (spsr)", 8 * i, v);
-					} else if i == 1 {
-						error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (elr)", 8 * i, v);
-					}
-				}
+				let (hit_any, hit_x) =
+					crate::diagnostics::dump_frame_magic(lsp, "exit");
 				error!(
 					"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
 				);
@@ -948,10 +929,6 @@ impl PerCoreScheduler {
 			// build core 0 is the only core, so this is behavior-preserving.
 			// INV-R8.1: executor::run() is drained ONLY on the I/O core.
 			if core_id() == 0 {
-				debug_assert!(
-					core_id() == 0,
-					"executor::run() drained off the I/O core violates M8.4 INV-R8.1"
-				);
 				// run async tasks
 				crate::executor::run();
 			}
@@ -1011,8 +988,6 @@ impl PerCoreScheduler {
 
 			// EL1h GATE (R5 errata): slot relocation is ONLY valid for EL1t
 			// frames. An EL1t context resumes on SP_EL0, so its State frame
-			// can live anywhere — the frame's address carries no meaning to
-			// the resumed code. An EL1h context, however, resumes on SP_EL1,
 			// and trap_exit's 18 ldp pops define resume SP = frame_base + 288:
 			// the frame's ADDRESS *is* the resume stack pointer. Copying an
 			// EL1h frame into a slot makes the task resume with SP = slot top
@@ -1028,6 +1003,15 @@ impl PerCoreScheduler {
 				if spsel & 1 == 1 {
 					return;
 				}
+			} else {
+				// DEFENSE-IN-DEPTH (review B5): a task with
+				// `last_stack_pointer == 0` and `frame_location == InSlot`
+				// would skip this EL1h/spsel check. The only way to reach
+				// here with frame==0 is a task whose frame was never set
+				// (which would be a separate bug), so we intentionally fall
+				// through to "treat as EL1t, acquire a slot" — the SAFE
+				// default (acquiring a slot can't corrupt a kernel stack the
+				// way in-place EL1h dispatch of a zero frame would).
 			}
 		}
 

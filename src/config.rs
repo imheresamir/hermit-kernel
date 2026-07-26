@@ -34,8 +34,8 @@ const _: () = assert!(
 	"EXCEPTION_SLOT_SIZE must be a multiple of the page size (0x1000) so the frame page and guard page are disjoint"
 );
 const _: () = assert!(
-	EXCEPTION_SLOT_SIZE >= 0x8000,
-	"EXCEPTION_SLOT_SIZE must be a real exception-stack size (>= 32 KiB): it holds State PLUS the full handler call chain (do_sync's debug frame alone is ~0x25a0 B), not just a State frame"
+	EXCEPTION_SLOT_SIZE >= 0x10000,
+	"EXCEPTION_SLOT_SIZE must be >= 64 KiB: it holds State PLUS the full handler call chain (do_sync's debug frame alone is ~0x25a0 B), not just a State frame. The old 0x8000 (32 KiB) floor was too tight — a slot exactly 32 KiB passes this assert but faults at runtime under deep handler nesting (review C5)."
 );
 /// Number of scratch slots per core. 3 = running + blocked + dispatch slack.
 pub const SLOTS_PER_CORE: usize = 3;

@@ -72,7 +72,7 @@ macro_rules! kernel_function_impl {
 				// stack → overflow → silent memory corruption (not caught by hardware
 				// until adjacent memory is already clobbered).
 				assert!(
-					CoreLocal::get().kernel_sp != 0,
+					CoreLocal::get().get_kernel_sp() != 0,
 					"call_with_kernel_stack: kernel_sp is zero — scheduler did not update CoreLocal.kernel_sp (§4D)"
 				);
 

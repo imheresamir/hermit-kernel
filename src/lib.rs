@@ -114,6 +114,7 @@ pub mod console;
 mod drivers;
 mod entropy;
 mod env;
+mod diagnostics;
 pub mod errno;
 mod executor;
 pub mod fd;
@@ -478,29 +479,8 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 			"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} panic_loc={loc} (0x60000207 = SPSR-shaped panic index)"
 		);
 		if lsp != 0 {
-			let slot = lsp as *const u64;
-			let mut hit_any = false;
-			let mut hit_x = false;
-			for i in 0..36u64 {
-				let v = unsafe { core::ptr::addr_of!(*slot.add(i as usize)).read_volatile() };
-				// State layout: spsel@0, elr@8, spsr@16, sp_el0@24, x0@40..x30@280
-				// => x-slots are u64 indices 5..35.
-				let is_x = i >= 5 && i <= 35;
-				if v == 0x60000207 {
-					hit_any = true;
-					if is_x {
-						hit_x = true;
-					}
-					error!(
-						"[ABORT-DUMP] slot[{i}] @+{:#x} = 0x60000207  <<< MATCH (is_x={is_x})",
-						8 * i
-					);
-				} else if i == 2 {
-					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (spsr)", 8 * i, v);
-				} else if i == 1 {
-					error!("[ABORT-DUMP] slot[{i}] @+{:#x} = {:#x}  (elr)", 8 * i, v);
-				}
-			}
+			let (hit_any, hit_x) =
+				crate::diagnostics::dump_frame_magic(lsp, "panic");
 			error!(
 				"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
 			);

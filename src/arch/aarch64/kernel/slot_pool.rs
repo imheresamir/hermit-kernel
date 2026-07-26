@@ -94,9 +94,17 @@ static CORE_SLOTS: [CoreSlotOwners; 4] = [const { CoreSlotOwners::new() }; 4];
 
 #[inline]
 fn owners_for_core(core: usize) -> &'static CoreSlotOwners {
-	// SAFETY: CORE_SLOTS is sized for the documented core maximum; callers
-	// pass a valid core_id (0..N). Out-of-range would be a kernel bug.
-	&CORE_SLOTS[core.min(CORE_SLOTS.len() - 1)]
+	// Assert (not the previous silent `.min()` clamp): the pool is sized for
+	// the documented core maximum, and `core` comes from `core_id()`, which is
+	// bounded by `max_bootable_cores()`. A clamp would have silently mapped an
+	// OOB core onto the last pool (a real correctness hazard on a >4-core
+	// build) — fail loud instead (review B1).
+	assert!(
+		core < CORE_SLOTS.len(),
+		"owners_for_core: core {core} >= CORE_SLOTS pool size {} (linker core count exceeds pool; grow CORE_SLOTS)",
+		CORE_SLOTS.len()
+	);
+	&CORE_SLOTS[core]
 }
 
 /// Allocate a scratch slot for `task` on the current core, copy its State
@@ -120,6 +128,11 @@ pub fn dispatch_acquire_slot(task: &mut Task) -> bool {
 	// or by a prior eviction resume).
 	let src = task.last_stack_pointer.as_u64() as *const u64;
 	let dst = frame_base as *mut u64;
+	// SAFETY (review C8): `src` and `dst` are both mapped, RW, naturally-
+	// aligned State frames (36 u64 words; STATE_SIZE/8). They are distinct
+	// allocations of identical size, so a word-by-word copy neither overlaps
+	// nor overruns. `#[repr(C)] State` guarantees the layout/alignment the
+	// raw-pointer reads/writes require.
 	unsafe {
 		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);
@@ -208,6 +221,11 @@ pub fn evict_victim(victim: &mut Task, slot_idx: usize) -> bool {
 	let frame_base = top - STATE_SIZE as u64;
 	let src = frame_base as *const u64;
 	let dst = victim.last_stack_pointer.as_u64() as *mut u64;
+	// SAFETY (review C8): `src` and `dst` are both mapped, RW, naturally-
+	// aligned State frames (36 u64 words; STATE_SIZE/8). They are distinct
+	// allocations of identical size, so a word-by-word copy neither overlaps
+	// nor overruns. `#[repr(C)] State` guarantees the layout/alignment the
+	// raw-pointer reads/writes require.
 	unsafe {
 		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);
@@ -259,6 +277,11 @@ pub fn resume_from_evicted(task: &mut Task) -> bool {
 	let frame_base = top - STATE_SIZE as u64;
 	let src = task.last_stack_pointer.as_u64() as *const u64;
 	let dst = frame_base as *mut u64;
+	// SAFETY (review C8): `src` and `dst` are both mapped, RW, naturally-
+	// aligned State frames (36 u64 words; STATE_SIZE/8). They are distinct
+	// allocations of identical size, so a word-by-word copy neither overlaps
+	// nor overruns. `#[repr(C)] State` guarantees the layout/alignment the
+	// raw-pointer reads/writes require.
 	unsafe {
 		for w in 0..(STATE_SIZE / size_of::<u64>()) {
 			*dst.add(w) = *src.add(w);

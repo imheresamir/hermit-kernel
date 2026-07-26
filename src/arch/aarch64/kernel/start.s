@@ -174,6 +174,16 @@ b       do_bad_mode
 	// indexing: this is a halt path, so there is no "own stack" to avoid
 	// (and indexing would walk past the 1-core section on core>=1).
 	adrp x0, __start_overflow_stacks
+	// INVARIANT (review A2): `adrp`/`add` addressing is limited to a 4 GiB
+	// page-aligned range relative to the PC. This is always satisfied because
+	// the kernel image (text + .overflow_stacks) is linked as a single,
+	// contiguous ~tens-of-MiB block, so any section symbol is well within 4 GiB
+	// of any handler. If link.x ever moves .overflow_stacks (or any referenced
+	// section) gigabytes away from the exception vectors, this `adrp` silently
+	// truncates and the rescue path lands on the wrong stack. The const _: ()
+	// asserts in interrupts.rs pin the SIZE/STRIDE immediates, but NOT the
+	// addressability; a linker-script ASSERT on the section's distance from
+	// _start is the durable guard if the layout ever changes.
 	add  x0, x0, #:lo12:__start_overflow_stacks
 	add  x0, x0, #0x8, lsl #12       // + KERNEL_STACK_SIZE = rescue top
 	mov  x1, sp                      // x1 = the BAD SP_EL1 (for diagnostics)
