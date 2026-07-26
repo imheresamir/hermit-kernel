@@ -115,10 +115,14 @@ pub extern "C" fn sys_abort() -> ! {
 /// explicit syscall (the same kill path `sys_abort` takes) rather than a synthetic fault.
 /// The rs6 REPL `/fault` command invokes it. Returns `!` (it never returns).
 ///
-/// (review finding #16: gated behind `debug_assertions`. In a release build this symbol
-/// does not exist, so a production userspace task cannot invoke a self-kill test hook;
-/// the dev kernel + dev-built rs6 both keep it for the harness. No cross-crate feature
-/// wiring needed — both sides are governed by the same cargo profile.)
+/// (review finding #16: gated behind `debug_assertions`. In a release build
+/// this symbol does NOT exist, so the rs6 `/fault` command — which references
+/// it from an `unsafe extern "C"` block also gated the same way — FAILS TO
+/// LINK, not fails at runtime. That is a build-time guarantee (a production
+/// userspace task simply cannot name this syscall), stronger than a runtime
+/// guard. The dev kernel + dev-built rs6 both keep it for the harness; both
+/// sides are governed by the same cargo profile, so the symbol is present iff
+/// the reference is compiled.)
 #[cfg(debug_assertions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_test_fault() -> ! {

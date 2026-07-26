@@ -284,16 +284,24 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 			if supervisor::should_restart(ep_id) {
 				// (finding #11) The entry pointer comes from the dead task's
 				// struct and the very fault we just handled may have corrupted
-				// it. Before jumping into an arbitrary code pointer, reject the
-				// two most likely garbage values (null and the sentinel
-				// `usize::MAX`). A respawn onto a bad entry would be a
-				// secondary fault with no diagnostics — fail closed instead.
+				// it. Reject the two obvious garbage values (null and the
+				// sentinel `usize::MAX`), AND require the pointer to fall
+				// within the kernel image range (review N2): a corrupted code
+				// pointer is far more likely to be a plausible-looking address
+				// pointing at a data page, heap, or unmapped memory than 0 or
+				// ~0. Jumping there would be a secondary fault with no
+				// diagnostics — fail closed instead. `kernel_start_address` /
+				// `kernel_end_address` are the same bounds already asserted for
+				// the exception stacks at core_local.rs:142-148.
 				let entry_addr = entry as usize;
-				if entry_addr == 0 || entry_addr == usize::MAX {
+				let in_image = entry_addr
+					>= crate::mm::kernel_start_address().as_u64() as usize
+					&& entry_addr < crate::mm::kernel_end_address().as_u64() as usize;
+				if entry_addr == 0 || entry_addr == usize::MAX || !in_image {
 					warn!(
 						"[SUPERVISOR] refusing respawn of {:?}: entry pointer \
-						 corrupted ({entry_addr:#x}) — not restarting",
-						ep_id
+						 corrupt ({entry_addr:#x}, in_image={}) — not restarting",
+						ep_id, in_image
 					);
 				} else {
 					debug!(

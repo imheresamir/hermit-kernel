@@ -139,11 +139,16 @@ const _: () = assert!(
 /// reaching here from a memory bug.)
 pub fn should_restart(id: EntryPointId) -> bool {
 	let idx = id as usize;
+	// Single lock acquisition for the whole operation (review N1): the bounds
+	// check and the `may_restart` mutation both go through the same guard, so
+	// there is no window where the (fixed-size today) table could change
+	// between the check and the use. Uses `assert!` (not `debug_assert!`) —
+	// an OOB index on this static array is UB and must hold in release.
+	let mut table = RESTART_TABLE.lock();
 	assert!(
-		idx < RESTART_TABLE.lock().len(),
+		idx < table.len(),
 		"EntryPointId discriminant {idx} out of RESTART_TABLE range (corrupted id?)"
 	);
 	let now = crate::arch::kernel::processor::get_timer_ticks();
-	let mut table = RESTART_TABLE.lock();
 	table[idx].may_restart(now)
 }
