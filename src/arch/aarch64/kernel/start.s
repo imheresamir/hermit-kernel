@@ -216,15 +216,35 @@ b       do_bad_mode
 .macro df_check_el1h flavor
 	msr  tpidrro_el0, x0
 	mrs  x0, tpidr_el1               // &CoreLocal
+	// R3.1: a sync fault taken from INSIDE a nested RT handler has
+	// rt_nest_depth (offset 32) > 0 and SP_EL1 on the exception stack E (not a
+	// task's scratch_slot). Validate against the E window; the original
+	// scratch_slot check would FALSELY trip here. Off-core / non-nested (==0)
+	// stays on the task slot and uses the original check.
+	ldr  x1, [x0, #32]               // rt_nest_depth
+	cbz  x1, df_slotcheck_\flavor    // ==0 -> task context (scratch_slot)
+	// nested RT handler: E window = [e_top - DEFAULT_STACK_SIZE, e_top]
+	ldr  x0, [x0, #0]                // exception_sp (e_top)
+	sub  x0, x0, #0x2, lsl #12       // e_top - 0x20000 (DEFAULT_STACK_SIZE E)
+	sub  x0, sp, x0                  // delta = sp - e_base
+	cmp  x0, #0x2, lsl #12           // delta < 0x20000?
+	b.lo df_ok_\flavor               // ok: sp inside E
+	mrs  x0, tpidrro_el0
+	b    df_fail_\flavor
+df_slotcheck_\flavor:
 	ldr  x0, [x0, #24]               // scratch_slot (slot top)
 	sub  x0, x0, #0x11, lsl #12      // slot_bottom - GUARD (top - 0x11000)
 	sub  x0, sp, x0                  // delta = sp - guard_base (unsigned)
 	cmp  x0, #0x4, lsl #12           // delta < 0x4000 (GUARD 0x1000 + MARGIN 0x3000)?
-	b.lo 9f                          // -> sp in guard or about to blow the slot
+	b.lo df_ok_\flavor               // -> sp in guard or about to blow the slot
 	mrs  x0, tpidrro_el0             // ok: restore and fall through
-	b    8f
-9:	df_fatal 1, \flavor
-8:
+	b    df_fail_\flavor
+df_ok_\flavor:
+	mrs  x0, tpidrro_el0             // restore saved x0
+	b    df_end_\flavor
+df_fail_\flavor:
+	df_fatal 1, \flavor
+df_end_\flavor:
 .endm
 
 

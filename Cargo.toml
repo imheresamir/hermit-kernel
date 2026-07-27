@@ -63,6 +63,14 @@ default = [
 ## (without this feature) never trigger it. Keep this feature-flagged, do NOT
 ## delete — it is the regression harness for the slot-safety milestones.
 double-fault-injection = []
+## Spike 1 (rtic-gicv3-async-reactor.md §13 Phase A): GICv3 PMR-as-BASEPRI
+## preemption primitive. Feature-gated so the production kernel is byte-identical.
+## Two test SGIs (LO=14, HI=15) prove nested priority preemption via PMR ceiling
+## + PSTATE.I re-enable, and that a 0x00 PMR (all-masked) blocks HI. De-risks the
+## thesis-invalidating claim that ICC_PMR_EL1 = BASEPRI on GICv3. Inert unless set.
+pmr-preempt-spike = []
+pmr-band = []  # Spike 2: per-band executor + COOP-SGI waker + RT->COOP bridge. Inert unless set.
+pmr-coop-net = []  # Spike 3: COOP-band executor drives network_run via SGI waker; EOImode=1 + INV-P6 EOI counter. Inert unless set.
 #! ### Syscall Features
 
 ## Enables multiple address spaces.

@@ -51,6 +51,27 @@ const _: () = assert!(
 	"EXCEPTION_SLOT_GUARD must be >= one page (0x1000) for protect_stack_guards"
 );
 
+/// Dedicated per-core stack for the RT-band interrupt handler (Spike 2 / Phase B,
+/// rtic-gicv3-async-reactor.md §13 R3.4). The RT-band SGI ISR runs
+/// bounded RT-band work on this stack instead of the shared exception stack E,
+/// so an RT-handler overrun faults at its OWN guard page (R3.4) rather than
+/// clobbering E or the next category.
+///
+/// SIZING: the RT ISR does the PMR-ceiling raise + band-waker pend (bounded,
+/// no executor, no deep call chain) — so a 32 KiB kernel stack (matching
+/// .irq_stacks / .overflow_stacks discipline) is ample. MUST be page-aligned
+/// (BasePageSize = 0x1000): protect_stack_guards() unmaps one 4 KiB guard
+/// tail per core and the stack body must not alias it.
+pub(crate) const RT_STACK_SIZE: usize = 0x8000;
+const _: () = assert!(
+	RT_STACK_SIZE % 0x1000 == 0,
+	"RT_STACK_SIZE must be a multiple of the page size (0x1000) so the guard page is disjoint"
+);
+const _: () = assert!(
+	RT_STACK_SIZE >= 0x8000,
+	"RT_STACK_SIZE must be >= 32 KiB: the RT ISR's ceiling-raise + waker-pend path needs real depth (mirrors KERNEL_STACK_SIZE)"
+);
+
 pub(crate) const USER_STACK_SIZE: usize = 0x0010_0000;
 
 #[cfg(feature = "virtio")]

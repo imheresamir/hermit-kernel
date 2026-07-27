@@ -90,6 +90,7 @@ pub(crate) fn protect_stack_guards() {
 		static __start_reactor_stacks: u8;
 		static __start_idle_stacks: u8;
 		static __start_exception_slots: u8;
+		static __start_rt_stacks: u8;
 		static __end_exception_slots: u8;
 	}
 
@@ -130,7 +131,7 @@ pub(crate) fn protect_stack_guards() {
 		}
 	}
 
-	let section_bases: [usize; 7] = unsafe {
+	let section_bases: [usize; 8] = unsafe {
 		[
 			&__start_exception_stacks as *const u8 as usize,
 			&__start_irq_stacks as *const u8 as usize,
@@ -139,15 +140,16 @@ pub(crate) fn protect_stack_guards() {
 			&__start_reactor_stacks as *const u8 as usize,
 			&__start_idle_stacks as *const u8 as usize,
 			&__start_exception_slots as *const u8 as usize,
+			&__start_rt_stacks as *const u8 as usize,
 		]
 	};
 	// Per-slot stack size from config.rs. PARALLEL to `section_bases` above:
 	// index `i` here is the stack size for section `i` in `section_bases` (same
-	// 7-element order: exception, irq, overflow, task, reactor, idle,
-	// exception_slots). Keep the two arrays element-for-element in sync — adding
+	// 8-element order: exception, irq, overflow, task, reactor, idle,
+	// exception_slots, rt). Keep the two arrays element-for-element in sync — adding
 	// a new section requires updating BOTH, or guard unmapping for the new
 	// section is silently skipped (review C6).
-	let stacks: [usize; 7] = [
+	let stacks: [usize; 8] = [
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
 		KERNEL_STACK_SIZE,
@@ -155,6 +157,7 @@ pub(crate) fn protect_stack_guards() {
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
 		EXCEPTION_SLOT_SIZE, // per-task scratch slot
+		RT_STACK_SIZE,       // Spike 2 / Phase B RT-band handler stack (R3.4)
 	];
 
 	let n = max_bootable_cores();

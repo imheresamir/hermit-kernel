@@ -412,6 +412,13 @@ fn boot_processor_main() -> ! {
 	// Start the initd task.
 	unsafe { PerCoreScheduler::spawn(initd, 0, scheduler::task::NORMAL_PRIO, 0, USER_STACK_SIZE) };
 
+	// Spike-1 (rtic-gicv3-async-reactor.md §13 Phase A): fire the PMR-as-BASEPRI
+	// preemption harness from the fully-up idle loop (NOT at IRQs-enabled time,
+	// where the BSP GIC self-SGI generation can race the early boot shuffle).
+	// Feature-gated; inert in production.
+	#[cfg(feature = "pmr-preempt-spike")]
+	interrupts::pmr_spike_trigger();
+
 	// Run the scheduler loop.
 	PerCoreScheduler::run();
 }

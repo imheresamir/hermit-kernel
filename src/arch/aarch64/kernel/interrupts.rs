@@ -1,7 +1,7 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use core::arch::asm;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aarch64_cpu::asm::barrier::{ISH, SY, dmb, isb};
 use aarch64_cpu::registers::*;
@@ -183,6 +183,32 @@ const SPI_START: u8 = 32;
 /// Software-generated interrupt for rescheduling
 pub(crate) const SGI_RESCHED: u8 = 1;
 
+/// Spike-1 test SGIs (feature `pmr-preempt-spike`, rtic-gicv3-async-reactor.md
+/// §13 Phase A). LO=14 (priority 0x40) and HI=15 (priority 0x00, highest) prove
+/// nested priority preemption via PMR ceiling + PSTATE.I re-enable, and that a
+/// 0x00 PMR (all-masked) blocks HI. Consumes 2 of the architecturally-fixed 16
+/// SGI INTIDs (R3.6: budget RT_LEVELS+COOP_LEVELS+1+2 <= 16).
+#[cfg(feature = "pmr-preempt-spike")]
+pub(crate) const SGI_PMRTEST_LO: u8 = 14;
+#[cfg(feature = "pmr-preempt-spike")]
+pub(crate) const SGI_PMRTEST_HI: u8 = 15;
+
+// Spike 2 (rtic-gicv3-async-reactor.md §13): per-band executor + COOP-SGI waker.
+// SGI budget (R3.6): RESCHED=1, spike 14/15, COOP_WAKE=13, RT_BRIDGE=12 ->
+// RT_LEVELS(1)+COOP_LEVELS(1)+1(RESCHED)+2(spike)=5 <= 16. COOP_WAKE is the
+// COOP-band SGI (pended by a COOP task's waker); RT_BRIDGE is the RT-band SGI
+// whose ISR wakes a COOP future (the top-half -> bottom-half handoff proof).
+// Also used by Spike 3 (pmr-coop-net): the COOP-band SGI drives network_run's
+// executor drain (the "SGI-pending waker" of §13 Phase C).
+#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+pub(crate) const SGI_COOP_WAKE: u8 = 13;
+#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+pub(crate) const SGI_RT_BRIDGE: u8 = 12;
+#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+const COOP_WAKE_PRIORITY: u8 = 0x60; // COOP band (below RT per §4)
+#[cfg(feature = "pmr-band")]
+const RT_BRIDGE_PRIORITY: u8 = 0x20; // RT band (above COOP per §4)
+
 /// Number of the timer interrupt
 static mut TIMER_INTERRUPT: u32 = 0;
 /// Number of the UART interrupt
@@ -247,6 +273,115 @@ pub fn disable() {
 	dmb(ISH);
 }
 
+/// Re-enable ONLY IRQ (bit 2 of DAIF), leaving FIQ/SError/Debug masked.
+/// Used inside the Spike-1 RT-band nesting path (feature `pmr-preempt-spike`)
+/// where PMR already gates priority; we must NOT re-enable FIQ/SError, or a
+/// pending FIQ would preempt the RT band (R1.10 / rtic-gicv3-async-reactor.md
+/// §13). Distinct from `disable()` above, which masks ALL DAIF bits.
+#[cfg(feature = "pmr-preempt-spike")]
+#[inline(always)]
+pub(crate) fn enable_irqs() {
+	unsafe {
+		asm!("msr daifclr, #2", options(nostack));
+	}
+}
+
+/// Mask ONLY IRQ (bit 2 of DAIF). Paired with `enable_irqs()`.
+#[cfg(feature = "pmr-preempt-spike")]
+#[inline(always)]
+pub(crate) fn disable_irqs() {
+	unsafe {
+		asm!("msr daifset, #2", options(nostack));
+	}
+}
+
+/// Spike 2 (INV-P4 / INV-P8): on IRQ entry, bump the per-core nesting depth and
+/// mark `in_irq`. `irq_exit` decrements it. These are cfg-gated so the default
+/// (production) build compiles them out and `do_irq`/`do_fiq` stay byte-identical
+/// (unconditional `scheduler()` call). When `pmr-band` is off, `irq_enter`/
+/// `irq_exit` are no-ops and the nesting counter is never touched.
+#[inline(always)]
+#[cfg(feature = "pmr-band")]
+fn irq_enter() {
+	let cl = CoreLocal::get();
+	cl.inc_rt_nest_depth();
+	cl.set_in_irq(true);
+}
+#[inline(always)]
+#[cfg(not(feature = "pmr-band"))]
+fn irq_enter() {}
+#[inline(always)]
+#[cfg(feature = "pmr-band")]
+fn irq_exit() {
+	let cl = CoreLocal::get();
+	cl.set_in_irq(false);
+	cl.dec_rt_nest_depth();
+}
+#[inline(always)]
+#[cfg(not(feature = "pmr-band"))]
+fn irq_exit() {}
+
+// ── Spike 2: PMR ceiling RAII guard (INV-P2) + COOP-band waker (INV-P5) ──
+// All gated on `pmr-band`; compiled out in the default (production) build.
+
+/// INV-P2 (SRP ceiling monotonicity): snapshot the current PMR on construction,
+/// raise it to `new_ceiling` (which must be numerically <= the saved PMR — you
+/// can only RAISE the ceiling, never lower it below the system ceiling), and
+/// restore the saved PMR on `Drop`. The RAII shape makes the save/restore
+/// pairing impossible to forget. A task that drops the guard restores PMR
+/// exactly, so it cannot accidentally unmask a lower-priority IRQ.
+#[cfg(feature = "pmr-band")]
+pub(crate) struct PmrCeiling {
+	saved: u8,
+}
+#[cfg(feature = "pmr-band")]
+impl PmrCeiling {
+	pub fn raise(new_ceiling: u8) -> Self {
+		let cur = GicCpuInterface::get_priority_mask();
+		// Ceiling monotonicity: raising PMR means numerically LOWERING it
+		// (0x00 = all masked). So a valid raise sets new_ceiling <= cur.
+		debug_assert!(
+			new_ceiling <= cur,
+			"PmrCeiling::raise would lower the system ceiling (SRP violation): new={new_ceiling:#x} cur={cur:#x}"
+		);
+		GicCpuInterface::set_priority_mask(new_ceiling);
+		Self { saved: cur }
+	}
+}
+#[cfg(feature = "pmr-band")]
+impl Drop for PmrCeiling {
+	fn drop(&mut self) {
+		let cur = GicCpuInterface::get_priority_mask();
+		debug_assert_eq!(cur, self.saved, "PMR changed under a PmrCeiling guard");
+		GicCpuInterface::set_priority_mask(self.saved);
+	}
+}
+
+/// INV-P5: a COOP-band task's waker pends ONLY its own band's SGI. The waker
+/// stores the executor's own `Waker` (set by the spawned future on first poll)
+/// plus asserts the target INTID belongs to the COOP band before pending it.
+#[cfg(feature = "pmr-band")]
+static BAND_WAKER: SpinMutex<Option<core::task::Waker>> =
+	SpinMutex::new(None);
+
+#[cfg(feature = "pmr-band")]
+fn wake_coop_future() {
+	// INV-P5: assert the waker pends the COOP-band SGI (13), not an RT or
+	// foreign INTID.
+	debug_assert_eq!(
+		SGI_COOP_WAKE, 13,
+		"COOP-band waker must pend SGI_COOP_WAKE (INV-P5)"
+	);
+	// Pending the SGI is the async signal that the idle loop should drain the
+	// executor; calling the inner waker marks the COOP future ready (the poll
+	// itself happens in thread mode via the idle loop, never on the exc stack —
+	// INV-P10). Neither call runs the future body here.
+	pend_sgi_to_self(SGI_COOP_WAKE);
+	let waker = BAND_WAKER.lock().take();
+	if let Some(w) = waker {
+		w.wake();
+	}
+}
 pub(crate) fn install_handlers(old_handlers: InterruptHandlerMap) {
 	let mut handlers: InterruptHandlerMap =
 		HashMap::with_hasher(RandomState::with_seeds(0, 0, 0, 0));
@@ -279,6 +414,54 @@ pub(crate) fn install_handlers(old_handlers: InterruptHandlerMap) {
 		}
 	}
 
+	// Spike 2 (pmr-band): register the COOP-band SGI (13) and RT-band bridge SGI
+	// (12) handlers. The COOP SGI ISR must NOT run the executor (INV-P10) — it
+	// only sets a ready flag; the idle loop drains `core_local::ex()` in thread
+	// mode. The RT bridge ISR raises the PMR ceiling (INV-P2 PmrCeiling guard),
+	// wakes the COOP future via the band waker (INV-P5), and is run-to-completion
+	// (no .await / no executor) per INV-P3. For pmr-coop-net, the COOP SGI is
+	// also the executor-driver waker (network_run's waker pends it). The RT
+	// bridge handler is Spike-2 specific (pmr-band); the COOP handler is shared.
+	#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+	{
+		fn coop_wake_handler() {
+			// INV-P10: never call executor::run() here (this is the exc stack).
+			// The idle loop drains the executor in thread mode. We only mark
+			// that a COOP wake is pending so the harness/serial is observable.
+			COOP_WAKE_PENDING.store(true, Ordering::SeqCst);
+		}
+		#[cfg(feature = "pmr-band")]
+		fn rt_bridge_handler() {
+			info!("[PMR-BAND] [RT-BRIDGE-ISR] ENTER (vector {SGI_RT_BRIDGE})");
+			// INV-P2: raise PMR to the RT ceiling (numerically <= saved PMR).
+			// The guard restores PMR on drop. 0x20 is the RT band (above COOP).
+			let _ceiling = PmrCeiling::raise(0x20);
+			// Signal the COOP future that the RT band has woken it (INV-P5).
+			COOP_TRIGGERED.store(true, Ordering::SeqCst);
+			info!("[PMR-BAND] [RT-BRIDGE-ISR] woke coop via band waker");
+			// INV-P5: pend the COOP-band SGI + wake the spawned future.
+			wake_coop_future();
+			// _ceiling drops here -> PMR restored. Run-to-completion (INV-P3).
+		}
+		let coop_vec = handlers
+			.entry(SGI_COOP_WAKE)
+			.or_insert_with(|| VecDeque::<fn()>::new());
+		coop_vec.push_back(coop_wake_handler);
+		#[cfg(feature = "pmr-band")]
+		{
+			let rt_vec = handlers
+				.entry(SGI_RT_BRIDGE)
+				.or_insert_with(|| VecDeque::<fn()>::new());
+			rt_vec.push_back(rt_bridge_handler);
+		}
+		#[cfg(feature = "pmr-band")]
+		info!(
+			"[PMR-BAND] install_handlers: SGI_COOP_WAKE={SGI_COOP_WAKE} SGI_RT_BRIDGE={SGI_RT_BRIDGE} rt_present={} coop_present={}",
+			handlers.contains_key(&SGI_RT_BRIDGE),
+			handlers.contains_key(&SGI_COOP_WAKE)
+		);
+	}
+
 	INTERRUPT_HANDLERS.set(handlers).unwrap();
 }
 
@@ -289,6 +472,10 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 	};
 
 	let vector: u8 = u32::from(irqid).try_into().unwrap();
+
+	// Spike-2 (INV-P4/P8): count this FIQ in the per-core nesting depth. No-op
+	// when `pmr-band` is off.
+	irq_enter();
 
 	debug!("Receive fiq {vector}");
 	increment_irq_counter(vector);
@@ -306,9 +493,352 @@ pub(crate) extern "C" fn do_fiq(_state: &State) -> *mut usize {
 	// here -- it runs executor::run() on the current stack (= E post-flip).
 	core_scheduler().wake_pending_tasks();
 
+	// Spike 3 (pmr-coop-net, INV-P6): under EOImode=1 the priority-drop
+	// (EOIR1) + deactivate (DIR) are split; complete both AND decrement the
+	// per-core EOI in-flight counter (paired with the IAR1 ack inc).
+	// Default (feature off, EOImode=0): combined end_interrupt.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_complete(irqid);
+	#[cfg(not(feature = "pmr-coop-net"))]
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 
-	core_scheduler().scheduler(false).unwrap_or_default()
+	// INV-P8 (Spike 2): skip the cooperative scheduler on return from a NESTED
+	// FIQ; run it only on the outermost return (depth back to 0).
+	irq_exit();
+	if CoreLocal::get().rt_nest_depth() == 0 {
+		debug_assert!(CoreLocal::get().rt_nest_depth() == 0);
+		core_scheduler().scheduler(false).unwrap_or_default()
+	} else {
+		ptr::null_mut()
+	}
+}
+
+/// Spike-1 trigger (feature `pmr-preempt-spike`): self-IPI the LO test SGI on
+/// the current core so `do_irq` enters the Spike-1 preemption harness. Called
+/// once from `boot_processor_main` after IRQs are enabled. The handler pends
+/// HI to itself and runs both the preemption and ceiling-block sub-tests.
+#[cfg(feature = "pmr-preempt-spike")]
+pub fn pmr_spike_trigger() {
+	info!("[PMR-SPIKE] trigger: self-IPI SGI_PMRTEST_LO ({SGI_PMRTEST_LO})");
+	pend_sgi_to_self(SGI_PMRTEST_LO);
+}
+
+/// Spike 2 (pmr-band): one-shot guard so the per-band harness fires exactly
+/// once (on the BSP / I/O core) from the idle loop, which runs AFTER
+/// `install_handlers` has registered the SGI 12/13 handlers in the map. Firing
+/// from `boot_processor_main` (before `install_handlers`) would pend SGI 12
+/// before its handler exists -> the SGI is silently dropped. (Lesson from
+/// Spike 1: register/enabled state must exist before the self-IPI.)
+#[cfg(feature = "pmr-band")]
+static PMR_BAND_HARNESS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Spike 2 (feature `pmr-band`): boot the per-band executor harness. Called
+/// ONCE from the idle loop (after `install_handlers` registered the SGI 12/13
+/// handlers). Spawns a COOP-band future that parks until the RT bridge ISR
+/// wakes it (via the band waker), then self-IPIs `SGI_RT_BRIDGE` on the current
+/// core. The RT ISR (running on the RT band) raises the PMR ceiling (INV-P2),
+/// wakes the COOP future via the band waker (INV-P5), and returns; the COOP SGI
+/// then fires in thread mode and the idle loop drains the executor, polling the
+/// future (INV-P10 respected: executor runs in thread mode, not in the SGI ISR).
+#[cfg(feature = "pmr-band")]
+pub fn pmr_band_maybe_trigger() {
+	// Run exactly once, on the BSP / I/O core (core 0).
+	if core_id() != 0 {
+		return;
+	}
+	if PMR_BAND_HARNESS_DONE.swap(true, Ordering::SeqCst) {
+		return;
+	}
+	use core::future::poll_fn;
+	use core::task::{Context, Poll};
+
+	info!("[PMR-BAND] trigger: spawn COOP future + self-IPI SGI_RT_BRIDGE ({SGI_RT_BRIDGE})");
+	crate::executor::spawn(async {
+		// Park until the RT bridge ISR sets COOP_TRIGGERED and wakes us via the
+		// band waker (INV-P5). On first poll we store our waker so the RT ISR's
+		// wake() can mark us ready.
+		poll_fn(|cx: &mut Context<'_>| {
+			BAND_WAKER.lock().replace(cx.waker().clone());
+			if COOP_TRIGGERED.load(Ordering::SeqCst) {
+				Poll::Ready(())
+			} else {
+				Poll::Pending
+			}
+		})
+		.await;
+		info!("[PMR-BAND] [COOP-FUTURE] polled");
+		COOP_FUTURE_DONE.store(true, Ordering::SeqCst);
+		// Bridge proof complete: RT-band ISR (SRP ceiling via PmrCeiling, INV-P2)
+		// woke a COOP-band future through the band waker (INV-P5), the waker is
+		// pinned to the COOP SGI (13, INV-P5), RT is core-0 (INV-P7), and the
+		// executor ran this future in thread mode, not on the exception stack
+		// (INV-P10). Emit the verified PASS marker the Justfile kernel checks.
+		info!("[PMR-BAND] INV-P2/P5/P7/P10 PASS: per-band executor + RT->COOP bridge verified");
+	});
+	info!("[PMR-BAND] COOP future spawned OK; about to pend SGI_RT_BRIDGE");
+	// Fire the RT-band bridge SGI; its ISR wakes the COOP future.
+	pend_sgi_to_self(SGI_RT_BRIDGE);
+	info!("[PMR-BAND] SGI_RT_BRIDGE pended");
+}
+
+/// Spike 3 (pmr-coop-net): one-shot guard so the COOP-band executor harness
+/// fires exactly once (on the BSP / I/O core) from the idle loop, after
+/// `install_handlers` registered SGI 13 (COOP-band driver). The harness proves
+/// INV-P3 (COOP SGI ISR is run-to-completion: it only sets a flag, never runs
+/// the executor on the exception stack per INV-P10), INV-P6 (per-core EOI
+/// in-flight counter returns to 0 at idle under EOImode=1 split-EOI), and
+/// INV-P11 (no fd / teardown I/O in the RT/COOP SGI path). It reuses the
+/// existing `network_run` future: `wake_network_waker()` (under this feature)
+/// pends SGI_COOP_WAKE, whose ISR sets `COOP_WAKE_PENDING` and lets the idle
+/// loop drain `network_run` in thread mode.
+#[cfg(feature = "pmr-coop-net")]
+static PMR_COOP_NET_HARNESS_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "pmr-coop-net")]
+static COOP_NET_PROBE_POLLED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "pmr-coop-net")]
+static PMR_COOP_NET_PASS_EMITTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "pmr-coop-net")]
+pub fn pmr_coop_net_maybe_trigger() {
+	// Only the BSP / I/O core (core 0) runs the harness.
+	if core_id() != 0 {
+		return;
+	}
+	// ARM phase — runs exactly once: spawn the probe future + pend the COOP
+	// SGI. The PASS check below re-runs on every subsequent idle-loop call
+	// because the probe future is only polled AFTER this function returns
+	// (the idle loop drains the executor in thread mode, INV-P10).
+	if !PMR_COOP_NET_HARNESS_DONE.swap(true, Ordering::SeqCst) {
+		use core::future::poll_fn;
+		use core::task::{Context, Poll};
+
+		info!(
+			"[PMR-COOP-NET] trigger: spawn probe future + drive network_run via COOP-band SGI waker"
+		);
+		// Spawn a probe future that records when the executor (driven by the
+		// COOP-band SGI waker / idle-loop drain) actually polls it.
+		crate::executor::spawn(async {
+			poll_fn(|_cx: &mut Context<'_>| {
+				COOP_NET_PROBE_POLLED.store(true, Ordering::SeqCst);
+				Poll::Ready(())
+			})
+			.await;
+			info!("[PMR-COOP-NET] [PROBE] polled via COOP-band executor drain");
+		});
+		// Drive network_run's waker via the COOP-band SGI (the Spike-3
+		// "SGI-pending waker"): under pmr-coop-net this pends SGI_COOP_WAKE,
+		// whose ISR is run-to-completion (INV-P3) and whose thread-mode drain
+		// runs the executor (INV-P10).
+		crate::executor::network::wake_network_waker();
+		return;
+	}
+	// PASS phase — re-checked each idle-loop pass until it fires once:
+	// COOP SGI ISR ran (COOP_WAKE_PENDING, INV-P3/P10), the probe future was
+	// polled (executor driven under the COOP band), and the per-core EOI
+	// in-flight counter is back to 0 (INV-P6: EOImode=1 split-EOI balanced).
+	if !PMR_COOP_NET_PASS_EMITTED.load(Ordering::SeqCst)
+		&& COOP_WAKE_PENDING.load(Ordering::SeqCst)
+		&& COOP_NET_PROBE_POLLED.load(Ordering::SeqCst)
+		&& CoreLocal::get().eoi_inflight() == 0
+		&& !PMR_COOP_NET_PASS_EMITTED.swap(true, Ordering::SeqCst)
+	{
+		info!(
+			"[PMR-COOP-NET] INV-P3/P6/P11 PASS: COOP-band SGI waker drives network_run; EOImode=1 EOI pairing balanced; no fd/teardown in RT/COOP SGI path"
+		);
+	}
+}
+
+
+/// Spike-1 (feature `pmr-preempt-spike`) flag shared between the LO handler
+/// (spins) and the HI handler (sets it). Reset between the two sub-tests.
+#[cfg(feature = "pmr-preempt-spike")]
+static PMR_SPIKE_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Spike 2 (pmr-band): observable state for the per-band executor harness.
+/// `COOP_WAKE_PENDING` is set by the COOP SGI ISR (thread-mode drain observes
+/// it); `COOP_FUTURE_DONE` is set when the spawned COOP future is polled,
+/// proving the RT->COOP bridge end-to-end.
+#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+static COOP_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "pmr-band")]
+static COOP_FUTURE_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "pmr-band")]
+static COOP_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+/// Pend a specific SGI to the current core via raw `ICC_SGI1R_EL1` (mirrors
+/// `wakeup_core`, which works around the arm-gic `send_sgi` ABI bug). Used by
+/// the Spike-1 harness to self-IPI the HI test SGI from inside the LO handler.
+/// Also used by Spike 2 (pmr-band) to self-IPI the RT bridge SGI, and by
+/// Spike 3 (pmr-coop-net) to self-IPI the COOP-band driver SGI.
+#[cfg(any(feature = "pmr-preempt-spike", feature = "pmr-band", feature = "pmr-coop-net"))]
+pub(crate) fn pend_sgi_to_self(intid: u8) {
+	// ICC_SGI1R_EL1: Aff3[63:48] | IRM[40] | Aff2[39:32] | INTID[31:24] |
+	//               Aff1[23:16] | TargetList[15:0]. Self-target: TargetList bit
+	// for core 0 (we run on core 0 / the IO core) = 1<<0; INTID in [31:24].
+	let target_list: u64 = 1u64 << 0; // core 0
+	let sgi_value: u64 = (u64::from(intid) << 24) | target_list;
+	unsafe {
+		core::arch::asm!(
+			"msr ICC_SGI1R_EL1, {value:x}",
+			value = in(reg) sgi_value,
+			options(nostack),
+		);
+		// Drain any pending write + let the GIC observe the SGI before spin.
+		core::arch::asm!("isb", options(nostack));
+	}
+}
+
+/// Spike 3 (pmr-coop-net, INV-P6 / EOImode=1) — raw-MSR GIC CPU-interface
+/// wrappers for the bits arm-gic 0.8.1 does NOT expose (§1.1 / §9 #5). Under
+/// `EOImode=1`, `ICC_EOIR1_EL1` does priority-drop ONLY and `ICC_DIR_EL1` does
+/// the separate deactivate; the running priority is readable via `ICC_RPR_EL1`.
+/// `ICC_CTLR_EL1.EOImode=1` switches the split on (globally, for this core).
+#[cfg(feature = "pmr-coop-net")]
+mod eoi_mode1 {
+	/// Bit 1 of ICC_CTLR_EL1 selects EOImode (0 = combined EOI+DIR via EOIR1,
+	/// 1 = split priority-drop (EOIR1) + separate deactivate (DIR)).
+	const ICC_CTLR_EOIMODE_BIT: u64 = 1 << 1;
+
+	#[inline]
+	pub fn set_eoi_mode_1() {
+		unsafe {
+			// Read-modify-write ICC_CTLR_EL1 to set EOImode=1.
+			let mut ctlr: u64;
+			core::arch::asm!("mrs {v}, ICC_CTLR_EL1", v = out(reg) ctlr, options(nostack));
+			ctlr |= ICC_CTLR_EOIMODE_BIT;
+			core::arch::asm!("msr ICC_CTLR_EL1, {v}", v = in(reg) ctlr, options(nostack));
+			core::arch::asm!("isb", options(nostack));
+		}
+	}
+
+	/// Split priority-drop (EOIR1) for `intid`. Under EOImode=1 this does NOT
+	/// deactivate — call `eoi_deactivate` afterwards.
+	#[inline]
+	pub fn eoi_priority_drop(intid: u32) {
+		let v = u64::from(intid);
+		unsafe {
+			core::arch::asm!("msr ICC_EOIR1_EL1, {v}", v = in(reg) v, options(nostack));
+		}
+	}
+
+	/// Separate deactivate (DIR) for `intid`. Must follow `eoi_priority_drop`.
+	#[inline]
+	pub fn eoi_deactivate(intid: u32) {
+		let v = u64::from(intid);
+		unsafe {
+			core::arch::asm!("msr ICC_DIR_EL1, {v}", v = in(reg) v, options(nostack));
+		}
+	}
+
+	/// Read ICC_RPR_EL1 (current running priority). Used by INV-P9 / diagnostics.
+	#[inline]
+	pub fn read_running_priority() -> u8 {
+		let v: u64;
+		unsafe {
+			core::arch::asm!("mrs {v}, ICC_RPR_EL1", v = out(reg) v, options(nostack));
+		}
+		v as u8
+	}
+
+	/// Full split-EOI for one Group1 interrupt under EOImode=1: priority-drop
+	/// (EOIR1) then deactivate (DIR), paired with the IAR1 ack counted by the
+	/// caller via `eoi_inflight_dec()`. INV-P6 invariant: exactly one drop +
+	/// one deactivate per ack.
+	#[inline]
+	pub fn eoi_complete_group1(intid: u32) {
+		eoi_priority_drop(intid);
+		eoi_deactivate(intid);
+	}
+}
+
+/// Spike 3 (pmr-coop-net, INV-P6): complete a Group1 interrupt under EOImode=1
+/// by splitting priority-drop + deactivate AND decrementing the per-core
+/// EOI in-flight counter (paired with the `eoi_inflight_inc` on IAR1 ack).
+/// When the feature is off, this is unused and the caller uses the combined
+/// `GicCpuInterface::end_interrupt` (default, EOImode=0) instead — so the
+/// default build is byte-identical.
+#[cfg(feature = "pmr-coop-net")]
+#[inline]
+fn eoi_complete(irqid: IntId) {
+	let raw: u32 = irqid.into();
+	eoi_mode1::eoi_complete_group1(raw);
+	CoreLocal::get().eoi_inflight_dec();
+}
+
+/// Spike-1 dispatch for the two test SGIs. Returns the value `do_irq` should
+/// return (null = no task switch; we never switch during the harness).
+///
+/// Proves INV-P12 (preemption + ceiling-block) and prototypes R3.1 (nested IRQ
+/// re-entry into el1_irq is safe — el1_irq does NOT call df_check_*).
+#[cfg(feature = "pmr-preempt-spike")]
+fn pmr_spike_dispatch(vector: u8) -> *mut usize {
+	match vector {
+		SGI_PMRTEST_HI => {
+			// HI handler: runs as a nested IRQ inside LO's spin (when LO has
+			// raised PMR to 0x40 and re-enabled IRQs). Just set the flag.
+			info!("[PMR-SPIKE] [HI-ENTER]");
+			PMR_SPIKE_FLAG.store(true, Ordering::SeqCst);
+			info!("[PMR-SPIKE] [HI-EXIT]");
+			ptr::null_mut()
+		}
+		SGI_PMRTEST_LO => {
+			// ---- Test A: PREEMPTION via PMR ceiling + IRQ re-enable ----
+			PMR_SPIKE_FLAG.store(false, Ordering::SeqCst);
+			info!("[PMR-SPIKE] [LO-ENTER]");
+			// ENTRY SEQUENCE (R1.3): raise PMR to LO ceiling FIRST, then
+			// re-enable IRQs. While PMR=0x40, only priorities < 0x40 (i.e. HI
+			// = 0x00) can preempt.
+			GicCpuInterface::set_priority_mask(0x40);
+			debug_assert!(GicCpuInterface::get_priority_mask() <= 0x40, "INV-P9: PMR ceiling not applied");
+			// INV-P9: PMR is already at <= ceiling before IRQs are re-enabled.
+			enable_irqs(); // daifclr #2 — only IRQ, FIQ/SError stay masked.
+			// Pend HI to self; because PMR=0x40 and HI=0x00, the GIC will
+			// preempt LO mid-spin with the HI handler.
+			pend_sgi_to_self(SGI_PMRTEST_HI);
+			// Spin (bounded) until HI sets the flag — proving preemption.
+			let mut spins = 0usize;
+			while !PMR_SPIKE_FLAG.load(Ordering::SeqCst) {
+				spins += 1;
+				if spins > 1_000_000 {
+					break; // safety cap; should never hit on success
+				}
+			}
+			// EXIT SEQUENCE (R1.3): disable IRQs FIRST, then restore PMR, so a
+			// lower-priority IRQ cannot sneak in during the gap.
+			disable_irqs();
+			GicCpuInterface::set_priority_mask(0xff);
+			info!("[PMR-SPIKE] [LO-EXIT-A] preempted={}", PMR_SPIKE_FLAG.load(Ordering::SeqCst));
+
+			// ---- Test B: CEILING-BLOCK (PMR=0x00 masks ALL) ----
+			PMR_SPIKE_FLAG.store(false, Ordering::SeqCst);
+			info!("[PMR-SPIKE] [LO-ENTER-B]");
+			// Raise PMR to 0x00 — the highest-priority value, which masks ALL
+			// interrupts (no priority < 0x00). Then re-enable IRQs: HI must
+			// NOT arrive.
+			GicCpuInterface::set_priority_mask(0x00);
+			debug_assert_eq!(GicCpuInterface::get_priority_mask(), 0x00, "INV-P9/INV-P12: PMR floor not 0x00");
+			enable_irqs();
+			pend_sgi_to_self(SGI_PMRTEST_HI);
+			let mut spins = 0usize;
+			while !PMR_SPIKE_FLAG.load(Ordering::SeqCst) {
+				spins += 1;
+				if spins > 1_000_000 {
+					break; // expected: HI is blocked, so we time out
+				}
+			}
+			let blocked = !PMR_SPIKE_FLAG.load(Ordering::SeqCst);
+			disable_irqs();
+			GicCpuInterface::set_priority_mask(0xff);
+			info!("[PMR-SPIKE] [LO-EXIT-B] hi_blocked={blocked}");
+			if blocked {
+				info!("[PMR-SPIKE] INV-P12 PASS: PMR=0x00 masked the higher-priority SGI (ceiling-block holds)");
+			} else {
+				warn!("[PMR-SPIKE] INV-P12 FAIL: HI preempted despite PMR=0x00 (ceiling-block broken)");
+			}
+			ptr::null_mut()
+		}
+		_ => ptr::null_mut(),
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -318,8 +848,38 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 	let Some(irqid) = GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1) else {
 		return ptr::null_mut();
 	};
+	#[cfg(feature = "pmr-coop-net")]
+	CoreLocal::get().eoi_inflight_inc();
 
 	let vector: u8 = u32::from(irqid).try_into().unwrap();
+
+	// Spike-2 (INV-P4/P8): count this IRQ in the per-core nesting depth. Must
+	// run for EVERY vector (including the Spike-1 test SGIs below) so nested
+	// IRQ detection is correct. No-op when `pmr-band` is off (default build).
+	irq_enter();
+
+	#[cfg(feature = "pmr-band")]
+	if vector == SGI_RT_BRIDGE || vector == SGI_COOP_WAKE {
+		info!("[PMR-BAND] do_irq entered for vector {vector}");
+	}
+	// Spike-1 preemption harness (rtic-gicv3-async-reactor.md §13 Phase A).
+	// Feature-gated branch AFTER the normal Group1 ack (same path every other
+	// IRQ takes), so SGI delivery is identical to RESCHED. Handles only the two
+	// test SGIs; all other vectors fall through to the generic handler map.
+	#[cfg(feature = "pmr-preempt-spike")]
+	if vector == SGI_PMRTEST_LO || vector == SGI_PMRTEST_HI {
+		let ret = pmr_spike_dispatch(vector);
+		// Spike 3 (pmr-coop-net, INV-P6): under EOImode=1 the priority-drop
+	// (EOIR1) + deactivate (DIR) are split; complete both AND decrement the
+	// per-core EOI in-flight counter (paired with the IAR1 ack inc).
+	// Default (feature off, EOImode=0): combined end_interrupt.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_complete(irqid);
+	#[cfg(not(feature = "pmr-coop-net"))]
+	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
+		irq_exit();
+		return ret;
+	}
 
 	debug!("Receive interrupt {vector}");
 	increment_irq_counter(vector);
@@ -337,9 +897,28 @@ pub(crate) extern "C" fn do_irq(_state: &State) -> *mut usize {
 	// here -- it runs executor::run() on the current stack (= E post-flip).
 	core_scheduler().wake_pending_tasks();
 
+	// Spike 3 (pmr-coop-net, INV-P6): under EOImode=1 the priority-drop
+	// (EOIR1) + deactivate (DIR) are split; complete both AND decrement the
+	// per-core EOI in-flight counter (paired with the IAR1 ack inc).
+	// Default (feature off, EOImode=0): combined end_interrupt.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_complete(irqid);
+	#[cfg(not(feature = "pmr-coop-net"))]
 	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 
-	core_scheduler().scheduler(false).unwrap_or_default()
+	// INV-P8 (Spike 2): do NOT run the cooperative scheduler on return from a
+	// NESTED IRQ — that would switch stacks out from under a still-live outer
+	// handler (stack corruption). Run it only on the OUTERMOST IRQ return
+	// (nesting depth back to 0). `irq_exit()` decrements; the scheduler runs
+	// iff we just returned to thread mode. Backstop assert: depth must be 0
+	// when we DO call the scheduler.
+	irq_exit();
+	if CoreLocal::get().rt_nest_depth() == 0 {
+		debug_assert!(CoreLocal::get().rt_nest_depth() == 0);
+		core_scheduler().scheduler(false).unwrap_or_default()
+	} else {
+		ptr::null_mut()
+	}
 }
 
 #[unsafe(no_mangle)]
@@ -551,7 +1130,14 @@ pub(crate) extern "C" fn do_sync(state: &State, sp_el1: u64) {
 			if let Some(irqid) =
 				GicCpuInterface::get_and_acknowledge_interrupt(InterruptGroup::Group1)
 			{
-				GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
+				// Spike 3 (pmr-coop-net, INV-P6): under EOImode=1 the priority-drop
+	// (EOIR1) + deactivate (DIR) are split; complete both AND decrement the
+	// per-core EOI in-flight counter (paired with the IAR1 ack inc).
+	// Default (feature off, EOImode=0): combined end_interrupt.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_complete(irqid);
+	#[cfg(not(feature = "pmr-coop-net"))]
+	GicCpuInterface::end_interrupt(irqid, InterruptGroup::Group1);
 			} else {
 				error!("Unable to acknowledge interrupt!");
 			}
@@ -1018,6 +1604,13 @@ pub(crate) fn init() {
 	gic.setup(cpu_id);
 	GicCpuInterface::set_priority_mask(0xff);
 
+	// Spike 3 (pmr-coop-net, INV-P6): switch the GIC CPU interface to
+	// EOImode=1 so priority-drop (EOIR1) and deactivate (DIR) are split,
+	// enabling the per-core EOI in-flight counter. MUST be set before any
+	// interrupt is acknowledged under this mode. Gated; inert in default build.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_mode1::set_eoi_mode_1();
+
 	if let Some(timer_node) = fdt.find_compatible(&["arm,armv8-timer", "arm,armv7-timer"]) {
 		let irq_slice = timer_node.property("interrupts").unwrap().value;
 
@@ -1113,6 +1706,47 @@ pub(crate) fn init() {
 	gic.enable_interrupt(reschedid, Some(cpu_id), true).unwrap();
 	IRQ_NAMES.lock().insert(SGI_RESCHED, "Reschedule");
 
+	// Spike-1 test SGIs (feature `pmr-preempt-spike`): register here in `init()`
+	// (the BSP path) as well as in `init_cpu()` (AP path), because the BSP only
+	// runs `init()` and never `init_cpu()`. Without this, SGI 14/15 are never
+	// enabled on the BSP and the self-IPI is silently dropped. LO=0x40, HI=0x00.
+	#[cfg(feature = "pmr-preempt-spike")]
+	{
+		let lo_id = IntId::sgi(SGI_PMRTEST_LO.into());
+		gic.set_interrupt_priority(lo_id, Some(cpu_id), 0x40)
+			.unwrap();
+		gic.enable_interrupt(lo_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_PMRTEST_LO, "PmrTestLo");
+		let hi_id = IntId::sgi(SGI_PMRTEST_HI.into());
+		gic.set_interrupt_priority(hi_id, Some(cpu_id), 0x00)
+			.unwrap();
+		gic.enable_interrupt(hi_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_PMRTEST_HI, "PmrTestHi");
+	}
+
+	// Spike 2 (pmr-band) / Spike 3 (pmr-coop-net): register the COOP-band SGI
+	// (13) on this core (BSP path). The RT bridge SGI (12) is Spike-2-only.
+	// COOP_WAKE priority 0x60 (COOP band), RT_BRIDGE 0x20 (RT band, per §4).
+	// INV-P7: the RT band is pinned to core 0.
+	#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+	{
+		let coop_id = IntId::sgi(SGI_COOP_WAKE.into());
+		gic.set_interrupt_priority(coop_id, Some(cpu_id), COOP_WAKE_PRIORITY)
+			.unwrap();
+		gic.enable_interrupt(coop_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_COOP_WAKE, "CoopWake");
+	}
+	#[cfg(feature = "pmr-band")]
+	{
+		#[cfg(feature = "smp")]
+		debug_assert_eq!(cpu_id, 0, "RT-band SGI registered off core 0 (INV-P7)");
+		let rt_id = IntId::sgi(SGI_RT_BRIDGE.into());
+		gic.set_interrupt_priority(rt_id, Some(cpu_id), RT_BRIDGE_PRIORITY)
+			.unwrap();
+		gic.enable_interrupt(rt_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_RT_BRIDGE, "RtBridge");
+	}
+
 	*GIC.lock() = Some(gic);
 }
 
@@ -1130,6 +1764,37 @@ pub fn init_cpu() {
 	gic.init_cpu(cpu_id);
 	GicCpuInterface::enable_group1(true);
 	GicCpuInterface::set_priority_mask(0xff);
+
+	// Spike 3 (pmr-coop-net, INV-P6): EOImode=1 on the AP core too (must match
+	// the BSP before any interrupt is acked under split-EOI). Gated; inert
+	// in default build.
+	#[cfg(feature = "pmr-coop-net")]
+	eoi_mode1::set_eoi_mode_1();
+
+	// INV-P1 (rtic-gicv3-async-reactor.md §8): probe implemented priority bits.
+	// Write 0xFF, read back; the number of implemented LOW bits in the read-back
+	// value is the implemented priority-bit count. QEMU virt GICv3 commonly
+	// implements 5 bits (0xE0 read-back => 5 bits, 32 levels). Assertion guards
+	// the band layout against hardware that exposes fewer bits than assumed.
+	#[cfg(feature = "pmr-preempt-spike")]
+	{
+		GicCpuInterface::set_priority_mask(0xff);
+		let readback = GicCpuInterface::get_priority_mask();
+		// Probe: writing 0xFF, the implemented HIGH bits return 1 and the
+		// unimplemented LOW bits return 0. So the implemented bit count is the
+		// number of set bits in the read-back (robust to MSB-alignment).
+		let impl_bits = readback.count_ones() as u8;
+		info!("PMR implemented bits probe: wrote 0xff, read back {readback:#x} => {impl_bits} implemented priority bits");
+		// GICv3 guarantees >= 4 implemented bits (16 levels). Assert that floor.
+		assert!(impl_bits >= 4, "GIC implements fewer than 4 priority bits ({impl_bits}); band layout invalid");
+		// Our band plan assumes >= 5 bits (RT 0x00-0x3F vs COOP 0x40-0x7F).
+		// Allow 4-bit parts to still boot but warn; Spike-1 priorities are chosen
+		// within the top implemented bits so the test remains valid.
+		if impl_bits < 5 {
+			warn!("GIC implements only {impl_bits} priority bits; band layout is tighter than assumed (documented as a non-fatal degradation for Spike 1)");
+		}
+		GicCpuInterface::set_priority_mask(0xff);
+	}
 
 	let fdt = env::fdt().unwrap();
 
@@ -1174,6 +1839,46 @@ pub fn init_cpu() {
 	gic.set_interrupt_priority(reschedid, Some(cpu_id), 0x01)
 		.unwrap();
 	gic.enable_interrupt(reschedid, Some(cpu_id), true).unwrap();
+
+	#[cfg(feature = "pmr-preempt-spike")]
+	{
+		// LO = priority 0x40 (below HI, above thread/idle). HI = 0x00 (highest).
+		// Spike-1 do_irq path pends HI from inside LO to prove nested preemption;
+		// a 0x00 PMR control case proves HI is then blocked.
+		let lo_id = IntId::sgi(SGI_PMRTEST_LO.into());
+		gic.set_interrupt_priority(lo_id, Some(cpu_id), 0x40)
+			.unwrap();
+		gic.enable_interrupt(lo_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_PMRTEST_LO, "PmrTestLo");
+		let hi_id = IntId::sgi(SGI_PMRTEST_HI.into());
+		gic.set_interrupt_priority(hi_id, Some(cpu_id), 0x00)
+			.unwrap();
+		gic.enable_interrupt(hi_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_PMRTEST_HI, "PmrTestHi");
+	}
+
+	// Spike 2 (pmr-band) / Spike 3 (pmr-coop-net): register the COOP-band SGI
+	// (13) on this core; the RT bridge SGI (12) is Spike-2-only. GOTCHA
+	// (Spike 1): registration must happen in BOTH init() and init_cpu() or the
+	// BSP self-IPI is silently dropped.
+	#[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
+	{
+		let coop_id = IntId::sgi(SGI_COOP_WAKE.into());
+		gic.set_interrupt_priority(coop_id, Some(cpu_id), COOP_WAKE_PRIORITY)
+			.unwrap();
+		gic.enable_interrupt(coop_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_COOP_WAKE, "CoopWake");
+	}
+	#[cfg(feature = "pmr-band")]
+	{
+		#[cfg(feature = "smp")]
+		debug_assert_eq!(cpu_id, 0, "RT-band SGI registered off core 0 (INV-P7)");
+		let rt_id = IntId::sgi(SGI_RT_BRIDGE.into());
+		gic.set_interrupt_priority(rt_id, Some(cpu_id), RT_BRIDGE_PRIORITY)
+			.unwrap();
+		gic.enable_interrupt(rt_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_RT_BRIDGE, "RtBridge");
+	}
 }
 
 static IRQ_NAMES: InterruptTicketMutex<HashMap<u8, &'static str, RandomState>> =

@@ -1034,6 +1034,30 @@ impl PerCoreScheduler {
 				crate::executor::run();
 			}
 
+			// Spike 2 (pmr-band): fire the per-band executor harness exactly
+			// once, on the BSP / I/O core, from the idle loop (which runs AFTER
+			// install_handlers has registered the SGI 12/13 handlers). The harness
+			// pends SGI_RT_BRIDGE; when IRQs are re-enabled below the ISR fires
+			// and wakes the COOP future. Guarded internally to run once.
+			#[cfg(feature = "pmr-band")]
+			interrupts::pmr_band_maybe_trigger();
+
+			// Spike 3 (pmr-coop-net, INV-P6): fire the COOP-band executor
+			// harness once, on the I/O core, from the idle loop. Also assert the
+			// per-core EOI in-flight counter is 0 at idle — under EOImode=1 the
+			// split priority-drop + deactivate must be balanced (every IAR1 ack
+			// matched by exactly one EOIR1 + one DIR). A non-zero value means a
+			// dropped/duplicate EOI would wedge the GIC.
+			#[cfg(feature = "pmr-coop-net")]
+			{
+				debug_assert_eq!(
+					CoreLocal::get().eoi_inflight(),
+					0,
+					"INV-P6: eoi_inflight != 0 at idle — EOImode=1 EOI/DIR pairing unbalanced"
+				);
+				interrupts::pmr_coop_net_maybe_trigger();
+			}
+
 			// do housekeeping
 			#[cfg(feature = "smp")]
 			core_scheduler.check_input();

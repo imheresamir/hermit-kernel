@@ -93,6 +93,15 @@ impl Wake for TaskNotify {
 }
 
 pub(crate) fn run() {
+	// INV-P10 (Spike 2): the executor must NEVER run on the exception stack
+	// (it would corrupt nested-ISR state and is a thread-mode operation). Assert
+	// we are NOT in an IRQ/FIQ handler. Gated on `pmr-band`; inert in default
+	// build.
+	#[cfg(feature = "pmr-band")]
+	debug_assert!(
+		!core_local::CoreLocal::get().in_irq(),
+		"executor::run() called on the exception stack (INV-P10 violation)"
+	);
 	without_interrupts(|| {
 		// FIXME: We currently have no more than 3 tasks at a time, so this is fine.
 		// Ideally, we would set this value to 200, but the network task currently immediately wakes up again.

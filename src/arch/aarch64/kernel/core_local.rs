@@ -27,6 +27,18 @@ const _: () = assert!(
 	"CoreLocal.scratch_slot must be at offset 24 (start.s D4 tail / switch vectors hardcode #24)"
 );
 const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, rt_nest_depth) == 32,
+	"CoreLocal.rt_nest_depth must be at offset 32 (df_check_el1h asm reads #32; must follow scratch_slot@24)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, in_irq) == 40,
+	"CoreLocal.in_irq must be at offset 40 (follows rt_nest_depth@32)"
+);
+const _: () = assert!(
+	core::mem::offset_of!(CoreLocal, eoi_inflight) == 44,
+	"CoreLocal.eoi_inflight must be at offset 44 (follows in_irq@40, 4-byte aligned; INV-P6)"
+);
+const _: () = assert!(
 	core::mem::offset_of!(CoreLocal, exception_sp) == 0,
 	"CoreLocal.exception_sp must be at offset 0 (D4 tail: ldr x21,[x21,#0])"
 );
@@ -91,6 +103,27 @@ pub(crate) struct CoreLocal {
 	/// would overflow the handler stack (design D-1). Initialized at
 	/// `install()` to this core's slot 0 top (idle/boot task's slot).
 	scratch_slot: u64,
+	/// RT-band nesting depth (Spike 2 / INV-P4 / INV-P8). Incremented on entry
+	/// to every `do_irq`/`do_fiq` and decremented on exit; when > 1 the current
+	/// handler is nested inside another IRQ and the cooperative scheduler must
+	/// NOT run on its return (INV-P8). Offset 32: placed immediately after the
+	/// asm-critical `scratch_slot`@24 so it does NOT shift the hardcoded
+	/// asm offsets 0/8/16/24. Read by Rust `do_irq`/`do_fiq` (and by the
+	/// `df_check_el1h` asm predicate, which validates against the E window when
+	/// this is > 0 — R3.1).
+	pub(crate) rt_nest_depth: UnsafeCell<u64>,
+	/// True while executing in an exception handler (EL1h IRQ/FIQ context).
+	/// Used by `executor::run()` to assert it is NOT called on the exception
+	/// stack (INV-P10). Offset 40 (after rt_nest_depth@32).
+	pub(crate) in_irq: UnsafeCell<bool>,
+	/// Per-core count of interrupts currently between IAR1-ack and DIR-deactivate.
+	/// Spike 3 (pmr-coop-net, INV-P6): with `EOImode=1` the priority-drop
+	/// (EOIR1) and deactivate (DIR) are split; every `get_and_acknowledge_interrupt`
+	/// (IAR1) must be matched by exactly one EOIR1 + one DIR. This counter is
+	/// +=1 on ACK and -=1 on DIR; `debug_assert_eq!(eoi_inflight, 0)` at idle
+	/// catches a dropped/duplicate EOI that would wedge the GIC. Offset 44
+	/// (after in_irq@40, 4-byte aligned; `bool` leaves a 3-byte pad).
+	pub(crate) eoi_inflight: UnsafeCell<u32>,
 	/// ID of the current Core.
 	core_id: CoreId,
 	/// Scheduler of the current Core.
@@ -180,6 +213,9 @@ impl CoreLocal {
 			// e_top keeps boot correct; the switch path republishes the real
 			// per-task slot top on the first dispatch.
 			scratch_slot: e_top,
+			rt_nest_depth: UnsafeCell::new(0),
+			in_irq: UnsafeCell::new(false),
+			eoi_inflight: UnsafeCell::new(0),
 			scheduler: Cell::new(ptr::null_mut()),
 			irq_statistics,
 			ex: StaticLocalExecutor::new(),
@@ -216,6 +252,61 @@ impl CoreLocal {
 	#[inline]
 	pub fn scratch_slot(&self) -> u64 {
 		self.scratch_slot
+	}
+
+	/// Spike 2 (INV-P4/P8): current RT-band nesting depth. Read/written only on
+	/// this core (from `do_irq`/`do_fiq` and the `df_check_el1h` asm predicate),
+	/// so `UnsafeCell` interior-mutability with non-atomic access is sound here.
+	#[inline]
+	pub fn rt_nest_depth(&self) -> u64 {
+		unsafe { *self.rt_nest_depth.get() }
+	}
+	#[inline]
+	pub fn inc_rt_nest_depth(&self) -> u64 {
+		unsafe {
+			let p = self.rt_nest_depth.get();
+			*p += 1;
+			*p
+		}
+	}
+	#[inline]
+	pub fn dec_rt_nest_depth(&self) -> u64 {
+		unsafe {
+			let p = self.rt_nest_depth.get();
+			*p = (*p).checked_sub(1).expect("rt_nest_depth underflow");
+			*p
+		}
+	}
+	#[inline]
+	pub fn set_in_irq(&self, v: bool) {
+		unsafe { *self.in_irq.get() = v; }
+	}
+	#[inline]
+	pub fn in_irq(&self) -> bool {
+		unsafe { *self.in_irq.get() }
+	}
+	// Spike 3 (pmr-coop-net, INV-P6): per-core EOI in-flight counter.
+	// +1 on IAR1 ack, -1 on DIR deactivate. Returns the post-op value.
+	#[inline]
+	pub fn eoi_inflight_inc(&self) -> u32 {
+		unsafe {
+			let p = self.eoi_inflight.get();
+			*p += 1;
+			*p
+		}
+	}
+	#[inline]
+	pub fn eoi_inflight_dec(&self) -> u32 {
+		unsafe {
+			let p = self.eoi_inflight.get();
+			let v = *p;
+			*p = v.checked_sub(1).expect("eoi_inflight underflow: DIR without matching IAR1");
+			*p
+		}
+	}
+	#[inline]
+	pub fn eoi_inflight(&self) -> u32 {
+		unsafe { *self.eoi_inflight.get() }
 	}
 
 	/// §4D: Update kernel_sp for the incoming task. Called from the scheduler

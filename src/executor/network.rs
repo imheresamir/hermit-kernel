@@ -241,6 +241,15 @@ pub(crate) fn wake_network_waker() {
 	}
 
 	NETWORK_WAKER.lock().wake();
+
+	// Spike 3 (pmr-coop-net, INV-P3/P11): the COOP-band SGI waker. Under this
+	// feature, drive the network executor via the COOP-band SGI (13) instead of
+	// relying only on the idle-loop `executor::run()`. The COOP SGI ISR is
+	// run-to-completion (INV-P3: sets a flag, never runs the executor on the
+	// exception stack per INV-P10); the idle loop drains `network_run` in thread
+	// mode. This proves the executor is SGI-driven, not just idle-loop-driven.
+	#[cfg(feature = "pmr-coop-net")]
+	crate::arch::kernel::interrupts::pend_sgi_to_self(crate::arch::kernel::interrupts::SGI_COOP_WAKE);
 }
 
 /// Synchronously flush queued socket state by polling the NIC directly.
