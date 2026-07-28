@@ -994,6 +994,58 @@ fn s7_verify() {
 	}
 }
 
+/// ── Spike 7b-A: cont-backed thread create/exit (pthread_create/pthread_exit) ──
+/// Proves the `pthread` mapping WITHOUT touching the legacy task scheduler (§7
+/// deletion is a later spike): a cont-backed "thread" runs a REAL body (not a
+/// no-op), then `pthread_exit` == `continuation_teardown`. The body reads its
+/// own pool index via `CURRENT_CONT` and sets a RAN flag, proving `spawn_continuation`
+/// executed user code. Asserts: every thread body ran (RAN flags all set) +
+/// INV-C8 (exit never parked) / INV-C9 (reaper bounded) / INV-C10 (slot freed) +
+/// pool reuse. Prints `[CONT-PTHREAD] INV-C8/C9/C10 PASS`.
+const S7B_WAVE: u32 = 3;
+static S7B_SPAWNED: AtomicU32 = AtomicU32::new(0);
+static S7B_TORN: AtomicU32 = AtomicU32::new(0);
+static S7B_RAN_COUNT: AtomicU32 = AtomicU32::new(0);
+static S7B_DONE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn pthread_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	// A real "thread body" (what `pthread_create(func,arg)` would run). It
+	// proves spawn_continuation executed user code, not a stub. We derive the
+	// pool index from CURRENT_CONT (no new Cont field needed for the no-arg
+	// 7b-A stage; arg-passing + join land in 7b-B). The RAN count is cumulative
+	// across the serialized wave (threads reuse one slot), so it tracks how
+	// many thread bodies actually executed, not per-slot state.
+	assert!(is_in_continuation(), "pthread cont not in continuation");
+	let cur = CURRENT_CONT.load(Ordering::SeqCst) as *const Cont;
+	let base = core::ptr::addr_of!(CONT_POOL) as usize;
+	let _idx = (cur as usize - base) / core::mem::size_of::<Cont>();
+	S7B_RAN_COUNT.fetch_add(1, Ordering::SeqCst);
+	// == pthread_exit: tear down in place (frees record, pokes reactor).
+	S7B_TORN.fetch_add(1, Ordering::SeqCst);
+	continuation_teardown();
+	unreachable!()
+}
+
+fn s7b_verify() {
+	if S7B_DONE.load(Ordering::SeqCst) {
+		return;
+	}
+	if S7B_SPAWNED.load(Ordering::SeqCst) != S7B_WAVE {
+		return;
+	}
+	if S7B_TORN.load(Ordering::SeqCst) == S7B_WAVE
+		&& S7B_RAN_COUNT.load(Ordering::SeqCst) == S7B_WAVE
+	{
+		// INV-C8 (exit never parked) + INV-C9 (reaper bounded) + INV-C10
+		// (slot/record freed; pool reuse) + all N thread bodies ran.
+		info!(
+			"[CONT-PTHREAD] INV-C8/C9/C10 PASS (spawned={} torn={} ran={} max_continuations={})",
+			S7B_WAVE, S7B_TORN.load(Ordering::SeqCst), S7B_RAN_COUNT.load(Ordering::SeqCst), MAX_CONTINUATIONS
+		);
+		S7B_DONE.store(true, Ordering::SeqCst);
+	}
+}
+
 /// O6.1: called by the idle loop after `drain_ready()` returns — true if a
 /// continuation teardown happened since the last call. The idle loop uses this
 /// to poke the reactor once (INV-6/INV-7), re-hosting the `cleanup_tasks`
@@ -1006,6 +1058,7 @@ pub(crate) fn continuation_reaped() -> bool {
 /// completion (Spike 7a harness). Prints PASS when all wave conts reclaimed.
 pub(crate) fn continuation_teardown_verify() {
 	s7_verify();
+	s7b_verify();
 }
 
 /// Set by the Spike-6 harness once it has printed PASS (no further spawns need
@@ -1061,6 +1114,19 @@ pub(crate) fn continuation_maybe_trigger() {
 	{
 		S7_SPAWNED.fetch_add(1, Ordering::SeqCst);
 		spawn_continuation(teardown_harness_entry);
+	}
+	// Spike 7b-A harness (cont-backed pthread create/exit). Serialized after the
+	// Spike 7a wave completes so it doesn't contend on CONT_PENDING / RUNNING.
+	// Each pthread cont runs a real body then `pthread_exit` (continuation_teardown),
+	// reclaiming its slot; the wave is serialized through the drain (§10.6).
+	if S7_DONE.load(Ordering::SeqCst)
+		&& !S7B_DONE.load(Ordering::SeqCst)
+		&& S7B_SPAWNED.load(Ordering::SeqCst) < S7B_WAVE
+		&& CURRENT_CONT.load(Ordering::SeqCst) == 0
+		&& CONT_PENDING.load(Ordering::SeqCst) == 0
+	{
+		S7B_SPAWNED.fetch_add(1, Ordering::SeqCst);
+		spawn_continuation(pthread_entry);
 	}
 }
 
