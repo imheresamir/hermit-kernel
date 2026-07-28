@@ -1069,6 +1069,17 @@ impl PerCoreScheduler {
 			{
 				crate::arch::kernel::continuations::continuation_maybe_trigger();
 				crate::arch::kernel::continuations::drain_ready();
+				// O6.1/O6.3 (§10.3): if a continuation teardown happened, poke
+				// the reactor once (INV-6/INV-7 re-hosting the cleanup_tasks
+				// flush_nic poke that §7 deletes). Core 0 only (NIC/reactor).
+				#[cfg(feature = "net")]
+				if core_id() == 0
+					&& crate::arch::kernel::continuations::continuation_reaped()
+				{
+					crate::executor::network::flush_nic();
+				}
+				// O6 (Spike 7a): verify teardown-wave completion.
+				crate::arch::kernel::continuations::continuation_teardown_verify();
 			}
 
 			// do housekeeping

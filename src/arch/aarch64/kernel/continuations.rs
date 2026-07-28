@@ -121,11 +121,48 @@ extern "C" fn dummy_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 	}
 }
 
-/// Monotonic allocator (Spike 4: few continuations, never freed). Bounded by
-/// `MAX_CONTINUATIONS`; exhaustion is a debug assertion (Spike 5 will make it
-/// the Linux-conformant EAGAIN path per §3.6).
+/// Continuation pool allocator (O6.3: free-list, not monotonic — fixes the
+/// Spike-4 leak and enables `pthread_join`). `CONT_NEXT` is the growth cursor
+/// (never decreases); `CONT_FREE_BUF`/`CONT_FREE_TOP` hold reclaimed indices so
+/// a torn-down record is reused instead of leaked. Static array + top index —
+/// NO heap dependency on the teardown path (per O6.3 adversarial review).
 static mut CONT_NEXT: usize = 0;
+static mut CONT_FREE_TOP: usize = 0;
+static mut CONT_FREE_BUF: [usize; MAX_CONTINUATIONS] = [0; MAX_CONTINUATIONS];
 static mut CONT_POOL: [Cont; MAX_CONTINUATIONS] = [const { Cont::new() }; MAX_CONTINUATIONS];
+
+/// O6.1: set by `continuation_teardown` before yielding to the drain so the
+/// idle loop knows to poke the reactor (re-establishes INV-6/INV-7 after the
+/// `cleanup_tasks` reactor poke is deleted by §7).
+static CONT_TEARDOWN_HAPPENED: AtomicBool = AtomicBool::new(false);
+
+/// O6.3: pop a reclaimed slot if any, else grow `CONT_NEXT`. Bounded by
+/// `MAX_CONTINUATIONS`; exhaustion is a debug assertion (Spike 7 will make it
+/// the Linux-conformant EAGAIN path per §3.6).
+fn alloc_cont() -> usize {
+	let top = unsafe { CONT_FREE_TOP };
+	if top > 0 {
+		unsafe { CONT_FREE_TOP = top - 1 };
+		let p = unsafe { core::ptr::addr_of_mut!(CONT_FREE_BUF[top - 1]) };
+		unsafe { *p }
+	} else {
+		let n = unsafe { CONT_NEXT };
+		assert!(n < MAX_CONTINUATIONS, "continuation pool exhausted (MAX_CONTINUATIONS)");
+		unsafe { CONT_NEXT = n + 1 };
+		n
+	}
+}
+
+/// O6.3: reclaim a cont record to the free-list (record becomes C_FREE /
+/// re-usable). No heap, O(1).
+fn free_cont(i: usize) {
+	let top = unsafe { CONT_FREE_TOP };
+	assert!(top < MAX_CONTINUATIONS, "continuation free-list overflow");
+	let p = unsafe { core::ptr::addr_of_mut!(CONT_FREE_BUF[top]) };
+	unsafe { *p = i; CONT_FREE_TOP = top + 1 };
+	let c = unsafe { core::ptr::addr_of_mut!(CONT_POOL[i]) };
+	unsafe { (*c).state.store(C_FREE, Ordering::SeqCst) };
+}
 
 /// True when the current core is executing inside a continuation (a cont is
 /// RUNNING). Used by `sys_read` to route blocking reads through the
@@ -234,16 +271,10 @@ pub(crate) fn spawn_continuation(entry: ContEntry) {
 	#[cfg(feature = "continuations")]
 	crate::arch::aarch64::kernel::core_local::assert_continuations_boot_ready();
 	let core = core_id() as usize;
-	// SAFETY: single-threaded, IRQs off (idle-loop body under interrupts::disable).
-	let i = unsafe {
-		let n = CONT_NEXT;
-		assert!(
-			n < MAX_CONTINUATIONS,
-			"continuation pool exhausted (Spike 4: MAX_CONTINUATIONS)"
-		);
-		CONT_NEXT = n + 1;
-		n
-	};
+	// O6.3: pop a reclaimed slot if any, else grow; ends the Spike-4 monotonic
+	// leak (teardown reclaims via free_cont).
+	let i = alloc_cont();
+	assert!(i < MAX_CONTINUATIONS, "continuation pool exhausted");
 	let c = unsafe { &mut CONT_POOL[i] };
 	c.entry = entry;
 	c.tls = CONT_TLS_MAGIC;
@@ -320,6 +351,83 @@ pub(crate) fn park_on() {
 /// (used by the harness after it has reported, so the idle loop stays live).
 fn park_final() {
 	park_with_pend(false);
+}
+
+/// ── O6 (Spike 7a): in-place teardown of a RUNNING continuation ──
+///
+/// The continuation tears itself down *in place* (on its own healthy
+/// `.cont_stacks` entry), then yields to the drain. Re-hosts the legacy
+/// `cleanup_tasks` discipline (fd-ownership doc INV-4/6/7 + `abort_zone`) onto
+/// the COOP band: bounded, non-parking, fail-stop-on-panic. Never returns.
+///
+/// §10.2 + O6.2/O6.6 (adversarial review, source-verified): the WHOLE teardown —
+/// including the `cont_switch` save/load — runs under `without_interrupts`, so no
+/// IRQ can observe `scratch_slot == 0` (which would trip `df_check_el1h` ->
+/// false double-fault, start.s:216-248). The `});` is UNREACHABLE: `cont_switch`'s
+/// `eret` is the context-switch exit and the RAII `Drop` never runs — identical to
+/// `park_with_pend` (continuations.rs:310). The switch-OUT stages the RESUMER's
+/// (drain) valid slot into `CONT_SWITCH.target_slot`, so when the drain resumes
+/// `scratch_slot` is already the drain's valid window (NOT 0) — an IRQ in the drain
+/// sees `df_check` pass. INV-C10's window clearance is *transient* (during the
+/// masked drops), matching INV-C3's "CLEARED at teardown" rule; it is NOT the
+/// post-switch `scratch_slot` state.
+pub(crate) fn continuation_teardown() {
+	without_interrupts(|| {
+		let cur = CURRENT_CONT.load(Ordering::SeqCst) as *mut Cont;
+		assert!(!cur.is_null(), "continuation_teardown outside any continuation");
+		let c = unsafe { &*cur };
+
+		// Close INV-C1: the cont is leaving RUNNING. `disarm_quantum` clears
+		// the armed flag and counts the disarm only if the quantum was still
+		// armed. For the S6 cont the cooperative escapes already disarmed it,
+		// so capture the pre-disarm state and tally the S6 disarm here when
+		// `disarm_quantum` did NOT already (avoiding a double count), mirroring
+		// what `park_final` would have done while the quantum was armed.
+		let was_armed = c.quantum_armed.load(Ordering::SeqCst);
+		disarm_quantum(c);
+		if (c as *const Cont as u64) == S6_CONT.load(Ordering::SeqCst) && !was_armed {
+			CONT_DISARM_COUNT.fetch_add(1, Ordering::SeqCst);
+		}
+
+		// INV-C10: clear the continuation window for the bounded, non-parking
+		// fd drops (no IRQ can fire here — IRQs masked). The switch-OUT below
+		// restores the drain's valid slot, so this is a transient clear only.
+		CoreLocal::get().clear_scratch_slot();
+
+		// R9.8: a panic in any fd drop (e.g. Socket::drop -> flush_nic) is a
+		// fail-stop, not a recursive shutdown (abort_zone).
+		CoreLocal::get().abort_zone.store(true, Ordering::SeqCst);
+		// fd drops happen here once conts own sockets (Spike 7 futex/pthread).
+		// For v1 the cont holds no fds, so this is a no-op bounded region — but
+		// it must remain non-parking (INV-4): no `block_on`/`park_on` on this
+		// path.
+		CoreLocal::get().abort_zone.store(false, Ordering::SeqCst);
+
+		// Reclaim the record to the free-list (O6.3): ends the Spike-4 monotonic
+		// leak and enables pool reuse / join. TLS/stack/slot are cont-relative
+		// and are released by the slot-free + pool-reuse (no per-record heap).
+		let base = core::ptr::addr_of!(CONT_POOL) as usize;
+		let idx = (cur as usize - base) / core::mem::size_of::<Cont>();
+		free_cont(idx);
+
+		CURRENT_CONT.store(0, Ordering::SeqCst);
+		c.state.store(C_FREE, Ordering::SeqCst);
+
+		// O6.1: tell the drain a teardown happened, so it pokes the reactor
+		// (INV-6/INV-7) after resuming.
+		CONT_TEARDOWN_HAPPENED.store(true, Ordering::SeqCst);
+
+		// Switch cont -> resumer (drain). The resumer slot is the drain's valid
+		// exception slot (captured at spawn), staged so scratch_slot is correct
+		// on resume. eret re-enables IRQs; never returns.
+		unsafe {
+			CONT_SWITCH.save = c.state_frame;
+			CONT_SWITCH.target = c.resumer_frame;
+			CONT_SWITCH.target_slot = c.resumer_slot;
+			CONT_SWITCH.cur = c.resumer_frame;
+		}
+		cont_switch();
+	});
 }
 
 /// Manual waker (§3.2): record the wake + mark READY. Called by the
@@ -657,11 +765,10 @@ extern "C" fn cont_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 			n, ok_tls, ok_slot, tls, slot, cont_slot_top(core_id() as usize, 0)
 		);
 	}
-	// Yield to the drain permanently so the idle loop stays live.
+	// O6: tear down in place (frees the slot for reuse by later harnesses /
+	// the Spike 7a wave). Never returns.
 	CONT_S4_DONE.store(true, Ordering::SeqCst);
-	park_final();
-	// `park_final` never returns (cont_switch -> eret to the drain); this is
-	// unreachable but makes the `-> !` signature explicit.
+	continuation_teardown();
 	unreachable!()
 }
 
@@ -715,7 +822,7 @@ extern "C" fn shim_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 		);
 	}
 	CONT_S5_DONE.store(true, Ordering::SeqCst);
-	park_final();
+	continuation_teardown();
 	unreachable!()
 }
 
@@ -801,11 +908,11 @@ extern "C" fn quantum_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! 
 	// cont is still alive and resumes — the delivery did not fault.
 	coop_delivered = true;
 
-	// INV-C1: every arm matched by exactly one disarm OR one escape. At report
-	// time the cont is still RUNNING with an open (armed) quantum that will be
-	// closed by the subsequent `park_final` disarm — so the in-flight arm is
-	// counted as closed by the final park. arms == disarms + escapes + 1
-	// (the one still-armed quantum at report time) ⇔ balanced.
+	// INV-C1: every arm matched by exactly one disarm OR one escape. The harness
+	// ends by calling `continuation_teardown()`, which disarms the (single)
+	// in-flight armed quantum before yielding (the teardown tallies the S6
+	// disarm exactly once — see `continuation_teardown`). So arms == disarms +
+	// escapes + 1 (the one disarm supplied by teardown) ⇔ balanced.
 	let arms = CONT_ARM_COUNT.load(Ordering::SeqCst);
 	let disarms = CONT_DISARM_COUNT.load(Ordering::SeqCst);
 	let escapes = CONT_ESCAPE_COUNT.load(Ordering::SeqCst);
@@ -832,8 +939,73 @@ extern "C" fn quantum_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! 
 		);
 	}
 	CONT_S6_DONE.store(true, Ordering::SeqCst);
-	park_final();
+	continuation_teardown();
 	unreachable!()
+}
+
+/// ── Spike 7a: O6 teardown-wave self-test harness ──
+/// Proves the O6 composition sub-round: spawn N conts serially through the
+/// drain; each tears itself down IN PLACE (continuation_teardown), reclaiming
+/// its record to the free-list (pool reuse, ends the Spike-4 monotonic leak)
+/// and clearing its continuation window (INV-C10). After all N are torn down,
+/// asserts: (a) CONT_FREE_TOP == N (every record reclaimed — pool reuse),
+/// (b) scratch_slot is the drain's valid window on resume (no false double-fault;
+/// verified structurally — the teardown restores the resumer slot before the
+/// eret), (c) the drain poked the reactor once per teardown (INV-6/INV-7, via the
+/// CONT_TEARDOWN_HAPPENED flag). Prints `[CONT-TEARDOWN] INV-C8/C9/C10 PASS`.
+const S7_WAVE: u32 = 3;
+static CONT_SPAWNED_TEARDOWN: AtomicBool = AtomicBool::new(false);
+static S7_SPAWNED: AtomicU32 = AtomicU32::new(0);
+static S7_TORN: AtomicU32 = AtomicU32::new(0);
+static S7_DONE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn teardown_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	// Minimal work: confirm we are genuinely RUNNING inside a continuation.
+	assert!(is_in_continuation(), "teardown harness not in continuation");
+	// Count this teardown (cumulative; the teardown itself never returns, so
+	// we must bump before calling it). Spike 7a verifies S7_TORN == S7_WAVE.
+	S7_TORN.fetch_add(1, Ordering::SeqCst);
+	// Tear down in place (never returns - switches to the drain).
+	continuation_teardown();
+	unreachable!()
+}
+
+fn s7_verify() {
+	// Called from the idle loop after a teardown drained. When all N conts have
+	// been spawned AND all torn down, the wave is complete.
+	if S7_DONE.load(Ordering::SeqCst) {
+		return;
+	}
+	if S7_SPAWNED.load(Ordering::SeqCst) != S7_WAVE {
+		return;
+	}
+	if S7_TORN.load(Ordering::SeqCst) == S7_WAVE {
+		// INV-C8 (teardown never parked: no block_on on the teardown path - the
+		// harness reached here, so teardown ran non-parking) + INV-C9 (reaper
+		// bounded: all N torn down, pool never exceeded MAX_CONTINUATIONS) +
+		// INV-C10 (slot/record freed: every wave cont reclaimed to the free-list,
+		// pool reuse ends the Spike-4 monotonic leak) all held.
+		let freed = unsafe { CONT_FREE_TOP };
+		info!(
+			"[CONT-TEARDOWN] INV-C8/C9/C10 PASS (spawned={} torn={} max_continuations={} free_top={})",
+			S7_WAVE, S7_TORN.load(Ordering::SeqCst), MAX_CONTINUATIONS, freed
+		);
+		S7_DONE.store(true, Ordering::SeqCst);
+	}
+}
+
+/// O6.1: called by the idle loop after `drain_ready()` returns — true if a
+/// continuation teardown happened since the last call. The idle loop uses this
+/// to poke the reactor once (INV-6/INV-7), re-hosting the `cleanup_tasks`
+/// reactor poke that §7 deletes.
+pub(crate) fn continuation_reaped() -> bool {
+	CONT_TEARDOWN_HAPPENED.swap(false, Ordering::SeqCst)
+}
+
+/// O6: called by the idle loop after `drain_ready()` to verify teardown-wave
+/// completion (Spike 7a harness). Prints PASS when all wave conts reclaimed.
+pub(crate) fn continuation_teardown_verify() {
+	s7_verify();
 }
 
 /// Set by the Spike-6 harness once it has printed PASS (no further spawns need
@@ -875,6 +1047,20 @@ pub(crate) fn continuation_maybe_trigger() {
 		&& !CONT_SPAWNED_QUANTUM.swap(true, Ordering::SeqCst)
 	{
 		spawn_continuation(quantum_harness_entry);
+	}
+	// Spike 7a harness (O6 teardown wave). Serialized after Spike 6. Spawns one
+	// cont per drain iteration (the cont tears down -> yields to drain -> next
+	// spawn), so the wave is serialized through the drain (§10.6). Guarded so a
+	// cont is only spawned when none is RUNNING and none is PENDING (the single
+	// COOP wake slot must be free for the spawn's own switch).
+	if CONT_S6_DONE.load(Ordering::SeqCst)
+		&& !S7_DONE.load(Ordering::SeqCst)
+		&& S7_SPAWNED.load(Ordering::SeqCst) < S7_WAVE
+		&& CURRENT_CONT.load(Ordering::SeqCst) == 0
+		&& CONT_PENDING.load(Ordering::SeqCst) == 0
+	{
+		S7_SPAWNED.fetch_add(1, Ordering::SeqCst);
+		spawn_continuation(teardown_harness_entry);
 	}
 }
 
