@@ -202,6 +202,10 @@ pub(crate) const SGI_PMRTEST_HI: u8 = 15;
 // executor drain (the "SGI-pending waker" of §13 Phase C).
 #[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
 pub(crate) const SGI_COOP_WAKE: u8 = 13;
+// Spike 4 (stackful-continuations.md §3): continuation park/resume waker.
+// Distinct from SGI_COOP_WAKE so continuations need no pmr-band feature.
+#[cfg(feature = "continuations")]
+pub(crate) const SGI_CONT_WAKE: u8 = 11;
 #[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
 pub(crate) const SGI_RT_BRIDGE: u8 = 12;
 #[cfg(any(feature = "pmr-band", feature = "pmr-coop-net"))]
@@ -361,8 +365,8 @@ impl Drop for PmrCeiling {
 /// stores the executor's own `Waker` (set by the spawned future on first poll)
 /// plus asserts the target INTID belongs to the COOP band before pending it.
 #[cfg(feature = "pmr-band")]
-static BAND_WAKER: SpinMutex<Option<core::task::Waker>> =
-	SpinMutex::new(None);
+static BAND_WAKER: InterruptSpinMutex<Option<core::task::Waker>> =
+	InterruptSpinMutex::new(None);
 
 #[cfg(feature = "pmr-band")]
 fn wake_coop_future() {
@@ -460,6 +464,23 @@ pub(crate) fn install_handlers(old_handlers: InterruptHandlerMap) {
 			handlers.contains_key(&SGI_RT_BRIDGE),
 			handlers.contains_key(&SGI_COOP_WAKE)
 		);
+	}
+
+	// Spike 4 (stackful-continuations.md §3): register the continuation wake SGI
+	// (11) handler. The ISR only marks the pending cont READY (INV-P10-style:
+	// never runs executor/future body on the exc stack) — the idle-loop drain
+	// (`continuations::drain_ready`) does the actual resume in thread mode.
+	#[cfg(feature = "continuations")]
+	{
+		fn cont_wake_handler() {
+			// Mark the parked continuation READY so the idle loop resumes it.
+			crate::arch::aarch64::kernel::continuations::coop_wake();
+		}
+		let cont_vec = handlers
+			.entry(SGI_CONT_WAKE)
+			.or_insert_with(|| VecDeque::<fn()>::new());
+		cont_vec.push_back(cont_wake_handler);
+		info!("[CONT] install_handlers: SGI_CONT_WAKE={SGI_CONT_WAKE} registered");
 	}
 
 	INTERRUPT_HANDLERS.set(handlers).unwrap();
@@ -670,7 +691,12 @@ static COOP_TRIGGERED: AtomicBool = AtomicBool::new(false);
 /// the Spike-1 harness to self-IPI the HI test SGI from inside the LO handler.
 /// Also used by Spike 2 (pmr-band) to self-IPI the RT bridge SGI, and by
 /// Spike 3 (pmr-coop-net) to self-IPI the COOP-band driver SGI.
-#[cfg(any(feature = "pmr-preempt-spike", feature = "pmr-band", feature = "pmr-coop-net"))]
+#[cfg(any(
+	feature = "pmr-preempt-spike",
+	feature = "pmr-band",
+	feature = "pmr-coop-net",
+	feature = "continuations"
+))]
 pub(crate) fn pend_sgi_to_self(intid: u8) {
 	// ICC_SGI1R_EL1: Aff3[63:48] | IRM[40] | Aff2[39:32] | INTID[31:24] |
 	//               Aff1[23:16] | TargetList[15:0]. Self-target: TargetList bit
@@ -1706,6 +1732,18 @@ pub(crate) fn init() {
 	gic.enable_interrupt(reschedid, Some(cpu_id), true).unwrap();
 	IRQ_NAMES.lock().insert(SGI_RESCHED, "Reschedule");
 
+	// Spike 4 (stackful-continuations.md §3): enable the continuation wake SGI
+	// (11) on the BSP. Priority 0x60 = COOP band. AP core does the same in
+	// init_cpu() (the BSP never runs init_cpu()).
+	#[cfg(feature = "continuations")]
+	{
+		let cont_id = IntId::sgi(SGI_CONT_WAKE.into());
+		gic.set_interrupt_priority(cont_id, Some(cpu_id), 0x60)
+			.unwrap();
+		gic.enable_interrupt(cont_id, Some(cpu_id), true).unwrap();
+		IRQ_NAMES.lock().insert(SGI_CONT_WAKE, "ContWake");
+	}
+
 	// Spike-1 test SGIs (feature `pmr-preempt-spike`): register here in `init()`
 	// (the BSP path) as well as in `init_cpu()` (AP path), because the BSP only
 	// runs `init()` and never `init_cpu()`. Without this, SGI 14/15 are never
@@ -1748,7 +1786,18 @@ pub(crate) fn init() {
 	}
 
 	*GIC.lock() = Some(gic);
+	// docs/stackful-continuations.md §9 O1 (H1): publish the lock-free
+	// "GIC initialized" flag so continuation boot-ready asserts can check it
+	// without locking the `GIC` SpinMutex (locking would be the hazard O1
+	// forbids). `set` is lock-free; idempotent across cores.
+	let _ = GIC_READY.try_insert(());
 }
+
+/// docs/stackful-continuations.md §9 O1 (H1): lock-free "GIC initialized" flag.
+/// Published once in `install_gic` after `GIC` is populated. Read via
+/// `GIC_READY.get().is_some()` (lock-free) so continuation boot-ready asserts
+/// need not lock the `GIC` SpinMutex.
+pub(crate) static GIC_READY: OnceCell<()> = OnceCell::new();
 
 // marks the given CPU core as awake
 pub fn init_cpu() {

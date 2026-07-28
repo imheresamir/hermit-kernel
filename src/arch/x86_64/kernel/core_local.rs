@@ -7,7 +7,26 @@ use core::{mem, ptr};
 use async_executor::StaticLocalExecutor;
 #[cfg(feature = "smp")]
 use hermit_sync::InterruptTicketMutex;
-use hermit_sync::{RawRwSpinLock, RawSpinMutex};
+#[cfg(feature = "continuations")]
+use hermit_sync::RawInterruptSpinMutex;
+#[cfg(not(feature = "continuations"))]
+use hermit_sync::RawSpinMutex;
+use hermit_sync::RawRwSpinLock;
+
+/// Executor lock types — see arch/aarch64/kernel/core_local.rs for the
+/// rationale. Under `continuations` `ExSpin` becomes interrupt-masking
+/// `RawInterruptSpinMutex` (docs/stackful-continuations.md §9 O1); `ExRw`
+/// stays `RawRwSpinLock` (no interrupt-masking RW primitive exists in
+/// hermit-sync). Default keeps `RawSpinMutex`/`RawRwSpinLock` (byte-identical
+/// / inert).
+#[cfg(feature = "continuations")]
+type ExSpin = RawInterruptSpinMutex;
+#[cfg(feature = "continuations")]
+type ExRw = RawRwSpinLock;
+#[cfg(not(feature = "continuations"))]
+type ExSpin = RawSpinMutex;
+#[cfg(not(feature = "continuations"))]
+type ExRw = RawRwSpinLock;
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::GsBase;
 use x86_64::structures::tss::TaskStateSegment;
@@ -31,7 +50,7 @@ pub(crate) struct CoreLocal {
 	/// Interface to the interrupt counters
 	irq_statistics: &'static IrqStatistics,
 	/// The core-local async executor.
-	ex: StaticLocalExecutor<RawSpinMutex, RawRwSpinLock>,
+	ex: StaticLocalExecutor<ExSpin, ExRw>,
 	/// Queues to handle incoming requests from the other cores
 	#[cfg(feature = "smp")]
 	pub scheduler_input: InterruptTicketMutex<SchedulerInput>,
@@ -104,7 +123,7 @@ pub(crate) fn core_scheduler() -> &'static mut PerCoreScheduler {
 	unsafe { CoreLocal::get().scheduler.get().as_mut().unwrap() }
 }
 
-pub(crate) fn ex() -> &'static StaticLocalExecutor<RawSpinMutex, RawRwSpinLock> {
+pub(crate) fn ex() -> &'static StaticLocalExecutor<ExSpin, ExRw> {
 	&CoreLocal::get().ex
 }
 

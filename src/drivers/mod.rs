@@ -12,6 +12,8 @@ pub mod net;
 pub mod pci;
 #[cfg(feature = "virtio")]
 pub mod virtio;
+
+use hermit_sync::OnceCell;
 #[cfg(feature = "virtio-vsock")]
 pub mod vsock;
 
@@ -98,4 +100,16 @@ pub(crate) fn init() {
 	crate::arch::kernel::init_drivers(&mut handlers);
 
 	crate::arch::kernel::interrupts::install_handlers(handlers);
+
+	// docs/stackful-continuations.md §9 O1 (H5): publish the lock-free
+	// "drivers initialized" flag. Continuation boot-ready asserts check it
+	// (lock-free) instead of locking InitCell. Set once at the end of driver
+	// init, before the executor can run continuation work.
+	let _ = DRIVERS_READY.try_insert(());
 }
+
+/// docs/stackful-continuations.md §9 O1 (H5): lock-free "drivers initialized"
+/// flag. Published at the end of `drivers::init`. Read via
+/// `DRIVERS_READY.get().is_some()` (lock-free) so continuation boot-ready
+/// asserts need not lock `InitCell`/driver statics.
+pub(crate) static DRIVERS_READY: OnceCell<()> = OnceCell::new();

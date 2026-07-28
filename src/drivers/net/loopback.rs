@@ -2,7 +2,7 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use hermit_sync::SpinMutex;
+use hermit_sync::{InterruptSpinMutex, SpinMutex};
 use smoltcp::phy;
 use smoltcp::time::Instant;
 
@@ -11,15 +11,25 @@ use crate::drivers::net::NetworkDriver;
 use crate::executor::network::wake_network_waker;
 use crate::mm::device_alloc::DeviceAlloc;
 
+/// Loopback queue lock. Under the `continuations` feature (docs/stackful-
+/// continuations.md §9 O1, H4) the queue is reachable from continuation context
+/// (sys_read/sys_write path), so it becomes an interrupt-masking
+/// `InterruptSpinMutex`. Default build keeps `SpinMutex` (byte-identical /
+/// inert).
+#[cfg(feature = "continuations")]
+type LoopbackQueueLock = InterruptSpinMutex;
+#[cfg(not(feature = "continuations"))]
+type LoopbackQueueLock = SpinMutex;
+
 pub(crate) struct LoopbackDriver {
-	queue: SpinMutex<VecDeque<Vec<u8, DeviceAlloc>>>,
+	queue: LoopbackQueueLock<VecDeque<Vec<u8, DeviceAlloc>>>,
 	reserved_receives: AtomicUsize,
 }
 
 impl LoopbackDriver {
 	pub(crate) const fn new() -> Self {
 		Self {
-			queue: SpinMutex::new(VecDeque::new()),
+			queue: LoopbackQueueLock::new(VecDeque::new()),
 			reserved_receives: AtomicUsize::new(0),
 		}
 	}

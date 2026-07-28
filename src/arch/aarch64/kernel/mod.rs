@@ -11,6 +11,8 @@ pub mod processor;
 pub mod scheduler;
 pub mod serial;
 pub mod slot_pool;
+#[cfg(feature = "continuations")]
+pub mod continuations;
 #[cfg(target_os = "none")]
 mod start;
 pub mod systemtime;
@@ -92,6 +94,10 @@ pub(crate) fn protect_stack_guards() {
 		static __start_exception_slots: u8;
 		static __start_rt_stacks: u8;
 		static __end_exception_slots: u8;
+		static __start_cont_stacks: u8;
+		static __start_cont_slots: u8;
+		static __end_cont_stacks: u8;
+		static __end_cont_slots: u8;
 	}
 
 	// The per-task exception-slot pool (`.exception_slots`) is a NEW section the
@@ -131,7 +137,55 @@ pub(crate) fn protect_stack_guards() {
 		}
 	}
 
-	let section_bases: [usize; 8] = unsafe {
+	// Map the continuation call-stack + exception-slot regions (§3, Spike 4).
+	// Like `.exception_slots`, the loader does not know these new sections, so
+	// map them RW (identity) before protect_stack_guards() unmaps their per-
+	// element guard tails. Only meaningful under `continuations`, but always
+	// present in link.x, so always map (harmless in the default build).
+	{
+		use memory_addresses::PhysAddr;
+
+		use crate::arch::aarch64::mm::paging::{PageTableEntryFlags, map};
+
+		let start = &raw const __start_cont_stacks as usize;
+		let end = &raw const __end_cont_stacks as usize;
+		let size = end.saturating_sub(start);
+		if size > 0 {
+			let pages = size.div_ceil(BasePageSize::SIZE as usize);
+			let mut flags = PageTableEntryFlags::empty();
+			flags.normal().writable().execute_disable();
+			map::<BasePageSize>(
+				VirtAddr::new(start as u64),
+				PhysAddr::new(start as u64),
+				pages,
+				flags,
+			);
+			info!("protect_stack_guards: mapped .cont_stacks [{start:#x}, {end:#x}) = {pages} pages");
+		}
+	}
+	{
+		use memory_addresses::PhysAddr;
+
+		use crate::arch::aarch64::mm::paging::{PageTableEntryFlags, map};
+
+		let start = &raw const __start_cont_slots as usize;
+		let end = &raw const __end_cont_slots as usize;
+		let size = end.saturating_sub(start);
+		if size > 0 {
+			let pages = size.div_ceil(BasePageSize::SIZE as usize);
+			let mut flags = PageTableEntryFlags::empty();
+			flags.normal().writable().execute_disable();
+			map::<BasePageSize>(
+				VirtAddr::new(start as u64),
+				PhysAddr::new(start as u64),
+				pages,
+				flags,
+			);
+			info!("protect_stack_guards: mapped .cont_slots [{start:#x}, {end:#x}) = {pages} pages");
+		}
+	}
+
+	let section_bases: [usize; 10] = unsafe {
 		[
 			&__start_exception_stacks as *const u8 as usize,
 			&__start_irq_stacks as *const u8 as usize,
@@ -141,15 +195,17 @@ pub(crate) fn protect_stack_guards() {
 			&__start_idle_stacks as *const u8 as usize,
 			&__start_exception_slots as *const u8 as usize,
 			&__start_rt_stacks as *const u8 as usize,
+			&__start_cont_stacks as *const u8 as usize,
+			&__start_cont_slots as *const u8 as usize,
 		]
 	};
-	// Per-slot stack size from config.rs. PARALLEL to `section_bases` above:
-	// index `i` here is the stack size for section `i` in `section_bases` (same
-	// 8-element order: exception, irq, overflow, task, reactor, idle,
-	// exception_slots, rt). Keep the two arrays element-for-element in sync — adding
-	// a new section requires updating BOTH, or guard unmapping for the new
-	// section is silently skipped (review C6).
-	let stacks: [usize; 8] = [
+	// Per-element stack size from config.rs. PARALLEL to `section_bases` above:
+	// index `i` here is the element size for section `i` in `section_bases`
+	// (same 10-element order: exception, irq, overflow, task, reactor, idle,
+	// exception_slots, rt, cont_stacks, cont_slots). Keep the two arrays
+	// element-for-element in sync — adding a new section requires updating BOTH
+	// (review C6).
+	let stacks: [usize; 10] = [
 		DEFAULT_STACK_SIZE,
 		KERNEL_STACK_SIZE,
 		KERNEL_STACK_SIZE,
@@ -158,20 +214,26 @@ pub(crate) fn protect_stack_guards() {
 		KERNEL_STACK_SIZE,
 		EXCEPTION_SLOT_SIZE, // per-task scratch slot
 		RT_STACK_SIZE,       // Spike 2 / Phase B RT-band handler stack (R3.4)
+		CONT_STACK_SIZE,     // Spike 4 continuation call stack
+		CONT_SLOT_SIZE,      // Spike 4 continuation exception slot
 	];
 
 	let n = max_bootable_cores();
 	let guard = BasePageSize::SIZE as u64;
 	info!("protect_stack_guards: n={n} guard_page={guard:#x}");
 
-	for i in 0..7 {
+	for i in 0..10 {
 		let section_base = section_bases[i] as u64;
 		let stack = stacks[i];
-		// The exception-slot section holds SLOTS_PER_CORE slots PER core
+		// The exception-slot section (i==6) holds SLOTS_PER_CORE slots PER core
 		// (stride = slot + guard), so its guard count is cores × SLOTS_PER_CORE.
+		// The continuation sections (i==8 cont_stacks, i==9 cont_slots) hold
+		// MAX_CONTINUATIONS elements PER core (stride = stack/slot + guard).
 		// Every other section has exactly one element per core.
 		let elements = if i == 6 {
 			n * SLOTS_PER_CORE
+		} else if i == 8 || i == 9 {
+			n * MAX_CONTINUATIONS
 		} else {
 			n
 		};

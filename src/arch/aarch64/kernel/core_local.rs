@@ -7,7 +7,31 @@ use aarch64_cpu::registers::{Readable, TPIDR_EL1, Writeable};
 use async_executor::StaticLocalExecutor;
 #[cfg(feature = "smp")]
 use hermit_sync::InterruptTicketMutex;
-use hermit_sync::{RawRwSpinLock, RawSpinMutex};
+#[cfg(feature = "continuations")]
+use hermit_sync::RawInterruptSpinMutex;
+#[cfg(not(feature = "continuations"))]
+use hermit_sync::RawSpinMutex;
+use hermit_sync::RawRwSpinLock;
+
+/// Executor lock types. Under the `continuations` feature (docs/stackful-
+/// continuations.md §9 O1), the COOP-band executor's primary (park/wake) slot
+/// must mask IRQs (coupled disable+lock), so `ExSpin` becomes the
+/// interrupt-masking `RawInterruptSpinMutex`. Default build keeps
+/// `RawSpinMutex`/`RawRwSpinLock` (byte-identical / inert). NOTE: hermit-sync
+/// exposes NO interrupt-masking RW primitive, so the RW slot (`ExRw`) stays
+/// `RawRwSpinLock` under `continuations` too — it cannot be made
+/// interrupt-masking until hermit-sync gains a `RawInterruptRwLock`. The hot
+/// park/wake path (the spin slot, which continuations touch on every
+/// park/wake) is the one O1 actually protects; the RW slot is read-mostly
+/// executor state.
+#[cfg(feature = "continuations")]
+type ExSpin = RawInterruptSpinMutex;
+#[cfg(feature = "continuations")]
+type ExRw = RawRwSpinLock;
+#[cfg(not(feature = "continuations"))]
+type ExSpin = RawSpinMutex;
+#[cfg(not(feature = "continuations"))]
+type ExRw = RawRwSpinLock;
 
 use super::CPU_ONLINE;
 use super::interrupts::{IRQ_COUNTERS, IrqStatistics};
@@ -131,7 +155,7 @@ pub(crate) struct CoreLocal {
 	/// Interface to the interrupt counters
 	irq_statistics: &'static IrqStatistics,
 	/// The core-local async executor.
-	ex: StaticLocalExecutor<RawSpinMutex, RawRwSpinLock>,
+	ex: StaticLocalExecutor<ExSpin, ExRw>,
 	/// Queues to handle incoming requests from the other cores
 	#[cfg(feature = "smp")]
 	pub scheduler_input: InterruptTicketMutex<SchedulerInput>,
@@ -378,8 +402,24 @@ pub(crate) fn try_core_scheduler() -> Option<&'static mut PerCoreScheduler> {
 	unsafe { CoreLocal::get().scheduler.get().as_mut() }
 }
 
-pub(crate) fn ex() -> &'static StaticLocalExecutor<RawSpinMutex, RawRwSpinLock> {
+pub(crate) fn ex() -> &'static StaticLocalExecutor<ExSpin, ExRw> {
 	&CoreLocal::get().ex
+}
+
+/// docs/stackful-continuations.md §9 O1 (H1/H5): lock-free boot-ready check.
+/// Asserts GIC + drivers are initialized (via their lock-free `OnceCell`
+/// flags) before the first continuation touches the COOP executor. Gated to
+/// the `continuations` feature; a no-op otherwise.
+#[cfg(feature = "continuations")]
+pub(crate) fn assert_continuations_boot_ready() {
+	debug_assert!(
+		crate::arch::aarch64::kernel::interrupts::GIC_READY.get().is_some(),
+		"continuation created before GIC init (O1 H1)"
+	);
+	debug_assert!(
+		crate::drivers::DRIVERS_READY.get().is_some(),
+		"continuation created before driver init (O1 H5)"
+	);
 }
 
 pub(crate) fn set_core_scheduler(scheduler: *mut PerCoreScheduler) {

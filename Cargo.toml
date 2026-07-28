@@ -71,6 +71,13 @@ double-fault-injection = []
 pmr-preempt-spike = []
 pmr-band = []  # Spike 2: per-band executor + COOP-SGI waker + RT->COOP bridge. Inert unless set.
 pmr-coop-net = []  # Spike 3: COOP-band executor drives network_run via SGI waker; EOImode=1 + INV-P6 EOI counter. Inert unless set.
+## Stackful continuations (docs/stackful-continuations.md): one COOP-band reactor
+## for futures, syscalls, and Linux threads. Generalizes the pmr-band / pmr-coop-net
+## COOP executor. Inert unless set — all continuation code is `#[cfg(feature =
+## "continuations")]`. Introduces the §9 O1 hazard-lock conversions (executor
+## generics + loopback -> InterruptSpinMutex) and the lock-free boot-ready asserts
+## (H1 GIC / H5 InitCell). Default build is byte-identical.
+continuations = []
 #! ### Syscall Features
 
 ## Enables multiple address spaces.

@@ -1058,6 +1058,19 @@ impl PerCoreScheduler {
 				interrupts::pmr_coop_net_maybe_trigger();
 			}
 
+			// Spike 4 (stackful-continuations.md §3): spawn the continuation
+			// self-test harness once (on the I/O core) and drain any READY
+			// continuation. Runs AFTER install_handlers has registered the
+			// SGI_CONT_WAKE handler. The harness pends the SGI while masked;
+			// when IRQs are re-enabled below the ISR fires and the next
+			// drain_ready() resumes the cont → prints the PASS marker.
+			// Guarded internally to run once (trigger) / when pending (drain).
+			#[cfg(feature = "continuations")]
+			{
+				crate::arch::kernel::continuations::continuation_maybe_trigger();
+				crate::arch::kernel::continuations::drain_ready();
+			}
+
 			// do housekeeping
 			#[cfg(feature = "smp")]
 			core_scheduler.check_input();

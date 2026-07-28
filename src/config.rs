@@ -87,3 +87,37 @@ pub(crate) const VSOCK_PACKET_SIZE: u32 = 8192;
 
 #[cfg(feature = "virtio-console")]
 pub(crate) const CONSOLE_PACKET_SIZE: u32 = 8192;
+
+/// Stackful continuations (docs/stackful-continuations.md §3, Spike 4).
+/// A continuation owns a persistent call stack + a persistent exception slot,
+/// so it suspends/resumes without disturbing the task it was spawned from.
+///
+/// These consts are UNCONDITIONAL: the `.cont_stacks`/`.cont_slots` linker
+/// regions (crates/rs6/link.x) are always emitted so the feature needs no
+/// linker rewrite, and `protect_stack_guards()` (arch/aarch64/kernel/mod.rs)
+/// always protects those regions' guard pages. Only the *behavior* that uses
+/// the regions is gated behind `continuations`.
+///
+/// CONT_STACK_SIZE: the continuation's own call stack. Must be page-aligned so
+/// protect_stack_guards() can unmap one 4 KiB guard tail without aliasing the
+/// body. 32 KiB matches RT_STACK_SIZE / KERNEL_STACK_SIZE discipline.
+pub(crate) const CONT_STACK_SIZE: usize = 0x8000;
+const _: () = assert!(
+	CONT_STACK_SIZE % 0x1000 == 0,
+	"CONT_STACK_SIZE must be page-aligned so the guard page is disjoint"
+);
+/// Guard tail per continuation stack element (one unmapped 4 KiB page).
+pub(crate) const CONT_GUARD: usize = 0x1000;
+/// Continuation exception slot: full exception stack (mirrors EXCEPTION_SLOT_SIZE).
+pub(crate) const CONT_SLOT_SIZE: usize = 0x10000;
+const _: () = assert!(
+	CONT_SLOT_SIZE % 0x1000 == 0,
+	"CONT_SLOT_SIZE must be page-aligned so the guard page is disjoint"
+);
+const _: () = assert!(
+	CONT_SLOT_SIZE >= 0x10000,
+	"CONT_SLOT_SIZE must be >= 64 KiB (holds State + the exception-handler call chain)"
+);
+pub(crate) const CONT_SLOT_GUARD: usize = 0x1000;
+/// Number of continuations allocated per core (monotonic allocator, Spike 4).
+pub(crate) const MAX_CONTINUATIONS: usize = 4;
