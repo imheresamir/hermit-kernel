@@ -278,6 +278,19 @@ impl CoreLocal {
 		self.scratch_slot
 	}
 
+	/// Spike 6: clear the continuation window so the drain/executor runs on the
+	/// reactor stack (INV-C3 transition rule: CLEARED at park/escape/teardown).
+	#[inline]
+	pub fn clear_scratch_slot(&self) {
+		// SAFETY: scratch_slot is a plain u64 at a fixed offset (start.s D4 tail
+		// / switch vectors hardcode #24); this runs on the current core only
+		// (IRQ handler / drain), so a single raw write is sound.
+		unsafe {
+			let p = core::ptr::addr_of!(self.scratch_slot) as *mut u64;
+			*p = 0;
+		}
+	}
+
 	/// Spike 2 (INV-P4/P8): current RT-band nesting depth. Read/written only on
 	/// this core (from `do_irq`/`do_fiq` and the `df_check_el1h` asm predicate),
 	/// so `UnsafeCell` interior-mutability with non-atomic access is sound here.

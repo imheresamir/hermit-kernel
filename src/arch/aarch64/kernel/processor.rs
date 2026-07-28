@@ -335,6 +335,36 @@ pub fn set_oneshot_timer(wakeup_time: Option<u64>) {
 	});
 }
 
+/// Spike 6: arm a one-shot physical-timer deadline in raw CNTPCT cycles (no
+/// microsecond conversion). The continuation quantum uses this so its deadline
+/// math stays in cycle units. `None` disarms the timer.
+pub fn set_oneshot_timer_cycles(deadline_cycles: Option<u64>) {
+	without_interrupts(|| {
+		match deadline_cycles {
+			None => {
+				CNTP_CVAL_EL0.set(0);
+				CNTP_CTL_EL0.write(CNTP_CTL_EL0::ENABLE::CLEAR);
+			}
+			Some(d) => {
+				CNTP_CVAL_EL0.set(d);
+				CNTP_CTL_EL0.write(CNTP_CTL_EL0::ENABLE::SET);
+				// CRITICAL: also clear IMASK (bit 1) so the timer actually
+				// raises an interrupt. `ENABLE::SET` alone leaves IMASK=1,
+				// which makes the timer count but never interrupt — the
+				// preemption quantum would never fire.
+				CNTP_CTL_EL0.modify(CNTP_CTL_EL0::IMASK::CLEAR);
+			}
+		}
+	});
+}
+
+/// Current CNTPCT cycle count (monotonic). Used by Spike 6 for INV-C6
+/// (quantum arm/disarm latency measurement) and quantum deadline math.
+#[inline]
+pub fn read_counter() -> u64 {
+	CNTPCT_EL0.get()
+}
+
 pub fn print_information() {
 	// Implementer is 8 bits wide, so this cannot fail
 	let implementer_raw = u8::try_from(MIDR_EL1.read(MIDR_EL1::Implementer)).unwrap();
