@@ -15,6 +15,8 @@ use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 pub(crate) use self::delegate::Fd;
 use crate::arch::kernel::core_local::core_scheduler;
 use crate::errno::Errno;
+#[cfg(feature = "continuations")]
+use crate::arch::kernel::continuations::{block_on_cont, is_in_continuation};
 use crate::executor::block_on;
 use crate::fs::{FileAttr, SeekWhence};
 use crate::io;
@@ -350,6 +352,13 @@ pub(crate) fn read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 		return Ok(0);
 	}
 
+	// Spike 5: when called inside a continuation, drive the read future via the
+	// continuation-aware `block_on_cont` (cont parks, socket/NIC wake resumes it)
+	// instead of blocking the *task* on a TaskNotify futex. Task path unchanged.
+	#[cfg(feature = "continuations")]
+	if is_in_continuation() {
+		return block_on_cont(async { obj.read().await.read(buf).await });
+	}
 	block_on(async { obj.read().await.read(buf).await }, None)
 }
 

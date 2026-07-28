@@ -30,7 +30,11 @@ use log::info;
 use crate::arch::aarch64::kernel::core_local::{core_id, core_scheduler, CoreLocal};
 use crate::arch::aarch64::kernel::interrupts::{pend_sgi_to_self, SGI_CONT_WAKE};
 use crate::arch::aarch64::kernel::scheduler::State;
-use crate::config::{CONT_GUARD, CONT_SLOT_GUARD, CONT_SLOT_SIZE, CONT_STACK_SIZE, MAX_CONTINUATIONS};
+use crate::config::{
+	CONT_GUARD, CONT_SLOT_GUARD, CONT_SLOT_SIZE, CONT_STACK_SIZE, MAX_CONTINUATIONS,
+};
+use crate::io;
+use alloc::sync::Arc;
 
 // Continuation lifecycle states (§3.2.1). ESCAPED reserved for Spike 6.
 const C_FREE: u32 = 0;
@@ -98,6 +102,14 @@ extern "C" fn dummy_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 /// the Linux-conformant EAGAIN path per §3.6).
 static mut CONT_NEXT: usize = 0;
 static mut CONT_POOL: [Cont; MAX_CONTINUATIONS] = [const { Cont::new() }; MAX_CONTINUATIONS];
+
+/// True when the current core is executing inside a continuation (a cont is
+/// RUNNING). Used by `sys_read` to route blocking reads through the
+/// continuation-aware `block_on_cont` instead of the task-futex `block_on`.
+#[inline]
+pub(crate) fn is_in_continuation() -> bool {
+	CURRENT_CONT.load(Ordering::SeqCst) != 0
+}
 
 /// The continuation currently running on this core (null while the drain /
 /// task runs). Set on spawn + drain-resume, cleared on park.
@@ -280,6 +292,85 @@ pub(crate) fn coop_wake() {
 	}
 }
 
+/// ── Spike 5: continuation-aware `block_on` ──
+///
+/// A `Waker` that resumes the parked continuation: its `wake_by_ref` calls
+/// `coop_wake()`, which marks the `CONT_PENDING` continuation READY; the
+/// idle-loop `drain_ready` then performs the eret back into the cont. This is
+/// the SAME resume path proven in Spike 4 — a socket/NIC wake (via
+/// `wake_network_waker` → `NETWORK_WAKER.wake()` → this waker) reuses it.
+struct ContWaker;
+
+impl alloc::task::Wake for ContWaker {
+	fn wake(self: alloc::sync::Arc<Self>) {
+		coop_wake();
+	}
+	fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
+		coop_wake();
+	}
+}
+
+/// INV-C1 (counter balance): parks must equal resumes for a continuation that
+/// blocks on a future. Incremented on each external (future-driven) park and on
+/// each drain resume, respectively; the Spike-5 harness asserts balance.
+static CONT_PARK_COUNT: AtomicU32 = AtomicU32::new(0);
+static CONT_RESUME_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Park the current continuation, expecting an EXTERNAL wake (a future's waker,
+/// not the SGI_CONT_WAKE self-pend used by Spike 4's harness). Marks the cont
+/// PARKED + CONT_PENDING and switches to the resumer (drain). The external
+/// resource wakes via `coop_wake()` (through the `ContWaker`), after which
+/// `drain_ready` resumes us here.
+fn park_for_external_wake() {
+	without_interrupts(|| {
+		let cur = CURRENT_CONT.load(Ordering::SeqCst) as *mut Cont;
+		assert!(cur != ptr::null_mut(), "park_for_external_wake outside any continuation");
+		let c = unsafe { &*cur };
+		// R1.4 / R2.2: consume a wake that arrived while RUNNING.
+		if c.pending_wake.swap(0, Ordering::SeqCst) != 0 {
+			return;
+		}
+		c.state.store(C_PARKED, Ordering::SeqCst);
+		CONT_PENDING.store(cur as u64, Ordering::SeqCst);
+		CONT_PARK_COUNT.fetch_add(1, Ordering::SeqCst);
+		unsafe {
+			CONT_SWITCH.save = c.state_frame;
+			CONT_SWITCH.target = c.resumer_frame;
+			CONT_SWITCH.target_slot = c.resumer_slot;
+			CONT_SWITCH.cur = c.resumer_frame;
+		}
+		CURRENT_CONT.store(0, Ordering::SeqCst);
+		cont_switch();
+	});
+}
+
+/// Continuation-aware analogue of `executor::block_on`. Drives `future` to
+/// completion, but instead of blocking the *task* on a `TaskNotify` futex, the
+/// calling *continuation* parks itself (via `park_for_external_wake`) whenever
+/// the future is `Pending`. The future receives a `ContWaker` whose `wake()`
+/// resumes this cont. Used by `sys_read` when called inside a continuation
+/// (Spike 5: retire `block_on` at the socket read site).
+pub(crate) fn block_on_cont<F, T>(future: F) -> io::Result<T>
+where
+	F: Future<Output = io::Result<T>>,
+{
+	let waker = alloc::sync::Arc::new(ContWaker).into();
+	let mut cx = core::task::Context::from_waker(&waker);
+	let mut future = core::pin::pin!(future);
+	loop {
+		match future.as_mut().poll(&mut cx) {
+			core::task::Poll::Ready(t) => return t,
+			core::task::Poll::Pending => {
+				// The future registered our ContWaker via cx.waker(); park and
+				// wait for the external wake to resume us here.
+				park_for_external_wake();
+				// Resumed: re-poll the future.
+				CONT_RESUME_COUNT.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+	}
+}
+
 /// Drain one ready continuation (called from the idle loop on core 0). Switches
 /// drain→cont if a cont is READY.
 pub(crate) fn drain_ready() {
@@ -349,9 +440,63 @@ extern "C" fn cont_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 		);
 	}
 	// Yield to the drain permanently so the idle loop stays live.
+	CONT_S4_DONE.store(true, Ordering::SeqCst);
 	park_final();
 	// `park_final` never returns (cont_switch -> eret to the drain); this is
 	// unreachable but makes the `-> !` signature explicit.
+	unreachable!()
+}
+
+/// Set by the Spike-4 harness once it has printed PASS, so the Spike-5 harness
+/// (which shares the single global `CONT_PENDING` wake slot — one COOP wake
+/// line on the I/O core) only spawns afterward and gets the slot to itself.
+static CONT_S4_DONE: AtomicBool = AtomicBool::new(false);
+
+/// ── Spike 5 self-test harness ──
+/// Exercises the continuation-aware read path (`block_on_cont`): a cont drives a
+/// synthetic "socket read" future that Pending-then-Ready, woken via the same
+/// `coop_wake` (SGI_CONT_WAKE) resume path Spike 4 proved. Asserts INV-C1 (park
+/// count == resume count) and INV-C2 (exactly one resume). Prints
+/// `[CONT-SHIM] INV-C1/C2 PASS`.
+static CONT_SPAWNED_SHIM: AtomicBool = AtomicBool::new(false);
+
+async fn shim_read_future() -> io::Result<usize> {
+	use core::future;
+	use core::task::Poll;
+	static FIRST: AtomicBool = AtomicBool::new(true);
+	future::poll_fn(|_cx| {
+		if FIRST.swap(false, Ordering::SeqCst) {
+			// First poll: "no data yet" — pend the wake that routes to
+			// coop_wake (delivered on unmask → drain_ready resumes us).
+			pend_sgi_to_self(SGI_CONT_WAKE);
+			Poll::Pending
+		} else {
+			Poll::Ready(Ok(42))
+		}
+	})
+	.await
+}
+
+extern "C" fn shim_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	// Drive the read future through the continuation-aware path: the cont parks
+	// (registering the ContWaker) and is resumed when the wake fires.
+	let n = block_on_cont(shim_read_future());
+	let parks = CONT_PARK_COUNT.load(Ordering::SeqCst);
+	let resumes = CONT_RESUME_COUNT.load(Ordering::SeqCst);
+	// INV-C1: every park is balanced by a resume. INV-C2: exactly one resume
+	// (a single read completes once).
+	if parks == resumes && resumes == 1 {
+		info!(
+			"[CONT-SHIM] INV-C1/C2 PASS (parks={} resumes={} n={:?})",
+			parks, resumes, n
+		);
+	} else {
+		info!(
+			"[CONT-SHIM] FAIL: parks={} resumes={} n={:?}",
+			parks, resumes, n
+		);
+	}
+	park_final();
 	unreachable!()
 }
 
@@ -370,15 +515,20 @@ pub(crate) fn continuation_maybe_trigger() {
 		return;
 	}
 	#[cfg(feature = "continuations")]
-	if crate::drivers::DRIVERS_READY.get().is_some() {
-		// drivers up; safe to (once) spawn the harness
-	} else {
+	if crate::drivers::DRIVERS_READY.get().is_none() {
 		return; // not ready yet — idle loop will retry next iteration
 	}
-	if CONT_SPAWNED.swap(true, Ordering::SeqCst) {
-		return;
+	// Spike 4 harness (park/resume via self-pend SGI).
+	if !CONT_SPAWNED.swap(true, Ordering::SeqCst) {
+		spawn_continuation(cont_harness_entry);
 	}
-	spawn_continuation(cont_harness_entry);
+	// Spike 5 harness (block_on_cont read path + external wake). Serialized
+	// after Spike 4 so the two harnesses don't contend on CONT_PENDING.
+	if CONT_S4_DONE.load(Ordering::SeqCst)
+		&& !CONT_SPAWNED_SHIM.swap(true, Ordering::SeqCst)
+	{
+		spawn_continuation(shim_harness_entry);
+	}
 }
 
 // ── asm switch primitive ──
