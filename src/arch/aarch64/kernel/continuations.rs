@@ -87,6 +87,15 @@ pub(crate) struct Cont {
 	escape_frame: *mut State,
 	/// Whether a quantum is currently armed for this cont (INV-C1 pairing).
 	quantum_armed: AtomicBool,
+	/// 7b-B: user thread body (`func(arg)`) to run when this cont starts.
+	/// Stored at spawn from `spawn_continuation`'s args; read by `pthread_entry`
+	/// after resume (never via the stack pointer — see bisect notes).
+	user_func: usize,
+	/// 7b-B: argument passed to `user_func`.
+	user_arg: usize,
+	/// 7b-B: an fd this cont owns; dropped on teardown. `None` = no owned fd.
+	/// (Idiomatic replacement for the `-1` sentinel the user rejected.)
+	owned_fd: Option<i32>,
 }
 
 /// 16-byte-aligned buffer holding one `State` frame (escape capture target).
@@ -110,6 +119,9 @@ impl Cont {
 			escape_buf: AlignedStateBuf { inner: [0u8; 320] },
 			escape_frame: ptr::null_mut(),
 			quantum_armed: AtomicBool::new(false),
+			user_func: 0,
+			user_arg: 0,
+			owned_fd: None,
 		}
 	}
 }
@@ -262,7 +274,7 @@ fn build_frame(c: &mut Cont, core: usize, i: usize) {
 
 /// Spawn a continuation from the current (drain) context. Switches drain→cont;
 /// returns to the drain when the cont parks.
-pub(crate) fn spawn_continuation(entry: ContEntry) {
+pub(crate) fn spawn_continuation(entry: ContEntry, func: usize, arg: usize, owned_fd: i32) {
 	// docs/stackful-continuations.md §9 O1 (H1/H5): a continuation IS created
 	// here, so assert boot completed (GIC + drivers ready) — lock-free, so it
 	// does not take the `GIC`/`InitCell` hazard-class locks O1 forbids. The
@@ -278,6 +290,17 @@ pub(crate) fn spawn_continuation(entry: ContEntry) {
 	let c = unsafe { &mut CONT_POOL[i] };
 	c.entry = entry;
 	c.tls = CONT_TLS_MAGIC;
+	// 7b-B: stash the user func/arg/owned_fd into the Cont record, delivered
+	// as SIGNATURE PARAMS (not module-level pending statics — pending statics
+	// go stale across Cont free-list reuse and corrupt the resumed cont's
+	// func/arg/fd; the disassembly-proven-safe 4-arg signature is correct).
+	c.user_func = func;
+	c.user_arg = arg;
+	c.owned_fd = if owned_fd < 0 { None } else { Some(owned_fd) };
+	// 7b-B: account for a cont-owned fd so the teardown drop balances 1:1.
+	if c.owned_fd.is_some() {
+		S7B_FD_REFS.fetch_add(1, Ordering::SeqCst);
+	}
 	// Spike 6: tag the quantum-harness cont so its quantum counters are
 	// isolated from Spike-4/5 conts (which share spawn_continuation).
 	if core::ptr::eq(entry as *const (), quantum_harness_entry as *const ()) {
@@ -397,6 +420,14 @@ pub(crate) fn continuation_teardown() {
 		// R9.8: a panic in any fd drop (e.g. Socket::drop -> flush_nic) is a
 		// fail-stop, not a recursive shutdown (abort_zone).
 		CoreLocal::get().abort_zone.store(true, Ordering::SeqCst);
+		// 7b-B: drop any cont-owned fd (O6 INV-4/6/7 re-hosted onto the COOP
+		// band). Bounded, non-parking (INV-4): no `block_on`/`park_on` here.
+		// For the spike we model the drop with the ref counter; a real fd
+		// would be closed via the fd table here.
+		if let Some(_fd) = c.owned_fd {
+			S7B_FD_REFS.fetch_sub(1, Ordering::SeqCst);
+			S7B_FD_DROPPED.fetch_add(1, Ordering::SeqCst);
+		}
 		// fd drops happen here once conts own sockets (Spike 7 futex/pthread).
 		// For v1 the cont holds no fds, so this is a no-op bounded region — but
 		// it must remain non-parking (INV-4): no `block_on`/`park_on` on this
@@ -1007,19 +1038,44 @@ static S7B_SPAWNED: AtomicU32 = AtomicU32::new(0);
 static S7B_TORN: AtomicU32 = AtomicU32::new(0);
 static S7B_RAN_COUNT: AtomicU32 = AtomicU32::new(0);
 static S7B_DONE: AtomicBool = AtomicBool::new(false);
+/// 7b-B cont-owned fd accounting. `S7B_FD_REFS` counts live owned fds;
+/// `S7B_FD_DROPPED` counts how many were dropped on teardown. Both prove the
+/// fd-drop path (O6 INV-4/6/7 re-hosted onto the COOP band) executes without
+/// faulting and balances 1:1 with spawned conts that own an fd.
+static S7B_FD_REFS: AtomicU32 = AtomicU32::new(0);
+static S7B_FD_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// 7b-B test body: a real thread function the cont runs via `func(arg)`.
+/// It atomically records that it executed (with its argument), proving
+/// `spawn_continuation`'s func/arg passing reached the cont body intact.
+static S7B_FUNC_RAN: AtomicU32 = AtomicU32::new(0);
+extern "C" fn s7b_thread_func(arg: usize) {
+	S7B_FUNC_RAN.store(arg as u32, Ordering::SeqCst);
+	// A tiny bit of real work so the body isn't elided.
+	let _x = arg.wrapping_add(1);
+}
 
 extern "C" fn pthread_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
-	// A real "thread body" (what `pthread_create(func,arg)` would run). It
-	// proves spawn_continuation executed user code, not a stub. We derive the
-	// pool index from CURRENT_CONT (no new Cont field needed for the no-arg
-	// 7b-A stage; arg-passing + join land in 7b-B). The RAN count is cumulative
-	// across the serialized wave (threads reuse one slot), so it tracks how
-	// many thread bodies actually executed, not per-slot state.
+	// 7b-B: run the user thread body `func(arg)` that was stashed into the
+	// Cont record at spawn. Read it AFTER resume via CURRENT_CONT (never
+	// through the stack pointer — the bisect proved struct growth is safe but
+	// the resume path is frame-size-sensitive). The `Func`/arg are plain
+	// usizes; we transmute the stored func into a callable and invoke it.
 	assert!(is_in_continuation(), "pthread cont not in continuation");
 	let cur = CURRENT_CONT.load(Ordering::SeqCst) as *const Cont;
-	let base = core::ptr::addr_of!(CONT_POOL) as usize;
-	let _idx = (cur as usize - base) / core::mem::size_of::<Cont>();
+	let c = unsafe { &*cur };
+	let func = c.user_func;
+	let arg = c.user_arg;
+	let _idx = (cur as usize
+		- (core::ptr::addr_of!(CONT_POOL) as usize))
+		/ core::mem::size_of::<Cont>();
 	S7B_RAN_COUNT.fetch_add(1, Ordering::SeqCst);
+	// Run the user body (if any) BEFORE tearing down. A null func is a
+	// no-op body (valid for the no-func 7b-B verify path).
+	if func != 0 {
+		let f: extern "C" fn(usize) = unsafe { core::mem::transmute(func) };
+		f(arg);
+	}
 	// == pthread_exit: tear down in place (frees record, pokes reactor).
 	S7B_TORN.fetch_add(1, Ordering::SeqCst);
 	continuation_teardown();
@@ -1036,6 +1092,27 @@ fn s7b_verify() {
 	if S7B_TORN.load(Ordering::SeqCst) == S7B_WAVE
 		&& S7B_RAN_COUNT.load(Ordering::SeqCst) == S7B_WAVE
 	{
+		// 7b-B: every cont body must have actually RUN `func(arg)` — i.e.
+		// S7B_FUNC_RAN was set to the arg we passed (0x7b42) at least once.
+		// If the func/arg call path is broken, this assertion pinpoints it.
+		assert!(
+			S7B_FUNC_RAN.load(Ordering::SeqCst) == 0x7b42,
+			"7b-B func(arg) call path not exercised: S7B_FUNC_RAN={:#x}",
+			S7B_FUNC_RAN.load(Ordering::SeqCst)
+		);
+		// 7b-B: every cont-owned fd must have been dropped on teardown,
+		// leaving zero live refs and a dropped count equal to the wave size.
+		assert!(
+			S7B_FD_REFS.load(Ordering::SeqCst) == 0,
+			"7b-B fd-drop unbalanced: S7B_FD_REFS={}",
+			S7B_FD_REFS.load(Ordering::SeqCst)
+		);
+		assert!(
+			S7B_FD_DROPPED.load(Ordering::SeqCst) == S7B_WAVE,
+			"7b-B fd-drop count mismatch: dropped={} expected={}",
+			S7B_FD_DROPPED.load(Ordering::SeqCst),
+			S7B_WAVE
+		);
 		// INV-C8 (exit never parked) + INV-C9 (reaper bounded) + INV-C10
 		// (slot/record freed; pool reuse) + all N thread bodies ran.
 		info!(
@@ -1085,21 +1162,21 @@ pub(crate) fn continuation_maybe_trigger() {
 	}
 	// Spike 4 harness (park/resume via self-pend SGI).
 	if !CONT_SPAWNED.swap(true, Ordering::SeqCst) {
-		spawn_continuation(cont_harness_entry);
+		spawn_continuation(cont_harness_entry, 0, 0, -1);
 	}
 	// Spike 5 harness (block_on_cont read path + external wake). Serialized
 	// after Spike 4 so the two harnesses don't contend on CONT_PENDING.
 	if CONT_S4_DONE.load(Ordering::SeqCst)
 		&& !CONT_SPAWNED_SHIM.swap(true, Ordering::SeqCst)
 	{
-		spawn_continuation(shim_harness_entry);
+		spawn_continuation(shim_harness_entry, 0, 0, -1);
 	}
 	// Spike 6 harness (quantum escape). Serialized after Spike 4+5 so it doesn't
 	// contend on the single CONT_PENDING wake slot.
 	if CONT_S5_DONE.load(Ordering::SeqCst)
 		&& !CONT_SPAWNED_QUANTUM.swap(true, Ordering::SeqCst)
 	{
-		spawn_continuation(quantum_harness_entry);
+		spawn_continuation(quantum_harness_entry, 0, 0, -1);
 	}
 	// Spike 7a harness (O6 teardown wave). Serialized after Spike 6. Spawns one
 	// cont per drain iteration (the cont tears down -> yields to drain -> next
@@ -1113,7 +1190,7 @@ pub(crate) fn continuation_maybe_trigger() {
 		&& CONT_PENDING.load(Ordering::SeqCst) == 0
 	{
 		S7_SPAWNED.fetch_add(1, Ordering::SeqCst);
-		spawn_continuation(teardown_harness_entry);
+		spawn_continuation(teardown_harness_entry, 0, 0, -1);
 	}
 	// Spike 7b-A harness (cont-backed pthread create/exit). Serialized after the
 	// Spike 7a wave completes so it doesn't contend on CONT_PENDING / RUNNING.
@@ -1126,7 +1203,16 @@ pub(crate) fn continuation_maybe_trigger() {
 		&& CONT_PENDING.load(Ordering::SeqCst) == 0
 	{
 		S7B_SPAWNED.fetch_add(1, Ordering::SeqCst);
-		spawn_continuation(pthread_entry);
+		// 7b-B: pass a real thread body + arg through the Cont record (as
+		// signature params — the proven-safe delivery), and a cont-owned fd
+		// (3) dropped on teardown. The body runs via `func(arg)`, recording
+		// its arg in S7B_FUNC_RAN; the fd-drop decrements S7B_FD_REFS.
+		spawn_continuation(
+			pthread_entry,
+			s7b_thread_func as usize,
+			0x7b42,
+			3,
+		);
 	}
 }
 
