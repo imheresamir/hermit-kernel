@@ -153,7 +153,7 @@ static CONT_TEARDOWN_HAPPENED: AtomicBool = AtomicBool::new(false);
 /// the Linux-conformant EAGAIN path per §3.6).
 fn alloc_cont() -> usize {
 	let top = unsafe { CONT_FREE_TOP };
-	if top > 0 {
+	let i = if top > 0 {
 		unsafe { CONT_FREE_TOP = top - 1 };
 		let p = unsafe { core::ptr::addr_of_mut!(CONT_FREE_BUF[top - 1]) };
 		unsafe { *p }
@@ -162,7 +162,19 @@ fn alloc_cont() -> usize {
 		assert!(n < MAX_CONTINUATIONS, "continuation pool exhausted (MAX_CONTINUATIONS)");
 		unsafe { CONT_NEXT = n + 1 };
 		n
-	}
+	};
+	// INVARIANT: a record leaving the allocator must be C_FREE. A live
+	// (PARKED/RUNNING/READY) record handed out here means its stack/slot are
+	// about to be rebuilt under a live continuation — stack clobber.
+	let st = unsafe { (*core::ptr::addr_of!(CONT_POOL[i])).state.load(Ordering::SeqCst) };
+	assert!(
+		st == C_FREE,
+		"alloc_cont returned a LIVE record: idx={} state={} (free_top was {})",
+		i,
+		st,
+		top
+	);
+	i
 }
 
 /// O6.3: reclaim a cont record to the free-list (record becomes C_FREE /
@@ -267,7 +279,13 @@ fn build_frame(c: &mut Cont, core: usize, i: usize) {
 		// what makes involuntary park (§3.5) possible — with IRQs masked the
 		// quantum could never fire mid-cont.
 		(*frame).spsr_el1 = 0x3c4;
-		(*frame).sp_el0 = stack_top - 16;
+		// SP starts BELOW the reserved State-frame region. `state_frame` is a
+		// FIXED save area at the top of the cont stack: every park writes the
+		// 288-byte State there (`CONT_SWITCH.save = c.state_frame`). If the
+		// entry function's stack frame overlapped that window, each park would
+		// clobber the entry's live locals/spills (7b-C: joiner's spilled `x9`
+		// read back as 0 after resume → str [x9,#0x68] data abort).
+		(*frame).sp_el0 = stack_top - size_of::<State>() as u64 - 16;
 		(*frame).tpidr_el0 = c.tls;
 	}
 }
@@ -666,6 +684,14 @@ static DUMMY_SAVE: core::mem::MaybeUninit<State> = core::mem::MaybeUninit::unini
 /// resource wakes via `coop_wake()` (through the `ContWaker`), after which
 /// `drain_ready` resumes us here.
 fn park_for_external_wake() {
+	park_external(true);
+}
+
+/// Core of the external-wake park. `count_stats` controls the Spike-5 INV-C1
+/// park counter (`CONT_PARK_COUNT`): `block_on_cont` parks count (balanced by
+/// its resume counter); the 7b-C join park does NOT (it has no matching
+/// resume-counter site and would skew the S5 balance).
+fn park_external(count_stats: bool) {
 	without_interrupts(|| {
 		let cur = CURRENT_CONT.load(Ordering::SeqCst) as *mut Cont;
 		assert!(cur != ptr::null_mut(), "park_for_external_wake outside any continuation");
@@ -678,7 +704,9 @@ fn park_for_external_wake() {
 		}
 		c.state.store(C_PARKED, Ordering::SeqCst);
 		CONT_PENDING.store(cur as u64, Ordering::SeqCst);
-		CONT_PARK_COUNT.fetch_add(1, Ordering::SeqCst);
+		if count_stats {
+			CONT_PARK_COUNT.fetch_add(1, Ordering::SeqCst);
+		}
 		unsafe {
 			CONT_SWITCH.save = c.state_frame;
 			CONT_SWITCH.target = c.resumer_frame;
@@ -1123,6 +1151,79 @@ fn s7b_verify() {
 	}
 }
 
+// ── Spike 7b-C: pthread_join (cont→cont join via join word + COOP wake) ──
+//
+// pthread_join model (§3.4): the JOINER parks on a join word (the futex-wait
+// shape: `while word == 0 { park }` — loop handles spurious wakes) and the
+// JOINEE's exit path publishes its retval into the word then wakes the joiner
+// through the SAME COOP wake path a FUTEX_WAKE takes (`coop_wake` → READY →
+// drain resume), then tears down. The joinee's retval is delivered via the
+// proven signature-param `user_arg` (7b-B). Spike limitation: the single
+// `CONT_PENDING` wake slot means exactly one parked joiner; the multi-waiter
+// wake queue is Spike 7 futex work.
+static S7C_JOINER_SPAWNED: AtomicBool = AtomicBool::new(false);
+static S7C_JOINEE_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// The join word: 0 = joinee not exited; non-zero = joinee's retval.
+static S7C_JOIN_WORD: AtomicU32 = AtomicU32::new(0);
+/// Number of parks the joiner performed before the join word was visible
+/// (proves the joiner actually PARKED and was RESUMED by the joinee's wake,
+/// rather than spinning or seeing the word set pre-park).
+static S7C_JOIN_PARKS: AtomicU32 = AtomicU32::new(0);
+static S7C_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The retval the joinee "returns" and the joiner must observe.
+const S7C_RETVAL: u32 = 0x7C77;
+
+extern "C" fn s7c_joiner_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	assert!(is_in_continuation(), "joiner not in continuation");
+	// pthread_join(joinee): futex-wait shape on the join word. The park loop
+	// re-checks the word after every resume (spurious-wake safe).
+	while S7C_JOIN_WORD.load(Ordering::SeqCst) == 0 {
+		S7C_JOIN_PARKS.fetch_add(1, Ordering::SeqCst);
+		park_external(false);
+	}
+	let rv = S7C_JOIN_WORD.load(Ordering::SeqCst);
+	assert!(
+		rv == S7C_RETVAL,
+		"pthread_join observed wrong retval: {:#x} (expected {:#x})",
+		rv,
+		S7C_RETVAL
+	);
+	// The joiner must have actually parked at least once (the joinee only
+	// spawns AFTER the joiner is parked, so the word cannot be pre-set).
+	assert!(
+		S7C_JOIN_PARKS.load(Ordering::SeqCst) >= 1,
+		"joiner never parked — join path not exercised"
+	);
+	info!(
+		"[CONT-JOIN] INV-C2/C8 PASS (retval={:#x} parks={})",
+		rv,
+		S7C_JOIN_PARKS.load(Ordering::SeqCst)
+	);
+	S7C_DONE.store(true, Ordering::SeqCst);
+	// Yield to the drain forever (harness cont has no teardown of its own —
+	// keeping it parked keeps the pool accounting of the 7a/7b waves intact).
+	park_final();
+	unreachable!()
+}
+
+extern "C" fn s7c_joinee_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	assert!(is_in_continuation(), "joinee not in continuation");
+	// == return from the thread body: publish retval (delivered via the
+	// proven 7b-B signature-param user_arg) into the join word...
+	let cur = CURRENT_CONT.load(Ordering::SeqCst) as *const Cont;
+	let rv = unsafe { (*cur).user_arg } as u32;
+	assert!(rv != 0, "joinee retval must be non-zero (0 = not-exited)");
+	S7C_JOIN_WORD.store(rv, Ordering::SeqCst);
+	// ...then FUTEX_WAKE the parked joiner through the COOP wake path
+	// (coop_wake marks the CONT_PENDING cont READY; the drain resumes it
+	// after our teardown switches back).
+	coop_wake();
+	// == pthread_exit.
+	continuation_teardown();
+	unreachable!()
+}
+
 /// O6.1: called by the idle loop after `drain_ready()` returns — true if a
 /// continuation teardown happened since the last call. The idle loop uses this
 /// to poke the reactor once (INV-6/INV-7), re-hosting the `cleanup_tasks`
@@ -1213,6 +1314,36 @@ pub(crate) fn continuation_maybe_trigger() {
 			0x7b42,
 			3,
 		);
+	}
+	// Spike 7b-C harness (pthread_join). Serialized after the 7b-B wave. Order:
+	// 1) spawn the JOINER; it parks on the join word (occupies CONT_PENDING).
+	// 2) once the joiner is PARKED, spawn the JOINEE with the retval as its
+	//    user_arg; it publishes the retval, coop_wake()s the joiner, exits.
+	// 3) the drain resumes the joiner, which validates retval + park count.
+	// The joinee spawn deliberately does NOT require CONT_PENDING == 0: the
+	// parked joiner occupies the single wake slot by design (see 7b-C note).
+	if S7B_DONE.load(Ordering::SeqCst)
+		&& !S7C_JOINER_SPAWNED.swap(true, Ordering::SeqCst)
+	{
+		spawn_continuation(s7c_joiner_entry, 0, 0, -1);
+	}
+	if S7C_JOINER_SPAWNED.load(Ordering::SeqCst)
+		&& !S7C_DONE.load(Ordering::SeqCst)
+		&& CURRENT_CONT.load(Ordering::SeqCst) == 0
+		&& !S7C_JOINEE_SPAWNED.load(Ordering::SeqCst)
+	{
+		// Only spawn the joinee once the joiner is actually PARKED on the
+		// join word (it must be the CONT_PENDING occupant in C_PARKED state),
+		// so the joinee's coop_wake targets it deterministically.
+		let p = CONT_PENDING.load(Ordering::SeqCst);
+		if p != 0 {
+			let joiner = unsafe { &*(p as *const Cont) };
+			if joiner.state.load(Ordering::SeqCst) == C_PARKED
+				&& !S7C_JOINEE_SPAWNED.swap(true, Ordering::SeqCst)
+			{
+				spawn_continuation(s7c_joinee_entry, 0, S7C_RETVAL as usize, -1);
+			}
+		}
 	}
 }
 
