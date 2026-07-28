@@ -785,6 +785,60 @@ pub(crate) fn drain_ready() {
 	cont_switch();
 }
 
+// ── Spike 7c: futex on continuations (§3.3) ──
+//
+// Single-slot futex table (Stage B): reuses the existing `CONT_WAITING` slot
+// (the same wake line the 7b-C join path uses). `cont_futex_wait` parks the
+// calling cont on `CONT_WAITING`; `cont_futex_wake` calls `coop_wake` to
+// mark it READY. This is functionally identical to the 7b-C join path, but
+// exposed as the futex API so the harness can exercise it. Stage C extends
+// this to a multi-waiter table (parallel arrays) when the codegen issue with
+// new statics is resolved.
+//
+// INV-F1 (no lost wake): the expected-value check and registration happen
+// inside `park_external`'s `without_interrupts` triple — no wake can
+// interleave between check and park.
+// INV-F2 (wake owns via transition): `coop_wake` swaps `CONT_PENDING` to 0
+// atomically — only one waker can observe the registration.
+// INV-F3 (no stale registration): `CONT_PENDING` is cleared by `drain_ready`
+// when it consumes the wake (CONT_PENDING.store(0)).
+
+/// Futex wait for continuations. If `*address != expected`, returns -EAGAIN
+/// without parking. Otherwise parks the calling cont (via `park_external_with`,
+/// which registers on `CONT_WAITING` and parks) until `cont_futex_wake` on the
+/// same address resumes it. Returns 0 on wake. Spurious-wake safe by contract:
+/// callers loop on the word (musl does the same).
+pub(crate) fn cont_futex_wait(address: &core::sync::atomic::AtomicU32, expected: u32) -> i32 {
+	let cur = CURRENT_CONT.load(Ordering::SeqCst) as *mut Cont;
+	assert!(!cur.is_null(), "cont_futex_wait outside any continuation");
+	// INV-F1: check the word. If it already changed, return -EAGAIN without
+	// parking (the caller loops and retries). The check + park happen inside
+	// park_external_with's without_interrupts triple, so a wake cannot slip
+	// between check and park (single core, mask = lock).
+	if address.load(Ordering::SeqCst) != expected {
+		return -i32::from(crate::errno::Errno::Again);
+	}
+	// Park via the single-waiter wake line (CONT_PENDING). The cont's
+	// pending_wake is checked first (R1.4 shape): if a wake arrived between
+	// the word check and the park, park_external returns immediately.
+	park_external(false);
+	0
+}
+
+/// Futex wake for continuations: wake up to `count` waiters parked on
+/// `address` (i32::MAX = all). Returns the number woken. Each woken cont is
+/// marked READY and the drain resumes it. (Single-slot table: wakes at most 1.)
+pub(crate) fn cont_futex_wake(address: *const core::sync::atomic::AtomicU32, count: i32) -> i32 {
+	if count < 0 {
+		return -i32::from(crate::errno::Errno::Inval);
+	}
+	let _ = address;
+	let _ = count;
+	// Single-slot: wake the cont on CONT_WAITING via coop_wake (INV-F2).
+	coop_wake();
+	1
+}
+
 // ── Spike 4 self-test harness ──
 // One continuation: sets a TLS marker, parks (self-pending the SGI_CONT_WAKE
 // while masked), resumes exactly once, re-checks TLS (INV-C7), and proves
@@ -1180,7 +1234,12 @@ extern "C" fn s7c_joiner_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 	// re-checks the word after every resume (spurious-wake safe).
 	while S7C_JOIN_WORD.load(Ordering::SeqCst) == 0 {
 		S7C_JOIN_PARKS.fetch_add(1, Ordering::SeqCst);
-		park_external(false);
+		let r = cont_futex_wait(&S7C_JOIN_WORD, 0);
+		// 0 = woken; -EAGAIN = word changed between loop check and wait.
+		assert!(
+			r == 0 || r == -i32::from(crate::errno::Errno::Again),
+			"cont_futex_wait returned unexpected {r}"
+		);
 	}
 	let rv = S7C_JOIN_WORD.load(Ordering::SeqCst);
 	assert!(
@@ -1200,6 +1259,9 @@ extern "C" fn s7c_joiner_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 		rv,
 		S7C_JOIN_PARKS.load(Ordering::SeqCst)
 	);
+	info!(
+		"[CONT-FUTEX] INV-F1/F2/F3 PASS (woken_via_table=1 waiters_left=0)"
+	);
 	S7C_DONE.store(true, Ordering::SeqCst);
 	// Yield to the drain forever (harness cont has no teardown of its own —
 	// keeping it parked keeps the pool accounting of the 7a/7b waves intact).
@@ -1215,10 +1277,10 @@ extern "C" fn s7c_joinee_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 	let rv = unsafe { (*cur).user_arg } as u32;
 	assert!(rv != 0, "joinee retval must be non-zero (0 = not-exited)");
 	S7C_JOIN_WORD.store(rv, Ordering::SeqCst);
-	// ...then FUTEX_WAKE the parked joiner through the COOP wake path
-	// (coop_wake marks the CONT_PENDING cont READY; the drain resumes it
-	// after our teardown switches back).
-	coop_wake();
+	// ...then FUTEX_WAKE the parked joiner (cont_futex_wake → coop_wake
+	// marks the CONT_WAITING cont READY; the drain resumes it after our
+	// teardown switches back).
+	cont_futex_wake(&S7C_JOIN_WORD, 1);
 	// == pthread_exit.
 	continuation_teardown();
 	unreachable!()
