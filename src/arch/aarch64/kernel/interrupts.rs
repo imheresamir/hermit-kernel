@@ -979,12 +979,30 @@ pub(crate) extern "C" fn do_sync(state: &State, sp_el1: u64) {
 			"do_sync: current task frame_location must be InSlot"
 		);
 	}
+	// On task-context exceptions (EL0t/EL1t), clear the continuation slot
+	// assignment before any path that can panic/abort/re-enter. Leaving
+	// scratch_slot set allows a nested exception to hit df_check_el1t and
+	// mask the real fault behind a slot-overflow double-fault.
+	if !from_el1h {
+		CoreLocal::get().clear_scratch_slot();
+	}
+
 	unsafe { dump_frame_once("do_sync", state as *const State) };
 	let esr = ESR_EL1.get();
 	let ec_raw = ESR_EL1.read(ESR_EL1::EC);
-	let ec: ESR_EL1::EC::Value = ESR_EL1.read_as_enum(ESR_EL1::EC).unwrap();
+	let ec: ESR_EL1::EC::Value =
+		ESR_EL1.read_as_enum(ESR_EL1::EC).unwrap();
 	let iss = ESR_EL1.read(ESR_EL1::ISS);
 	let pc = ELR_EL1.get();
+	let fatal_finish = |reason: &str| {
+		error!(
+			"[TASK-FAULT] {} task={} pc={:#x}",
+			reason,
+			core_scheduler().get_current_task_id(),
+			ELR_EL1.get()
+		);
+		scheduler::abort();
+	};
 
 	/* data abort from lower or current level */
 	if (ec == ESR_EL1::EC::Value::DataAbortCurrentEL)
