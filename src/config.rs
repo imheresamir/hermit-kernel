@@ -120,4 +120,4 @@ const _: () = assert!(
 );
 pub(crate) const CONT_SLOT_GUARD: usize = 0x1000;
 /// Number of continuations allocated per core (monotonic allocator, Spike 4).
-pub(crate) const MAX_CONTINUATIONS: usize = 4;
+pub(crate) const MAX_CONTINUATIONS: usize = 128;

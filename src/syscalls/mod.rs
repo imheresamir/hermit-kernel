@@ -124,6 +124,7 @@ pub(crate) fn scan_kstack_for_v(tag: &str, v: u64) {
 	}
 }
 
+#[cfg(all(target_os = "none", not(feature = "common-os")))]
 #[inline(never)]
 fn alloc_trace(tag: &str, size: usize, align: usize, ptr: *mut u8) {
 	// Only trace sizeable allocations to keep the log readable; the eh-pool

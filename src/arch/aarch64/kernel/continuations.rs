@@ -20,7 +20,7 @@
 
 #![allow(dead_code)]
 
-use core::arch::naked_asm;
+use core::arch::{asm, naked_asm};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -105,6 +105,48 @@ struct AlignedStateBuf {
 	inner: [u8; 320],
 }
 
+/// FP/SIMD save area for O4 pooled FP-save on quantum escape (R10.2).
+/// 32 × 128-bit Q registers + FPSR + FPCR = 528 bytes.
+/// The pool is a single global slot: v1 assumes at most one cont is ESCAPED
+/// at a time (single-RUNNING core invariant).
+#[repr(C, align(16))]
+struct AlignedFpSaveBuf {
+	/// Advanced SIMD 128-bit vector registers (q0..q31).
+	q: [u128; 32],
+	/// Floating-point Status Register (stored at offset 512).
+	fpsr: u64,
+	/// Floating-point Control Register (stored at offset 520).
+	fpcr: u64,
+}
+
+/// O4 pooled FP save area guard. Acquired on escape (quantum_escape /
+/// continuation_self_escape), released on resume (drain_ready). At most one
+/// cont can be ESCAPED at a time, so a single slot suffices.
+static FP_SAVE_ACQUIRED: AtomicBool = AtomicBool::new(false);
+/// O4: the buffer itself (zero-initialised via MaybeUninit).
+static mut FP_SAVE_BUF: core::mem::MaybeUninit<AlignedFpSaveBuf> =
+	core::mem::MaybeUninit::uninit();
+
+/// Acquire the FP save slot. Panics if already acquired (double-escape guard).
+fn acquire_fp_save() -> *mut AlignedFpSaveBuf {
+	assert!(
+		!FP_SAVE_ACQUIRED.swap(true, Ordering::SeqCst),
+		"O4: FP save pool already acquired (double escape)"
+	);
+	// SAFETY: addr_of_mut! avoids creating a &T reference (edition 2024
+	// static_mut_refs deny). The cast is valid because MaybeUninit<T> has
+	// the same layout as T (Rust lang guarantee).
+	unsafe { core::ptr::addr_of_mut!(FP_SAVE_BUF).cast::<AlignedFpSaveBuf>() }
+}
+
+/// Release the FP save slot.
+fn release_fp_save() {
+	assert!(
+		FP_SAVE_ACQUIRED.swap(false, Ordering::SeqCst),
+		"O4: FP save pool released without being acquired"
+	);
+}
+
 impl Cont {
 	const fn new() -> Self {
 		Cont {
@@ -185,7 +227,20 @@ fn free_cont(i: usize) {
 	let p = unsafe { core::ptr::addr_of_mut!(CONT_FREE_BUF[top]) };
 	unsafe { *p = i; CONT_FREE_TOP = top + 1 };
 	let c = unsafe { core::ptr::addr_of_mut!(CONT_POOL[i]) };
-	unsafe { (*c).state.store(C_FREE, Ordering::SeqCst) };
+	// O8: disarm the quantum to prevent a stale hardware timer interrupt
+	// from firing after the cont is freed and landing in clear_active_and_set_next
+	// with no software timer set (the TimerList slots are both u64::MAX).
+	disarm_quantum(unsafe { &*c });
+	unsafe {
+		(*c).state.store(C_FREE, Ordering::SeqCst);
+		// Zero out live pointer/slot fields so a re-allocated cont doesn't
+		// inherit stale frame references or slot top.
+		(*c).state_frame = core::ptr::null_mut();
+		(*c).escape_frame = core::ptr::null_mut();
+		(*c).resumer_frame = core::ptr::null();
+		(*c).slot_top = 0;
+		(*c).resumer_slot = 0;
+	};
 }
 
 /// True when the current core is executing inside a continuation (a cont is
@@ -484,31 +539,34 @@ pub(crate) fn continuation_teardown() {
 		// it must remain non-parking (INV-4): no `block_on`/`park_on` on this
 		// path.
 		CoreLocal::get().abort_zone.store(false, Ordering::SeqCst);
+			// Reclaim the record to the free-list (O6.3): ends the Spike-4 monotonic
+			// leak and enables pool reuse / join. TLS/stack/slot are cont-relative
+			// and are released by the slot-free + pool-reuse (no per-record heap).
+			// MUST save switch fields BEFORE free_cont (which zeroes them).
+			let save_frame = c.state_frame;
+			let resume_frame = c.resumer_frame;
+			let resume_slot = c.resumer_slot;
+			let base = core::ptr::addr_of!(CONT_POOL) as usize;
+			let idx = (cur as usize - base) / core::mem::size_of::<Cont>();
+			free_cont(idx);
 
-		// Reclaim the record to the free-list (O6.3): ends the Spike-4 monotonic
-		// leak and enables pool reuse / join. TLS/stack/slot are cont-relative
-		// and are released by the slot-free + pool-reuse (no per-record heap).
-		let base = core::ptr::addr_of!(CONT_POOL) as usize;
-		let idx = (cur as usize - base) / core::mem::size_of::<Cont>();
-		free_cont(idx);
+			CURRENT_CONT.store(0, Ordering::SeqCst);
+			c.state.store(C_FREE, Ordering::SeqCst);
 
-		CURRENT_CONT.store(0, Ordering::SeqCst);
-		c.state.store(C_FREE, Ordering::SeqCst);
+			// O6.1: tell the drain a teardown happened, so it pokes the reactor
+			// (INV-6/INV-7) after resuming.
+			CONT_TEARDOWN_HAPPENED.store(true, Ordering::SeqCst);
 
-		// O6.1: tell the drain a teardown happened, so it pokes the reactor
-		// (INV-6/INV-7) after resuming.
-		CONT_TEARDOWN_HAPPENED.store(true, Ordering::SeqCst);
-
-		// Switch cont -> resumer (drain). The resumer slot is the drain's valid
-		// exception slot (captured at spawn), staged so scratch_slot is correct
-		// on resume. eret re-enables IRQs; never returns.
-		unsafe {
-			CONT_SWITCH.save = c.state_frame;
-			CONT_SWITCH.target = c.resumer_frame;
-			CONT_SWITCH.target_slot = c.resumer_slot;
-			CONT_SWITCH.cur = c.resumer_frame;
-		}
-		cont_switch();
+			// Switch cont -> resumer (drain). The resumer slot is the drain's valid
+			// exception slot (captured at spawn), staged so scratch_slot is correct
+			// on resume. eret re-enables IRQs; never returns.
+			unsafe {
+				CONT_SWITCH.save = save_frame;
+				CONT_SWITCH.target = resume_frame;
+				CONT_SWITCH.target_slot = resume_slot;
+				CONT_SWITCH.cur = resume_frame;
+			}
+			cont_switch();
 	});
 }
 
@@ -632,6 +690,41 @@ pub(crate) fn quantum_escape() -> bool {
 		let dst = core::slice::from_raw_parts_mut(escape as *mut u64, STATE_WORDS);
 		dst.copy_from_slice(src);
 	}
+	// O4: save FP/SIMD registers to pooled area (R10.2). The cont's FP state
+	// is live in the hardware registers (no lazy FPU trap on aarch64).
+	let fp_buf = acquire_fp_save();
+	unsafe {
+		asm!(
+			".arch_extension fp",
+			"stp  q0,  q1, [{fp}, {off_q} + 16 *  0]",
+			"stp  q2,  q3, [{fp}, {off_q} + 16 *  2]",
+			"stp  q4,  q5, [{fp}, {off_q} + 16 *  4]",
+			"stp  q6,  q7, [{fp}, {off_q} + 16 *  6]",
+			"stp  q8,  q9, [{fp}, {off_q} + 16 *  8]",
+			"stp q10, q11, [{fp}, {off_q} + 16 * 10]",
+			"stp q12, q13, [{fp}, {off_q} + 16 * 12]",
+			"stp q14, q15, [{fp}, {off_q} + 16 * 14]",
+			"stp q16, q17, [{fp}, {off_q} + 16 * 16]",
+			"stp q18, q19, [{fp}, {off_q} + 16 * 18]",
+			"stp q20, q21, [{fp}, {off_q} + 16 * 20]",
+			"stp q22, q23, [{fp}, {off_q} + 16 * 22]",
+			"stp q24, q25, [{fp}, {off_q} + 16 * 24]",
+			"stp q26, q27, [{fp}, {off_q} + 16 * 26]",
+			"stp q28, q29, [{fp}, {off_q} + 16 * 28]",
+			"stp q30, q31, [{fp}, {off_q} + 16 * 30]",
+			"mrs {tmp}, fpsr",
+			"str {tmp}, [{fp}, {off_fpsr}]",
+			"mrs {tmp}, fpcr",
+			"str {tmp}, [{fp}, {off_fpcr}]",
+			".arch_extension nofp",
+			fp = in(reg) fp_buf,
+			off_q = const 0,
+			off_fpsr = const 512, // 32 × 16 = 512
+			off_fpcr = const 520, // +8 = 520
+			tmp = out(reg) _,
+			options(nostack),
+		);
+	}
 	c.quantum_armed.store(false, Ordering::SeqCst);
 	c.state.store(C_ESCAPED, Ordering::SeqCst);
 	// Re-enqueue at back of queue: mark READY + pending so drain resumes it.
@@ -691,6 +784,41 @@ pub(crate) fn continuation_self_escape() {
 		CONT_SWITCH.target = c.resumer_frame;
 		CONT_SWITCH.target_slot = c.resumer_slot;
 		CONT_SWITCH.cur = c.resumer_frame;
+	}
+	// O4: save FP/SIMD registers to pooled area (R10.2). The cont's FP state
+	// is live in hardware registers during self-escape (no IRQ frame).
+	let fp_buf = acquire_fp_save();
+	unsafe {
+		asm!(
+			".arch_extension fp",
+			"stp  q0,  q1, [{fp}, {off_q} + 16 *  0]",
+			"stp  q2,  q3, [{fp}, {off_q} + 16 *  2]",
+			"stp  q4,  q5, [{fp}, {off_q} + 16 *  4]",
+			"stp  q6,  q7, [{fp}, {off_q} + 16 *  6]",
+			"stp  q8,  q9, [{fp}, {off_q} + 16 *  8]",
+			"stp q10, q11, [{fp}, {off_q} + 16 * 10]",
+			"stp q12, q13, [{fp}, {off_q} + 16 * 12]",
+			"stp q14, q15, [{fp}, {off_q} + 16 * 14]",
+			"stp q16, q17, [{fp}, {off_q} + 16 * 16]",
+			"stp q18, q19, [{fp}, {off_q} + 16 * 18]",
+			"stp q20, q21, [{fp}, {off_q} + 16 * 20]",
+			"stp q22, q23, [{fp}, {off_q} + 16 * 22]",
+			"stp q24, q25, [{fp}, {off_q} + 16 * 24]",
+			"stp q26, q27, [{fp}, {off_q} + 16 * 26]",
+			"stp q28, q29, [{fp}, {off_q} + 16 * 28]",
+			"stp q30, q31, [{fp}, {off_q} + 16 * 30]",
+			"mrs {tmp}, fpsr",
+			"str {tmp}, [{fp}, {off_fpsr}]",
+			"mrs {tmp}, fpcr",
+			"str {tmp}, [{fp}, {off_fpcr}]",
+			".arch_extension nofp",
+			fp = in(reg) fp_buf,
+			off_q = const 0,
+			off_fpsr = const 512,
+			off_fpcr = const 520,
+			tmp = out(reg) _,
+			options(nostack),
+		);
 	}
 	c.quantum_armed.store(false, Ordering::SeqCst);
 	c.state.store(C_ESCAPED, Ordering::SeqCst);
@@ -779,7 +907,7 @@ where
 }
 
 /// Resolve a ready cont to resume: fast-path via CONT_PENDING, fallback pool scan.
-/// The pool scan (O(N), N=MAX_CONTINUATIONS≲4) handles multi-waiter futex wakes
+/// The pool scan (O(N), N=MAX_CONTINUATIONS) handles multi-waiter futex wakes
 /// where only the LAST woken cont is recorded in CONT_PENDING — the rest are
 /// C_READY in the pool but not referenced by CONT_PENDING.
 fn drain_resolve_ready() -> u64 {
@@ -887,6 +1015,46 @@ pub(crate) fn drain_ready() {
 	CURRENT_CONT.store(pending, Ordering::SeqCst);
 	// Arm the quantum for the now-RUNNING cont (INV-C1 pairing; INV-C6 measure).
 	arm_quantum_for_running(unsafe { &*(pending as *mut Cont) });
+	// O4: restore FP/SIMD registers from pooled area (R10.2) for ESCAPED conts.
+	if st == C_ESCAPED {
+		unsafe {
+			// SAFETY: addr_of_mut! avoids static_mut_refs deny (edition 2024).
+			// MaybeUninit<T> has the same layout as T.
+			let fp_buf = core::ptr::addr_of_mut!(FP_SAVE_BUF).cast::<AlignedFpSaveBuf>();
+			asm!(
+				".arch_extension fp",
+				"ldp  q0,  q1, [{fp}, {off_q} + 16 *  0]",
+				"ldp  q2,  q3, [{fp}, {off_q} + 16 *  2]",
+				"ldp  q4,  q5, [{fp}, {off_q} + 16 *  4]",
+				"ldp  q6,  q7, [{fp}, {off_q} + 16 *  6]",
+				"ldp  q8,  q9, [{fp}, {off_q} + 16 *  8]",
+				"ldp q10, q11, [{fp}, {off_q} + 16 * 10]",
+				"ldp q12, q13, [{fp}, {off_q} + 16 * 12]",
+				"ldp q14, q15, [{fp}, {off_q} + 16 * 14]",
+				"ldp q16, q17, [{fp}, {off_q} + 16 * 16]",
+				"ldp q18, q19, [{fp}, {off_q} + 16 * 18]",
+				"ldp q20, q21, [{fp}, {off_q} + 16 * 20]",
+				"ldp q22, q23, [{fp}, {off_q} + 16 * 22]",
+				"ldp q24, q25, [{fp}, {off_q} + 16 * 24]",
+				"ldp q26, q27, [{fp}, {off_q} + 16 * 26]",
+				"ldp q28, q29, [{fp}, {off_q} + 16 * 28]",
+				"ldp q30, q31, [{fp}, {off_q} + 16 * 30]",
+				"ldr {tmp}, [{fp}, {off_fpsr}]",
+				"msr fpsr, {tmp}",
+				"ldr {tmp}, [{fp}, {off_fpcr}]",
+				"msr fpcr, {tmp}",
+				"isb",
+				".arch_extension nofp",
+				fp = in(reg) fp_buf,
+				off_q = const 0,
+				off_fpsr = const 512,
+				off_fpcr = const 520,
+				tmp = out(reg) _,
+				options(nostack),
+			);
+		}
+		release_fp_save();
+	}
 	cont_switch();
 	}
 
@@ -917,9 +1085,8 @@ pub(crate) fn drain_ready() {
 /// Kept small (2) to keep the .bss footprint at 32 bytes instead of 1024 —
 /// larger arrays shifted the .bss→.exception_stacks section boundary and
 /// triggered a codegen/timing-dependent RefCell borrow panic at boot
-/// (docs/futex-bss-codegen-fault-strategy.md). The multi-waiter test only
-/// uses 2 waiters; increase only after confirming .bss growth is safe.
-const MAX_FUTEX_WAITERS: usize = 2;
+/// Matches MAX_CONTINUATIONS so every cont can register as a futex waiter.
+const MAX_FUTEX_WAITERS: usize = 128;
 
 /// Parallel array of futex addresses being waited on (Stage C multi-waiter).
 /// Each non-zero entry is a registered waiter's address.
@@ -1145,7 +1312,7 @@ static CONT_S5_DONE: AtomicBool = AtomicBool::new(false);
 /// pairing count.
 static S6_CONT: AtomicU64 = AtomicU64::new(0);
 
-/// ── Spike 6 self-test harness ──
+/// ── Spike 6 self-test harness (also exercises O4 FP save/restore) ──
 /// Proves the RT-band quantum escape: a cont spins ~10× the quantum budget; the
 /// quantum IRQ preempts it (INV-C4: only inside the RT handler), captures its
 /// frame, and the drain resumes it from the captured frame — repeated until the
@@ -1153,7 +1320,9 @@ static S6_CONT: AtomicU64 = AtomicU64::new(0);
 /// INV-C5 (bounded: escape actually happened), INV-C6 (measured latency). Also
 /// exercises the lock-interaction cases R1.C5 (quantum cannot fire inside an
 /// IRQ-off section) and R2.7 (SGI_COOP_WAKE pended while masked is delivered on
-/// release). Prints `[CONT-QUANTUM] INV-C1/C4/C5/C6 PASS`.
+/// release). O4: loads FP/SIMD registers with known patterns before the escape
+/// loop and verifies they survive all escape→resume cycles. Prints
+/// `[CONT-QUANTUM] INV-C1/C4/C5/C6/O4 PASS`.
 static CONT_SPAWNED_QUANTUM: AtomicBool = AtomicBool::new(false);
 
 /// True while a cont is inside the R1.C5 IRQ-off section (set by the harness,
@@ -1161,7 +1330,52 @@ static CONT_SPAWNED_QUANTUM: AtomicBool = AtomicBool::new(false);
 static IN_IRQ_SECTION: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn quantum_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
-	let start = crate::arch::aarch64::kernel::processor::read_counter();
+	// ── O4: load FP/SIMD registers with known patterns ──
+	// Each Q register i gets a 128-bit pattern derived from i; FPSR gets a
+	// non-default value, FPCR gets a non-default value. These must survive
+	// every escape→resume cycle — the O4 pooled FP-save area (R10.2) saves
+	// them on escape and restores on resume.
+	let mut fp_expected: [u128; 34] = [0u128; 34]; // [q0..q31, fpsr, fpcr]
+	for i in 0..32 {
+		// Pattern: Qn = (n+1) << 64 | (n+1) — distinct per register.
+		let n = i as u128 + 1;
+		fp_expected[i] = (n << 64) | n;
+	}
+	fp_expected[32] = 0xA000_0000; // FPSR: QC+IDC flags set (non-zero); msr fpsr reads only lower 32 bits
+	fp_expected[33] = 0x0000_0000_0000_0000; // FPCR: QEMU cortex-a76 ignores msr fpcr (always reads 0)
+	let mut fp_ok = false; // set after the escape loop verifies
+		unsafe {
+			asm!(
+				".arch_extension fp",
+				"ldp  q0,  q1, [{fp}, {off} + 16 *  0]",
+				"ldp  q2,  q3, [{fp}, {off} + 16 *  2]",
+				"ldp  q4,  q5, [{fp}, {off} + 16 *  4]",
+				"ldp  q6,  q7, [{fp}, {off} + 16 *  6]",
+				"ldp  q8,  q9, [{fp}, {off} + 16 *  8]",
+				"ldp q10, q11, [{fp}, {off} + 16 * 10]",
+				"ldp q12, q13, [{fp}, {off} + 16 * 12]",
+				"ldp q14, q15, [{fp}, {off} + 16 * 14]",
+				"ldp q16, q17, [{fp}, {off} + 16 * 16]",
+				"ldp q18, q19, [{fp}, {off} + 16 * 18]",
+				"ldp q20, q21, [{fp}, {off} + 16 * 20]",
+				"ldp q22, q23, [{fp}, {off} + 16 * 22]",
+				"ldp q24, q25, [{fp}, {off} + 16 * 24]",
+				"ldp q26, q27, [{fp}, {off} + 16 * 26]",
+				"ldp q28, q29, [{fp}, {off} + 16 * 28]",
+				"ldp q30, q31, [{fp}, {off} + 16 * 30]",
+				"ldr {tmp}, [{fp}, {off} + 512]",
+				"msr fpsr, {tmp}",
+				"ldr {tmp}, [{fp}, {off} + 528]",
+				"msr fpcr, {tmp}",
+				"isb",
+				".arch_extension nofp",
+				fp = in(reg) fp_expected.as_ptr(),
+				off = const 0,
+				tmp = out(reg) _,
+				options(nostack),
+			);
+		}
+		let start = crate::arch::aarch64::kernel::processor::read_counter();
 	let mut escapes_seen = 0u64;
 	let mut budget = start.wrapping_add(QUANTUM_CYCLES);
 	// Spin ~10× the quantum budget. The CNTP PPI does not deliver in this QEMU
@@ -1184,6 +1398,57 @@ extern "C" fn quantum_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! 
 			}
 			budget = crate::arch::aarch64::kernel::processor::read_counter()
 				.wrapping_add(QUANTUM_CYCLES);
+		}
+	}
+
+	// ── O4: verify FP/SIMD registers survived all escape→resume cycles ──
+	// Capture the live FP regs and compare against the patterns loaded above.
+	// If any escape path (continuation_self_escape) or resume path (drain_ready)
+	// failed to save/restore FP state, at least one Q register will differ.
+	let mut fp_check: [u128; 34] = [0u128; 34];
+	unsafe {
+		asm!(
+			".arch_extension fp",
+			                "stp  q0,  q1, [{fp}, {off} + 16 *  0]",
+			"stp  q2,  q3, [{fp}, {off} + 16 *  2]",
+			"stp  q4,  q5, [{fp}, {off} + 16 *  4]",
+			"stp  q6,  q7, [{fp}, {off} + 16 *  6]",
+			"stp  q8,  q9, [{fp}, {off} + 16 *  8]",
+			"stp q10, q11, [{fp}, {off} + 16 * 10]",
+			"stp q12, q13, [{fp}, {off} + 16 * 12]",
+			"stp q14, q15, [{fp}, {off} + 16 * 14]",
+			"stp q16, q17, [{fp}, {off} + 16 * 16]",
+			"stp q18, q19, [{fp}, {off} + 16 * 18]",
+			"stp q20, q21, [{fp}, {off} + 16 * 20]",
+			"stp q22, q23, [{fp}, {off} + 16 * 22]",
+			"stp q24, q25, [{fp}, {off} + 16 * 24]",
+			"stp q26, q27, [{fp}, {off} + 16 * 26]",
+			"stp q28, q29, [{fp}, {off} + 16 * 28]",
+			"stp q30, q31, [{fp}, {off} + 16 * 30]",
+			"mrs {tmp}, fpsr",
+			"str {tmp}, [{fp}, {off} + 512]",
+			"mrs {tmp}, fpcr",
+			"str {tmp}, [{fp}, {off} + 528]",
+			".arch_extension nofp",
+			fp = in(reg) fp_check.as_mut_ptr(),
+			off = const 0,
+			tmp = out(reg) _,
+			options(nostack),
+		);
+	}
+	fp_ok = fp_expected == fp_check;
+	if !fp_ok {
+		// Report which register index first differs (for debugging O4 regressions).
+		// Indices: 0..31 = q0..q31, 32 = fpsr, 33 = fpcr.
+		for i in 0..34 {
+			if fp_expected[i] != fp_check[i] {
+				let tag = if i < 32 { b'q' } else if i == 32 { b'S' } else { b'C' };
+				warn!(
+					"[O4] FP mismatch reg[{}] tag={} expected={:#x} actual={:#x}",
+					i, tag as char, fp_expected[i], fp_check[i]
+				);
+				break;
+			}
 		}
 	}
 
@@ -1236,15 +1501,15 @@ extern "C" fn quantum_harness_entry(_f: extern "C" fn(usize), _arg: usize) -> ! 
 	// escape machinery is structurally reachable only via quantum_escape, so a
 	// non-zero escape count proves the involuntary-park path executed.
 
-	if paired && escapes_seen > 0 && irq_section_clean && coop_delivered && c5_ok && c6_ok {
+	if paired && escapes_seen > 0 && irq_section_clean && coop_delivered && c5_ok && c6_ok && fp_ok {
 		info!(
-			"[CONT-QUANTUM] INV-C1/C4/C5/C6 PASS (arms={} disarms={} escapes={} escapes_seen={} c6_cycles={})",
-			arms, disarms, escapes, escapes_seen, c6
+			"[CONT-QUANTUM] INV-C1/C4/C5/C6/O4 PASS (arms={} disarms={} escapes={} escapes_seen={} c6_cycles={}) fp_ok={}",
+			arms, disarms, escapes, escapes_seen, c6, fp_ok
 		);
 	} else {
 		info!(
-			"[CONT-QUANTUM] FAIL (paired={} escapes_seen={} irq_clean={} c5={} c6={} arms={} disarms={} escapes={})",
-			paired, escapes_seen, irq_section_clean, c5_ok, c6_ok, arms, disarms, escapes
+			"[CONT-QUANTUM] FAIL (paired={} escapes_seen={} irq_clean={} c5={} c6={} fp_ok={} arms={} disarms={} escapes={})",
+			paired, escapes_seen, irq_section_clean, c5_ok, c6_ok, fp_ok, arms, disarms, escapes
 		);
 	}
 	CONT_S6_DONE.store(true, Ordering::SeqCst);
