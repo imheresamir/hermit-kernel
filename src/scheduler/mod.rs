@@ -13,7 +13,7 @@ use core::time::Duration;
 
 use ahash::RandomState;
 use crossbeam_utils::Backoff;
-use hashbrown::{HashMap, hash_map};
+use hashbrown::{hash_map, HashMap};
 use hermit_sync::*;
 #[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus;
@@ -30,8 +30,8 @@ use crate::arch::kernel::{get_processor_count, interrupts};
 use crate::errno::Errno;
 use crate::fd::{Fd, RawFd};
 use crate::io;
-use crate::scheduler::task::*;
 use crate::scheduler::supervisor::EntryPointId;
+use crate::scheduler::task::*;
 
 pub mod supervisor;
 pub mod task;
@@ -136,7 +136,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 	/// Trigger an interrupt to reschedule the system
 	#[cfg(target_arch = "aarch64")]
 	fn reschedule(self) {
-		use aarch64_cpu::asm::barrier::{NSH, SY, dsb, isb};
+		use aarch64_cpu::asm::barrier::{dsb, isb, NSH, SY};
 
 		use crate::arch::kernel::interrupts::SGI_RESCHED;
 
@@ -187,8 +187,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 				"[ABORT-DUMP] task={tid:?} frame_base={lsp:#x} exit_code={exit_code} (0x60000207 = SPSR-shaped panic index)"
 			);
 			if lsp != 0 {
-				let (hit_any, hit_x) =
-					crate::diagnostics::dump_frame_magic(lsp, "exit");
+				let (hit_any, hit_x) = crate::diagnostics::dump_frame_magic(lsp, "exit");
 				error!(
 					"[ABORT-DUMP] kernel_leak? any={hit_any} x_slot={hit_x} (any slot == 0x60000207)"
 				);
@@ -275,8 +274,7 @@ impl PerCoreSchedulerExt for &mut PerCoreScheduler {
 				// `kernel_end_address` are the same bounds already asserted for
 				// the exception stacks at core_local.rs:142-148.
 				let entry_addr = entry as usize;
-				let in_image = entry_addr
-					>= crate::mm::kernel_start_address().as_u64() as usize
+				let in_image = entry_addr >= crate::mm::kernel_start_address().as_u64() as usize
 					&& entry_addr < crate::mm::kernel_end_address().as_u64() as usize;
 				if entry_addr == 0 || entry_addr == usize::MAX || !in_image {
 					warn!(
@@ -611,7 +609,12 @@ impl PerCoreScheduler {
 
 	#[inline]
 	pub fn get_current_task_id(&self) -> TaskId {
-		without_interrupts(|| self.current_task.borrow().id)
+		without_interrupts(|| {
+			self.current_task
+				.try_borrow()
+				.map(|t| t.id)
+				.unwrap_or_else(|_| TaskId::from(i32::MAX))
+		})
 	}
 
 	/// NEW-1 (option-d-per-task-slot-rebased.md §10): the per-task exception
@@ -619,7 +622,12 @@ impl PerCoreScheduler {
 	/// to assert the frame landed on the task's own scratch slot (InSlot), not a
 	/// shared/foreign stack.
 	pub fn get_current_task_frame_location(&self) -> FrameLocation {
-		without_interrupts(|| self.current_task.borrow().frame_location)
+		without_interrupts(|| {
+			self.current_task
+				.try_borrow()
+				.map(|t| t.frame_location)
+				.unwrap_or(FrameLocation::Evicted)
+		})
 	}
 
 	/// EL1t diagnostic helper: the current task's kernel_stack_top
@@ -628,8 +636,12 @@ impl PerCoreScheduler {
 	/// at `kernel_stack_top` is an off-by-one stack-top write (Option D §11.7).
 	pub fn get_current_task_kernel_stack_top(&self) -> u64 {
 		without_interrupts(|| {
-			let t = self.current_task.borrow();
-			t.stacks.get_kernel_stack().as_u64() + t.stacks.get_kernel_stack_size() as u64
+			self.current_task
+				.try_borrow()
+				.map(|t| {
+					t.stacks.get_kernel_stack().as_u64() + t.stacks.get_kernel_stack_size() as u64
+				})
+				.unwrap_or(0)
 		})
 	}
 
@@ -638,10 +650,14 @@ impl PerCoreScheduler {
 	/// allocator instrumentation to detect heap/stack overlap.
 	pub fn get_current_task_kstack_bounds(&self) -> (u64, u64, i32) {
 		without_interrupts(|| {
-			let t = self.current_task.borrow();
-			let base = t.stacks.get_kernel_stack().as_u64();
-			let top = base + t.stacks.get_kernel_stack_size() as u64;
-			(base, top, t.id.into())
+			self.current_task
+				.try_borrow()
+				.map(|t| {
+					let base = t.stacks.get_kernel_stack().as_u64();
+					let top = base + t.stacks.get_kernel_stack_size() as u64;
+					(base, top, t.id.into())
+				})
+				.unwrap_or((0, 0, i32::MAX))
 		})
 	}
 
@@ -1073,9 +1089,7 @@ impl PerCoreScheduler {
 				// the reactor once (INV-6/INV-7 re-hosting the cleanup_tasks
 				// flush_nic poke that §7 deletes). Core 0 only (NIC/reactor).
 				#[cfg(feature = "net")]
-				if core_id() == 0
-					&& crate::arch::kernel::continuations::continuation_reaped()
-				{
+				if core_id() == 0 && crate::arch::kernel::continuations::continuation_reaped() {
 					crate::executor::network::flush_nic();
 				}
 				// O6 (Spike 7a): verify teardown-wave completion.
@@ -1096,7 +1110,19 @@ impl PerCoreScheduler {
 			#[cfg(not(feature = "net"))]
 			let _ = reaped;
 
-			if core_scheduler.ready_queue.is_empty() {
+			#[cfg(feature = "continuations")]
+			let has_pending_cont = crate::arch::kernel::continuations::has_pending_cont();
+			#[cfg(not(feature = "continuations"))]
+			let has_pending_cont = false;
+
+			if has_pending_cont {
+				// Don't WFI: there are C_READY continuations in the pool that
+				// drain_ready has not yet picked up (e.g. multi-waiter futex
+				// wake where only the last waiter was in CONT_PENDING). Just
+				// enable IRQs and loop around so the next iteration calls
+				// drain_ready again and the pool scan finds them.
+				interrupts::enable();
+			} else if core_scheduler.ready_queue.is_empty() {
 				if backoff.is_completed() {
 					interrupts::enable_and_wait();
 					backoff.reset();
@@ -1115,7 +1141,10 @@ impl PerCoreScheduler {
 	#[inline]
 	#[cfg(target_arch = "aarch64")]
 	pub fn get_last_stack_pointer(&self) -> memory_addresses::VirtAddr {
-		self.current_task.borrow().last_stack_pointer
+		self.current_task
+			.try_borrow()
+			.map(|t| t.last_stack_pointer)
+			.unwrap_or(memory_addresses::VirtAddr::zero())
 	}
 
 	/// Per-task exception slot design (per-task-exception-slot-design.md):
@@ -1217,8 +1246,7 @@ impl PerCoreScheduler {
 				if woken {
 					// T5/R1.1: complete the deferred wake now (frame is Evicted).
 					// mark_ready returns true (status Blocked->Ready); push it.
-					let completed =
-						BlockedTaskQueue::mark_ready(&v);
+					let completed = BlockedTaskQueue::mark_ready(&v);
 					if completed {
 						self.ready_queue.push(v);
 					}

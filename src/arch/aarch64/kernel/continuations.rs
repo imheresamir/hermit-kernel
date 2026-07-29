@@ -329,9 +329,42 @@ pub(crate) fn spawn_continuation(entry: ContEntry, func: usize, arg: usize, owne
 	c.state.store(C_READY, Ordering::SeqCst);
 
 	// resumer = current task (drain) frame + its scratch slot.
-	let task_frame = core_scheduler().get_last_stack_pointer().as_u64();
-	c.resumer_frame = task_frame as *const State;
-	c.resumer_slot = CoreLocal::get().scratch_slot();
+	//
+	// ── S7D fix: the drain's 288-byte save area ──
+	// The cont_switch SAVE writes 288 bytes at CONT_SWITCH.save. Previously
+	// this was `get_last_stack_pointer()` (the idle task's frame base inside
+	// the exception stack, ≈0x417ef490). During cont execution an exception
+	// handler (timer/SGI) writes its State frame at scratch_slot-288 and then
+	// runs its Rust code stack downward from there. If the handler's stack
+	// extends below the drain's save area, the saved ELR_EL1 is corrupted,
+	// producing the deterministic garbage ELR=0x3f84d5b5b5470917 on restore.
+	//
+	// Fix: use `e_top - 288` (= exception_sp - 288), the top of the per-core
+	// exception stack. When the cont runs, CoreLocal.scratch_slot = c.slot_top
+	// (the cont's own slot in .cont_slots, 0x4188e000+). Every exception
+	// handler saves/preempts the cont's context at c.slot_top-288 — NOT at the
+	// exception stack top — so the handler's State frame and call chain are
+	// on the cont's slot, completely separate from the exception stack. The
+	// exception stack top is ONLY touched by the drain itself (no concurrent
+	// drain+cont execution), so drain_state at e_top-288 is never overwritten.
+	// e_top-288 also avoids the false-positive df_check_el1h that fires when
+	// scratch_slot == e_top and SP_EL1 jumps into the danger window.
+	let (resumer_frame, resumer_slot) = if CURRENT_CONT.load(Ordering::SeqCst) == 0 {
+		// Drain context: save at the dedicated area at the very top of the
+		// per-core exception stack. This area is idle during cont execution
+		// (handlers use the cont's slot, not the exception stack).
+		let e_top = CoreLocal::get().exception_sp;
+		let save_addr = (e_top - size_of::<State>() as u64) as *const State;
+		(save_addr, e_top)
+	} else {
+		// Non-drain context (already in a cont): save relative to the
+		// scheduler's frame base, which is on the cont's own kernel stack.
+		// Handlers use scratch_slot (also the cont's slot), so no overlap.
+		let task_frame = core_scheduler().get_last_stack_pointer().as_u64();
+		(task_frame as *const State, CoreLocal::get().scratch_slot())
+	};
+	c.resumer_frame = resumer_frame;
+	c.resumer_slot = resumer_slot;
 
 	CURRENT_CONT.store(c as *const Cont as u64, Ordering::SeqCst);
 	// Spike 6: arm the quantum for the freshly-spawned RUNNING cont (so the
@@ -339,7 +372,7 @@ pub(crate) fn spawn_continuation(entry: ContEntry, func: usize, arg: usize, owne
 	// drain→cont without going through drain_ready).
 	arm_quantum_for_running(c);
 	unsafe {
-		CONT_SWITCH.save = task_frame as *const State;
+		CONT_SWITCH.save = resumer_frame;
 		CONT_SWITCH.target = c.state_frame;
 		CONT_SWITCH.target_slot = c.slot_top;
 		CONT_SWITCH.cur = c.state_frame;
@@ -745,23 +778,95 @@ where
 	}
 }
 
+/// Resolve a ready cont to resume: fast-path via CONT_PENDING, fallback pool scan.
+/// The pool scan (O(N), N=MAX_CONTINUATIONS≲4) handles multi-waiter futex wakes
+/// where only the LAST woken cont is recorded in CONT_PENDING — the rest are
+/// C_READY in the pool but not referenced by CONT_PENDING.
+fn drain_resolve_ready() -> u64 {
+	let pending = CONT_PENDING.load(Ordering::SeqCst);
+	if pending != 0 {
+		// SAFETY: pending is a valid Cont pointer from CONT_PENDING or
+		// drain_resolve_ready's pool scan; single-core, IRQs masked.
+		let st = unsafe { (*(pending as *const Cont)).state.load(Ordering::SeqCst) };
+		if st == C_READY || st == C_ESCAPED {
+			return pending;
+		}
+	}
+	// CONT_PENDING is 0 or stale — scan the pool.
+	for i in 0..MAX_CONTINUATIONS {
+		// SAFETY: single-core, IRQs masked during drain_ready call.
+		// Uses raw pointer (addr_of!) to avoid creating a &T from a static mut,
+		// which is UB in edition 2024 (static_mut_refs deny).
+		let st = unsafe {
+			(*core::ptr::addr_of!(CONT_POOL[i])).state.load(Ordering::SeqCst)
+		};
+		if st == C_READY || st == C_ESCAPED {
+			return unsafe { core::ptr::addr_of!(CONT_POOL[i]) as u64 };
+		}
+	}
+	0
+}
+
+/// Returns true if any continuation in the pool is C_READY but not yet picked up
+/// by drain_resolve_ready. Used by the idle loop to skip WFI when more work
+/// exists — solves the multi-waiter futex wakeup gap where only the last woken
+/// cont was recorded in CONT_PENDING and the rest are pool-only.
+pub(crate) fn has_pending_cont() -> bool {
+	for i in 0..MAX_CONTINUATIONS {
+		// SAFETY: single-core, IRQs masked during idle-loop call.
+		// Uses raw pointer (addr_of!) to avoid creating a &T from a static mut,
+		// which is UB in edition 2024 (static_mut_refs deny).
+		let st = unsafe {
+			(*core::ptr::addr_of!(CONT_POOL[i])).state.load(Ordering::SeqCst)
+		};
+		if st == C_READY {
+			return true;
+		}
+		// NOTE: C_ESCAPED is intentionally excluded. Quantum-escaped conts
+		// are still referenced by CONT_PENDING (set by quantum_escape) so
+		// drain_resolve_ready will find them without the pool scan. Including
+		// C_ESCAPED here would skip WFI after every escape, creating a tight
+		// escape->resume->re-escape loop that preempts other work. The quantum
+		// timer (left armed by the escape path) still wakes the core normally.
+	}
+	false
+}
+
 /// Drain one ready continuation (called from the idle loop on core 0). Switches
 /// drain→cont if a cont is READY. Arms the quantum for the resumed cont (Spike 6);
 /// on escape, resumes it from its captured `escape_frame`.
 pub(crate) fn drain_ready() {
-	let pending = CONT_PENDING.load(Ordering::SeqCst);
+	// IRQs are already disabled by the idle loop (`interrupts::disable()` at the
+	// top of `PerCoreScheduler::run()`), so no `without_interrupts` wrapper is
+	// needed here — and indeed it would be actively harmful: the RAII guard lives
+	// on the drain's stack and its Drop runs after cont_switch restores the drain.
+	// The synthesized SPSR for the drain resume (0x3c4 | spsel=1 = 0x3c5, I=1)
+	// already keeps IRQs masked on eret return, and the guard's saved_irq_state
+	// would be stale after the cont_switch stack swap, creating a double-mask or
+	// premature-unmask hazard. The idle loop handles IRQ state at its boundary
+	// (`interrupts::enable_and_wait()` / `interrupts::enable()`).
+	let pending = drain_resolve_ready();
 	if pending == 0 {
 		return;
 	}
 	let c = unsafe { &*(pending as *const Cont) };
 	let st = c.state.load(Ordering::SeqCst);
-	if st != C_READY && st != C_ESCAPED {
-		return;
-	}
+	debug_assert!(st == C_READY || st == C_ESCAPED, "drain_resolve_ready returned non-ready cont");
 	// This resume CONSUMES the wake that made the cont READY (R1.4): clear
 	// pending_wake so a later park doesn't see a stale wake and refuse to park.
 	c.pending_wake.store(0, Ordering::SeqCst);
-	let task_frame = core_scheduler().get_last_stack_pointer().as_u64();
+	// Same S7D fix as spawn_continuation: use the dedicated e_top-save area
+	// for the drain's 288-byte context, so exception handlers during cont
+	// execution (which use the cont's slot, not the exception stack) cannot
+	// overwrite the drain's saved ELR_EL1.
+	let (resumer_frame, resumer_slot) = if CURRENT_CONT.load(Ordering::SeqCst) == 0 {
+		let e_top = CoreLocal::get().exception_sp;
+		let save_addr = (e_top - size_of::<State>() as u64) as *const State;
+		(save_addr, e_top)
+	} else {
+		let task_frame = core_scheduler().get_last_stack_pointer().as_u64();
+		(task_frame as *const State, CoreLocal::get().scratch_slot())
+	};
 	// Spike 6: a cont that was ESCAPED resumes from its captured frame, not
 	// the original park/entry frame.
 	let target = if c.state.load(Ordering::SeqCst) == C_ESCAPED {
@@ -770,9 +875,9 @@ pub(crate) fn drain_ready() {
 		c.state_frame
 	};
 	unsafe {
-		(*(pending as *mut Cont)).resumer_frame = task_frame as *const State;
-		(*(pending as *mut Cont)).resumer_slot = CoreLocal::get().scratch_slot();
-		CONT_SWITCH.save = task_frame as *const State;
+		(*(pending as *mut Cont)).resumer_frame = resumer_frame;
+		(*(pending as *mut Cont)).resumer_slot = resumer_slot;
+		CONT_SWITCH.save = resumer_frame;
 		CONT_SWITCH.target = target;
 		CONT_SWITCH.target_slot = c.slot_top;
 		CONT_SWITCH.cur = target;
@@ -783,7 +888,7 @@ pub(crate) fn drain_ready() {
 	// Arm the quantum for the now-RUNNING cont (INV-C1 pairing; INV-C6 measure).
 	arm_quantum_for_running(unsafe { &*(pending as *mut Cont) });
 	cont_switch();
-}
+	}
 
 // ── Spike 7c: futex on continuations (§3.3) ──
 //
@@ -791,9 +896,14 @@ pub(crate) fn drain_ready() {
 // (the same wake line the 7b-C join path uses). `cont_futex_wait` parks the
 // calling cont on `CONT_WAITING`; `cont_futex_wake` calls `coop_wake` to
 // mark it READY. This is functionally identical to the 7b-C join path, but
-// exposed as the futex API so the harness can exercise it. Stage C extends
-// this to a multi-waiter table (parallel arrays) when the codegen issue with
-// new statics is resolved.
+// exposed as the futex API so the harness can exercise it.
+//
+// Stage C (multi-waiter futex table): parallel-array statics below extend the
+// single-slot design to N waiters. MAX_FUTEX_WAITERS is kept at 2 so the
+// .bss footprint is 32 bytes — small enough to NOT shift the .bss→.exception_stacks
+// section boundary. The original 64-waiter arrays (1028 bytes) caused a
+// codegen/timing-dependent fault when .bss growth shifted the boundary.
+// (docs/futex-bss-codegen-fault-strategy.md)
 //
 // INV-F1 (no lost wake): the expected-value check and registration happen
 // inside `park_external`'s `without_interrupts` triple — no wake can
@@ -803,40 +913,126 @@ pub(crate) fn drain_ready() {
 // INV-F3 (no stale registration): `CONT_PENDING` is cleared by `drain_ready`
 // when it consumes the wake (CONT_PENDING.store(0)).
 
+/// Maximum number of concurrent waiters in the multi-waiter futex table.
+/// Kept small (2) to keep the .bss footprint at 32 bytes instead of 1024 —
+/// larger arrays shifted the .bss→.exception_stacks section boundary and
+/// triggered a codegen/timing-dependent RefCell borrow panic at boot
+/// (docs/futex-bss-codegen-fault-strategy.md). The multi-waiter test only
+/// uses 2 waiters; increase only after confirming .bss growth is safe.
+const MAX_FUTEX_WAITERS: usize = 2;
+
+/// Parallel array of futex addresses being waited on (Stage C multi-waiter).
+/// Each non-zero entry is a registered waiter's address.
+static CONT_FUTEX_ADDRS: [AtomicU64; MAX_FUTEX_WAITERS] =
+	[const { AtomicU64::new(0) }; MAX_FUTEX_WAITERS];
+
+/// Parallel array of Cont pointers corresponding to each registered address.
+static CONT_FUTEX_CONTS: [AtomicU64; MAX_FUTEX_WAITERS] =
+	[const { AtomicU64::new(0) }; MAX_FUTEX_WAITERS];
+
+/// Number of waiters currently registered in the futex table.
+static CONT_FUTEX_WAITER_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Register a futex waiter in the multi-waiter table. Returns slot index, or
+/// MAX_FUTEX_WAITERS if the table is full (caller should return -EAGAIN).
+fn register_futex_wait(addr: u64, cont: u64) -> usize {
+	for i in 0..MAX_FUTEX_WAITERS {
+		if CONT_FUTEX_ADDRS[i].load(Ordering::SeqCst) == 0 {
+			CONT_FUTEX_ADDRS[i].store(addr, Ordering::SeqCst);
+			CONT_FUTEX_CONTS[i].store(cont, Ordering::SeqCst);
+			CONT_FUTEX_WAITER_COUNT.fetch_add(1, Ordering::SeqCst);
+			return i;
+		}
+	}
+	MAX_FUTEX_WAITERS
+}
+
+/// Clear a futex waiter slot (defensive, called after park returns in case the
+/// waker already cleared it — idempotent via swap check).
+fn clear_futex_slot(i: usize) {
+	if i < MAX_FUTEX_WAITERS {
+		if CONT_FUTEX_ADDRS[i].swap(0, Ordering::SeqCst) != 0 {
+			let _ = CONT_FUTEX_CONTS[i].swap(0, Ordering::SeqCst);
+			CONT_FUTEX_WAITER_COUNT.fetch_sub(1, Ordering::SeqCst);
+		}
+	}
+}
+
 /// Futex wait for continuations. If `*address != expected`, returns -EAGAIN
 /// without parking. Otherwise parks the calling cont (via `park_external_with`,
 /// which registers on `CONT_WAITING` and parks) until `cont_futex_wake` on the
 /// same address resumes it. Returns 0 on wake. Spurious-wake safe by contract:
 /// callers loop on the word (musl does the same).
-pub(crate) fn cont_futex_wait(address: &core::sync::atomic::AtomicU32, expected: u32) -> i32 {
+pub(crate) fn cont_futex_wait(address: &AtomicU32, expected: u32) -> i32 {
 	let cur = CURRENT_CONT.load(Ordering::SeqCst) as *mut Cont;
 	assert!(!cur.is_null(), "cont_futex_wait outside any continuation");
 	// INV-F1: check the word. If it already changed, return -EAGAIN without
-	// parking (the caller loops and retries). The check + park happen inside
-	// park_external_with's without_interrupts triple, so a wake cannot slip
-	// between check and park (single core, mask = lock).
+	// parking (the caller loops and retries).
 	if address.load(Ordering::SeqCst) != expected {
 		return -i32::from(crate::errno::Errno::Again);
 	}
-	// Park via the single-waiter wake line (CONT_PENDING). The cont's
-	// pending_wake is checked first (R1.4 shape): if a wake arrived between
-	// the word check and the park, park_external returns immediately.
+	// Register in the multi-waiter futex table, then park. The slot is
+	// cleared by cont_futex_wake (when it wakes us); we also defensively
+	// clear it after park returns in case of spurious wake (e.g. via
+	// coop_wake from another path). Registration is outside the
+	// without_interrupts block but that's safe single-core: no other cont
+	// can interleave, and IRQ handlers never call cont_futex_wait/wake.
+	let slot = register_futex_wait(address as *const AtomicU32 as u64, cur as u64);
+	if slot >= MAX_FUTEX_WAITERS {
+		return -i32::from(crate::errno::Errno::Again);
+	}
 	park_external(false);
+	// Defensive clear (waker may have already cleared the slot).
+	clear_futex_slot(slot);
 	0
 }
 
 /// Futex wake for continuations: wake up to `count` waiters parked on
 /// `address` (i32::MAX = all). Returns the number woken. Each woken cont is
 /// marked READY and the drain resumes it. (Single-slot table: wakes at most 1.)
-pub(crate) fn cont_futex_wake(address: *const core::sync::atomic::AtomicU32, count: i32) -> i32 {
+pub(crate) fn cont_futex_wake(address: *const AtomicU32, count: i32) -> i32 {
 	if count < 0 {
 		return -i32::from(crate::errno::Errno::Inval);
 	}
-	let _ = address;
-	let _ = count;
-	// Single-slot: wake the cont on CONT_WAITING via coop_wake (INV-F2).
-	coop_wake();
-	1
+	if count == 0 {
+		return 0;
+	}
+	let target_addr = address as u64;
+	let max_wake = if count == i32::MAX {
+		MAX_FUTEX_WAITERS as i32
+	} else {
+		count
+	};
+	let mut woken = 0i32;
+	let mut last_cont: u64 = 0;
+	for i in 0..MAX_FUTEX_WAITERS {
+		if woken >= max_wake {
+			break;
+		}
+		let slot_addr = CONT_FUTEX_ADDRS[i].load(Ordering::SeqCst);
+		if slot_addr == 0 || slot_addr != target_addr {
+			continue;
+		}
+		// Match — clear the slot and wake the cont.
+		// Order: clear ADDRS first so clear_futex_slot sees 0 and skips.
+		CONT_FUTEX_ADDRS[i].store(0, Ordering::SeqCst);
+		let cont_ptr = CONT_FUTEX_CONTS[i].swap(0, Ordering::SeqCst);
+		if cont_ptr != 0 {
+			let c = unsafe { &*(cont_ptr as *const Cont) };
+			c.pending_wake.store(1, Ordering::SeqCst);
+			c.state.store(C_READY, Ordering::SeqCst);
+			last_cont = cont_ptr;
+			woken += 1;
+		}
+	}
+	CONT_FUTEX_WAITER_COUNT.fetch_sub(woken as u32, Ordering::SeqCst);
+	// Set CONT_PENDING to the last woken cont so drain_ready picks it up.
+	// Other woken conts are C_READY in the pool but not referenced by
+	// CONT_PENDING; drain_resolve_ready's pool-scan fallback finds them.
+	if last_cont != 0 {
+		CONT_PENDING.store(last_cont, Ordering::SeqCst);
+	}
+	woken
 }
 
 // ── Spike 4 self-test harness ──
@@ -1286,7 +1482,75 @@ extern "C" fn s7c_joinee_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
 	unreachable!()
 }
 
-/// O6.1: called by the idle loop after `drain_ready()` returns — true if a
+// -- Spike 7d: Multi-waiter futex harness --
+// Proves the multi-waiter futex table (>1 concurrent waiter) + pool-scan
+// fallback (drain_resolve_ready). Two waiters park on separate futex words;
+// a waker wakes both via cont_futex_wake. Waiters verify word changed after
+// wake. Exercises INV-F4 (multi-waiter registration + wake) and INV-F5 (pool
+// scan finds woken cont not referenced by CONT_PENDING).
+static S7D_PHASE: AtomicU32 = AtomicU32::new(0);
+static S7D_W1_WOKEN: AtomicBool = AtomicBool::new(false);
+static S7D_W2_WOKEN: AtomicBool = AtomicBool::new(false);
+static S7D_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Word waited on by waiter 1.
+static S7D_WORD_A: AtomicU32 = AtomicU32::new(0);
+/// Word waited on by waiter 2.
+static S7D_WORD_B: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn s7d_waiter1_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	assert!(is_in_continuation(), "waiter1 not in continuation");
+	while S7D_WORD_A.load(Ordering::SeqCst) == 0 {
+		let r = cont_futex_wait(&S7D_WORD_A, 0);
+		assert!(
+			r == 0 || r == -i32::from(crate::errno::Errno::Again),
+			"waiter1 cont_futex_wait returned {}",
+			r
+		);
+	}
+	debug_assert!(
+		S7D_WORD_A.load(Ordering::SeqCst) != 0,
+		"waiter1 word still zero after wake"
+	);
+	S7D_W1_WOKEN.store(true, Ordering::SeqCst);
+	continuation_teardown();
+	unreachable!()
+}
+
+extern "C" fn s7d_waiter2_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	assert!(is_in_continuation(), "waiter2 not in continuation");
+	while S7D_WORD_B.load(Ordering::SeqCst) == 0 {
+		let r = cont_futex_wait(&S7D_WORD_B, 0);
+		assert!(
+			r == 0 || r == -i32::from(crate::errno::Errno::Again),
+			"waiter2 cont_futex_wait returned {}",
+			r
+		);
+	}
+	debug_assert!(
+		S7D_WORD_B.load(Ordering::SeqCst) != 0,
+		"waiter2 word still zero after wake"
+	);
+	S7D_W2_WOKEN.store(true, Ordering::SeqCst);
+	continuation_teardown();
+	unreachable!()
+}
+
+extern "C" fn s7d_waker_entry(_f: extern "C" fn(usize), _arg: usize) -> ! {
+	assert!(is_in_continuation(), "waker not in continuation");
+	// Set both words and wake both waiters. Order matters: set word BEFORE
+	// wake, so the woken cont sees the changed word and exits its wait loop.
+	S7D_WORD_A.store(1, Ordering::SeqCst);
+	let woken_a = cont_futex_wake(&S7D_WORD_A, 1);
+	assert!(woken_a >= 1, "waker woke {} on A (expected >=1)", woken_a);
+	S7D_WORD_B.store(1, Ordering::SeqCst);
+	let woken_b = cont_futex_wake(&S7D_WORD_B, 1);
+	assert!(woken_b >= 1, "waker woke {} on B (expected >=1)", woken_b);
+	continuation_teardown();
+	unreachable!()
+}
+
+/// O6.1: called by the idle loop after `drain_ready()` returns
 /// continuation teardown happened since the last call. The idle loop uses this
 /// to poke the reactor once (INV-6/INV-7), re-hosting the `cleanup_tasks`
 /// reactor poke that §7 deletes.
@@ -1394,9 +1658,6 @@ pub(crate) fn continuation_maybe_trigger() {
 		&& CURRENT_CONT.load(Ordering::SeqCst) == 0
 		&& !S7C_JOINEE_SPAWNED.load(Ordering::SeqCst)
 	{
-		// Only spawn the joinee once the joiner is actually PARKED on the
-		// join word (it must be the CONT_PENDING occupant in C_PARKED state),
-		// so the joinee's coop_wake targets it deterministically.
 		let p = CONT_PENDING.load(Ordering::SeqCst);
 		if p != 0 {
 			let joiner = unsafe { &*(p as *const Cont) };
@@ -1407,8 +1668,56 @@ pub(crate) fn continuation_maybe_trigger() {
 			}
 		}
 	}
+	// Spike 7d: multi-waiter futex harness. Serialized after 7c.
+	// Phases: 0=spawn W1, 1=spawn W2, 2=spawn waker, 3=verify both woken.
+	// Each spawn_continuation switches to the cont; the cont parks
+	// (cont_futex_wait) then returns to the drain (spawn_continuation returns).
+	// So phase advancement is implicitly sequenced: spawn returns only after
+	// the spawned cont has parked.
+	if S7C_DONE.load(Ordering::SeqCst) && !S7D_DONE.load(Ordering::SeqCst) {
+		let phase = S7D_PHASE.load(Ordering::SeqCst);
+		match phase {
+			0 => {
+				if CURRENT_CONT.load(Ordering::SeqCst) == 0
+					&& CONT_PENDING.load(Ordering::SeqCst) == 0
+				{
+					S7D_PHASE.store(1, Ordering::SeqCst);
+					spawn_continuation(s7d_waiter1_entry, 0, 0, -1);
+				}
+			}
+			1 => {
+				if CURRENT_CONT.load(Ordering::SeqCst) == 0 {
+					// W1 has parked (spawn_continuation returned).
+					S7D_PHASE.store(2, Ordering::SeqCst);
+					spawn_continuation(s7d_waiter2_entry, 0, 0, -1);
+				}
+			}
+			2 => {
+				if CURRENT_CONT.load(Ordering::SeqCst) == 0 {
+					// W2 has parked.
+					S7D_PHASE.store(3, Ordering::SeqCst);
+					spawn_continuation(s7d_waker_entry, 0, 0, -1);
+				}
+			}
+			3 => {
+				if CURRENT_CONT.load(Ordering::SeqCst) == 0
+					&& S7D_W1_WOKEN.load(Ordering::SeqCst)
+					&& S7D_W2_WOKEN.load(Ordering::SeqCst)
+				{
+					info!(
+						"[CONT-MULTI-FUTEX] INV-F4/F5 PASS (w1={} w2={})",
+						S7D_W1_WOKEN.load(Ordering::SeqCst),
+						S7D_W2_WOKEN.load(Ordering::SeqCst)
+					);
+					S7D_DONE.store(true, Ordering::SeqCst);
+				}
+			}
+			_ => {}
+		}
+	}
 }
 
+// -- asm switch primitive --
 // ── asm switch primitive ──
 // Saves the CURRENT EL1t context (GPRs x0..x30 + sp_el0/spsr/elr/tpidr/spsel)
 // into `CONT_SWITCH.save`, then `trap_exit`s into `CONT_SWITCH.target`, staging
