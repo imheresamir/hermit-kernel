@@ -418,6 +418,13 @@ el1_sp0_sync:
       mov     x0, sp
       add     x1, sp, #288     // NEW-1: entry SP_EL1 = frame_base + 288 (see el1_sync)
       bl      do_sync
+      // Restore scratch_slot = entry SP_EL1 (do_sync cleared it), so that
+      // trap_exit's D4 tail correctly sets SP_EL1 for the return. Without this,
+      // the next exception's df_check_el1t may find SP_EL1=0 != scratch_slot.
+      // x1 is clobbered by do_sync (caller-saved), so recompute from frame_base.
+      mrs     x2, tpidr_el1
+      add     x1, sp, #288
+      str     x1, [x2, #24]
       trap_exit
       eret
       // speculation barrier after the ERET to prevent the CPU
